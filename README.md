@@ -1,4 +1,4 @@
-# QuickRelay Studio v2.2.0
+# QuickRelay Studio v2.2.1
 
 **QuickRelay Studio** 是一款基于 Go 与 WebView2 桌面端打造的独立双协议 AI 反代网关与账号池管理控制台。支持将多个 AWS Quick 账号聚合为标准的 **OpenAI** 与 **Anthropic Messages** API，免改造直连 **Claude Code**、**Codex CLI** 及各类开源 SDK，并内置完整的请求明细统计与 1M 上下文持久化会话追踪。
 

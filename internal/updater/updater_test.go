@@ -213,6 +213,62 @@ func TestStartDownloadFallbackVerifyAndExtract(t *testing.T) {
 	}
 }
 
+// TestStartDownload_ChunkedStreamingBody 验证多包分块流式下载过程不会被过早 cancel Context，且 SHA-256 校验与解压正常完成。
+func TestStartDownload_ChunkedStreamingBody(t *testing.T) {
+	zipBytes, expectedSHA := makeTestZipBytes(t, map[string]string{
+		"QuickRelay-Studio/QuickRelay-Studio.exe": stringsRepeat("D", 128*1024),
+		"QuickRelay-Studio/quickrelay.exe":        stringsRepeat("Q", 128*1024),
+	})
+
+	streamSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		const chunks = 8
+		step := len(zipBytes) / chunks
+		for i := 0; i < chunks; i++ {
+			start := i * step
+			end := start + step
+			if i == chunks-1 {
+				end = len(zipBytes)
+			}
+			_, _ = w.Write(zipBytes[start:end])
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	}))
+	defer streamSrv.Close()
+
+	cfg := config.Default()
+	mgr := NewManager(&cfg, t.TempDir())
+	mgr.allowInsecureHTTP = true
+	mgr.customDownloadFn = func(rawURL, mode, customMirror string) []downloadCandidate {
+		return []downloadCandidate{{Name: "stream-mirror", Kind: "cn", URL: streamSrv.URL + "/pkg.zip"}}
+	}
+
+	if _, err := mgr.StartDownload(DownloadRequest{
+		Tag:         "v2.2.1",
+		DownloadURL: streamSrv.URL + "/pkg.zip",
+		AssetName:   "QuickRelay-Studio-v2.2.1-win-x64.zip",
+		SHA256:      expectedSHA,
+		Mode:        "cn",
+	}); err != nil {
+		t.Fatalf("StartDownload failed: %v", err)
+	}
+
+	st := waitDownloadDone(t, mgr)
+	if st.State != "ready" {
+		t.Fatalf("expected state=ready for chunked stream, got %+v", st)
+	}
+	if st.ActualSHA256 != expectedSHA {
+		t.Fatalf("sha mismatch: got %s want %s", st.ActualSHA256, expectedSHA)
+	}
+	if _, err := os.Stat(filepath.Join(st.StagingDir, "QuickRelay-Studio.exe")); err != nil {
+		t.Fatalf("expected QuickRelay-Studio.exe in staging dir: %v", err)
+	}
+}
+
 func stringsRepeat(ch string, n int) string {
 	b := make([]byte, n)
 	for i := range b {

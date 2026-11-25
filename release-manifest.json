@@ -1,15 +1,15 @@
 {
-  "version": "2.2.0",
-  "tag": "v2.2.0",
-  "published_at": "2026-11-25T05:33:59Z",
-  "release_notes": "QuickRelay Studio v2.2.0 更新内容：\n1. 新增三档工作场景模式（综合 / 文档办公 / 代码工程），支持顶部栏一键免重启热切换（work_mode）：\n   - 文档办公模式（document）：彻底去除本地编程/命令术语、明确提示文件在本机授权目录而非云端空间；\n   - 首轮尚未读入文件时自动将 high/max 思考平滑破冰降为 medium（读到文件后自动恢复高思考）；\n   - 超长规范在文档模式下不再上传易触发防注入怀疑的 guidelines-*.txt 附件，保留核心目录摘要与工具协议。\n2. 同时在 GitHub Releases 额外提供「文档办公专版」免配置压缩包（默认启用 work_mode=document）。\n3. 完整继承 v2.1.0 防撞墙保护与 GitHub 内置更新/国内源自动降级功能。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.2.0",
+  "version": "2.2.1",
+  "tag": "v2.2.1",
+  "published_at": "2026-11-25T05:55:09Z",
+  "release_notes": "QuickRelay Studio v2.2.1 更新内容：\n1. 修复在线更新器下载大文件时因过早取消 Context 引发 context canceled 的问题，现支持完整流式下载与国内源自动降级；\n2. 完整包含 v2.2.0 三档工作场景模式（综合 / 文档办公 / 代码工程）免重启热切换及文档防拒答优化；\n3. 完整包含 v2.1.0 防撞墙与 /compact 降档保护功能。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.2.1",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.2.0-win-x64.zip",
-      "size": 8611604,
-      "sha256": "b8f537320b3702cf72fff32490bbde0c30b8070d277099e80062842bc30f20ff",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.2.0/QuickRelay-Studio-v2.2.0-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.2.1-win-x64.zip",
+      "size": 8611857,
+      "sha256": "d2fdeb0fe289c19c1a94cb8967666e9f37d5f9800d85d20b7dbefcde7389a29e",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.2.1/QuickRelay-Studio-v2.2.1-win-x64.zip"
     }
   }
 }

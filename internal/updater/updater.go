@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,6 +28,7 @@ import (
 const (
 	checkPerSourceTimeout    = 8 * time.Second
 	downloadPerSourceTimeout = 15 * time.Second
+	downloadBodyTimeout      = 10 * time.Minute
 	maxManifestBytes         = 2 << 20
 	maxSHA256SumsBytes       = 256 << 10
 	maxDownloadBytes         = 256 << 20
@@ -148,8 +150,13 @@ type Manager struct {
 // NewManager 创建更新管理器实例，updatesDir 通常位于 data/updates。
 func NewManager(cfg *config.Config, dataDir string) *Manager {
 	tr := &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
-		TLSHandshakeTimeout: 8 * time.Second,
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   8 * time.Second,
+		ResponseHeaderTimeout: downloadPerSourceTimeout,
 	}
 	updatesDir := filepath.Join(strings.TrimSpace(dataDir), "updates")
 	return &Manager{
@@ -825,21 +832,21 @@ func (m *Manager) runDownloadWorkflow(safeTag, safeAsset, expectedSHA string, ca
 }
 
 func (m *Manager) downloadOneCandidate(cand downloadCandidate, partPath, expectedSHA string) (string, error) {
-	hdrCtx, hdrCancel := context.WithTimeout(context.Background(), downloadPerSourceTimeout)
-	req, err := http.NewRequestWithContext(hdrCtx, http.MethodGet, cand.URL, nil)
+	// 下载上下文需贯穿整个响应体流式读取过程，禁止在 Do() 返回后立即 cancel，
+	// 建连与响应头 15s 超时已交由 Transport.ResponseHeaderTimeout 控制。
+	dlCtx, dlCancel := context.WithTimeout(context.Background(), downloadBodyTimeout)
+	defer dlCancel()
+
+	req, err := http.NewRequestWithContext(dlCtx, http.MethodGet, cand.URL, nil)
 	if err != nil {
-		hdrCancel()
 		return "", err
 	}
 	req.Header.Set("User-Agent", "QuickRelay-Studio/"+version.Current)
 
-	// 仅对建连与首包响应头应用 15s 超时；正文大文件下载阶段单独控制。
 	resp, err := m.client.Do(req)
 	if err != nil {
-		hdrCancel()
 		return "", err
 	}
-	hdrCancel()
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
