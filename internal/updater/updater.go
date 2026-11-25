@@ -277,18 +277,6 @@ func buildCheckSpecs(repo, mode, customMirror string) []CheckSourceSpec {
 	}
 	cn = append(cn,
 		CheckSourceSpec{
-			Name: "jsdelivr-cdn",
-			Kind: "cn",
-			Type: "manifest",
-			URL:  fmt.Sprintf("https://cdn.jsdelivr.net/gh/%s@main/release-manifest.json", repo),
-		},
-		CheckSourceSpec{
-			Name: "jsdelivr-fastly",
-			Kind: "cn",
-			Type: "manifest",
-			URL:  fmt.Sprintf("https://fastly.jsdelivr.net/gh/%s@main/release-manifest.json", repo),
-		},
-		CheckSourceSpec{
 			Name: "gh-proxy",
 			Kind: "cn",
 			Type: "manifest",
@@ -305,6 +293,18 @@ func buildCheckSpecs(repo, mode, customMirror string) []CheckSourceSpec {
 			Kind: "cn",
 			Type: "manifest",
 			URL:  "https://gh-proxy.org/" + rawURL,
+		},
+		CheckSourceSpec{
+			Name: "jsdelivr-cdn",
+			Kind: "cn",
+			Type: "manifest",
+			URL:  fmt.Sprintf("https://cdn.jsdelivr.net/gh/%s@main/release-manifest.json", repo),
+		},
+		CheckSourceSpec{
+			Name: "jsdelivr-fastly",
+			Kind: "cn",
+			Type: "manifest",
+			URL:  fmt.Sprintf("https://fastly.jsdelivr.net/gh/%s@main/release-manifest.json", repo),
 		},
 	)
 
