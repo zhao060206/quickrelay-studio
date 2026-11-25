@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+
+	"quickrelay-studio/internal/config"
 )
 
 // hasVisibleText reports whether s contains a non-space, non-format rune.
@@ -90,6 +92,10 @@ func collectToolDefinitions(tools []Tool, functions []ToolFunction) []toolDefini
 // upstream model can use it. This belongs to the caller's instructions, not
 // to the relay backend.
 func forwardToolDefinitions(req *ChatRequest) string {
+	return forwardToolDefinitionsForMode(req, config.WorkModeGeneral)
+}
+
+func forwardToolDefinitionsForMode(req *ChatRequest, workMode string) string {
 	defs := collectToolDefinitions(req.Tools, req.Functions)
 	if len(defs) == 0 {
 		return ""
@@ -102,15 +108,25 @@ func forwardToolDefinitions(req *ChatRequest) string {
 	if err != nil {
 		return ""
 	}
-	return "Workspace actions available via the user's local client:\n" + string(body)
+	prefix := "Workspace actions available via the user's local client:\n"
+	if config.NormalizeWorkMode(workMode) == config.WorkModeDocument {
+		prefix = "Document and workspace actions supported by the user's desktop app:\n"
+	}
+	return prefix + string(body)
 }
 
-// buildToolBridgePrompt 定义客户端提供的工具定义及纯技术中立的客户端回调协议说明。
+// buildToolBridgePrompt 定义客户端提供的工具定义及纯技术中立的客户端回调协议说明（默认采用综合模式）。
 func buildToolBridgePrompt(req *ChatRequest, mode, name string, parallel bool) string {
+	return buildToolBridgePromptForMode(req, mode, name, parallel, config.WorkModeGeneral)
+}
+
+// buildToolBridgePromptForMode 按工作场景模式构造客户端工具协议块。
+func buildToolBridgePromptForMode(req *ChatRequest, mode, name string, parallel bool, workMode string) string {
 	if mode == "none" {
 		return ""
 	}
-	defs := forwardToolDefinitions(req)
+	normMode := config.NormalizeWorkMode(workMode)
+	defs := forwardToolDefinitionsForMode(req, normMode)
 	if defs == "" {
 		return ""
 	}
@@ -122,9 +138,20 @@ func buildToolBridgePrompt(req *ChatRequest, mode, name string, parallel bool) s
 	b.WriteString("- Optionally write one brief sentence in the user's language describing the action, then emit one marker per action with no Markdown code fences and no trailing text:\n")
 	b.WriteString(`<client_tool_call>{"name":"TOOL_NAME","arguments":{...}}</client_tool_call>`)
 	b.WriteString("\n- Use only listed tool names with a JSON object for \"arguments\" matching the parameter schema.\n")
-	b.WriteString("- By default, perform file creation, edits, exports (such as HTML/SVG/code files), and shell checks directly in the user's local workspace with these client tools rather than saving deliverables only in a remote workspace.\n")
-	b.WriteString("- Keep each turn focused and incremental: each streaming turn has a strict upstream runtime limit (~8-9 minutes), so for large or complex deliverables (such as detailed 3D/Three.js/SVG/HTML scenes or files over ~250 lines), do not try to design and emit the entire codebase in a single oversized tool call.\n")
-	b.WriteString("- Instead, keep the first turn's planning brief, immediately write a clean runnable scaffold or split into smaller files (~150-300 lines per tool call) in the local workspace, then continue across subsequent tool turns to add shaders, visual polish, interactions, and verification until the full deliverable is complete (do not stop at a skeleton unless blocked).\n")
+
+	switch normMode {
+	case config.WorkModeDocument:
+		b.WriteString("- Use these desktop app actions to browse authorized folders, read user documents, and save or update output files directly in the user's local folder rather than assuming files live in a remote cloud space.\n")
+		b.WriteString("- Keep each turn focused: read the required files first, and for lengthy reviews, reports, or manuscripts, write or refine sections incrementally so each turn completes cleanly within streaming limits.\n")
+	case config.WorkModeCoding:
+		b.WriteString("- By default, perform file creation, edits, exports (such as HTML/SVG/code files), and shell checks directly in the user's local workspace with these client tools rather than saving deliverables only in a remote workspace.\n")
+		b.WriteString("- Keep each turn focused and incremental: each streaming turn has a strict upstream runtime limit (~8-9 minutes), so for large or complex deliverables (such as detailed 3D/Three.js/SVG/HTML scenes or files over ~250 lines), do not try to design and emit the entire codebase in a single oversized tool call.\n")
+		b.WriteString("- Instead, keep the first turn's planning brief, immediately write a clean runnable scaffold or split into smaller files (~150-300 lines per tool call) in the local workspace, then continue across subsequent tool turns to add shaders, visual polish, interactions, and verification until the full deliverable is complete (do not stop at a skeleton unless blocked).\n")
+	default:
+		b.WriteString("- By default, read, create, update, or export files directly in the user's authorized local directory using these client actions rather than saving deliverables only in a remote space.\n")
+		b.WriteString("- Keep each turn focused and incremental: for long documents, reports, or large projects, work in clear concise steps (~150-300 lines per file write) and verify outputs across subsequent tool turns so every turn completes well within streaming limits.\n")
+	}
+
 	b.WriteString("- After the client returns the action result in the next turn, continue the task with that result.\n")
 	b.WriteString("- If no workspace action is needed, answer normally in plain text without a marker.\n")
 	if parallel {

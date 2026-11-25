@@ -40,6 +40,7 @@
     "refresh_interval": "5m0s",
     "max_attempts": 3
   },
+  "work_mode": "general",
   "guardrails": {
     "compact_downgrade": true,
     "no_tool_max_cap": true,

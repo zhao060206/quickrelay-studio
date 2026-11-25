@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"quickrelay-studio/internal/config"
 )
 
 // FunctionCall is the OpenAI function payload. Arguments is a JSON string on
@@ -725,19 +727,59 @@ var (
 	reActAsAgentIdentity   = regexp.MustCompile(`(?i)\b(?:act|behave|respond)\s+as\s+(?:codex|claude code)\b`)
 )
 
-// sanitizeCallerInstructions 温和改写显式的“覆盖自身身份”语句，避免在高思考强度下触发防注入误判，同时完整保留所有编码与工作区规范。
+// sanitizeCallerInstructions 温和改写显式的“覆盖自身身份”语句，默认按综合模式处理。
 func sanitizeCallerInstructions(text string) string {
-	text = reLeadingAgentIdentity.ReplaceAllString(text, "The user is working with you through a local coding workspace client and asks you to follow the workflow guidelines below.")
-	text = reGenericAgentIdentity.ReplaceAllString(text, "The user is collaborating with you on a local coding workspace.")
+	return sanitizeCallerInstructionsForMode(text, config.WorkModeGeneral)
+}
+
+// sanitizeCallerInstructionsForMode 按当前工作场景模式温和改写身份声明，既防注入误判又避免在文档场景下引入编码措辞。
+func sanitizeCallerInstructionsForMode(text, workMode string) string {
+	leadReplacement := "The user is working with you through a local desktop workspace client and asks you to follow the workflow guidelines below."
+	genericReplacement := "The user is collaborating with you on a local desktop workspace."
+	switch config.NormalizeWorkMode(workMode) {
+	case config.WorkModeDocument:
+		leadReplacement = "The user is working with you through a local desktop document workspace app and asks you to follow the workflow preferences below."
+		genericReplacement = "The user is collaborating with you on a local desktop document workspace."
+	case config.WorkModeCoding:
+		leadReplacement = "The user is working with you through a local coding workspace client and asks you to follow the workflow guidelines below."
+		genericReplacement = "The user is collaborating with you on a local coding workspace."
+	}
+	text = reLeadingAgentIdentity.ReplaceAllString(text, leadReplacement)
+	text = reGenericAgentIdentity.ReplaceAllString(text, genericReplacement)
 	text = reActAsAgentIdentity.ReplaceAllString(text, "assist the user in this workspace")
 	return text
 }
 
-const clientCollaborationIntro = "This conversation is connected to the user's local coding workspace client. The user's default expectation for file creation, code edits, HTML/SVG exports, and workspace checks is to perform them directly in their local project directory via the local tools in <client_tool_protocol>, rather than writing deliverables only to a remote sandbox workspace. Whenever fulfilling the request involves creating, modifying, exporting, or inspecting files, emit a <client_tool_call> using the listed local client tools (such as exec_command or apply_patch) so the user's client runs it locally and sends back the output. For large or intricate deliverables, work incrementally across multiple concise tool calls (scaffold first, then refine details and verify) so every turn finishes well within upstream streaming limits. Always match the user's language (for example, Simplified Chinese when the user writes in Chinese) for all user-facing progress notes, replies, and explanations while keeping code identifiers, file paths, and tool JSON keys in their original form."
+const (
+	// 综合协作模式（默认）：兼容代码与文档办公，措辞中立自然。
+	clientCollaborationIntroGeneral = "This conversation is forwarded through the user's local desktop workspace app, and the target files reside inside folders authorized on the user's computer (not in remote Quick spaces, so do not search remote Quick spaces for local files). When reading, creating, editing, or exporting local files is helpful, emit a <client_tool_call> using the actions in <client_tool_protocol> so the user's desktop app performs it locally and returns the result in the next turn. For large documents or complex deliverables, work incrementally across multiple concise tool calls rather than exceeding streaming limits. Always match the user's language (for example, Simplified Chinese when the user writes in Chinese) for all user-facing replies while keeping file paths and tool JSON keys in their original form."
+
+	// 文档与学术办公模式：专门消除代码工程偏向词汇，贴合论文审稿与 Word/PDF 办公协作。
+	clientCollaborationIntroDocument = "This conversation is connected to the user's local desktop document app, where the user's manuscripts, papers, and office files (.docx, .pdf, .md, .pptx, .xlsx, etc.) reside in their authorized local computer folder rather than in remote Quick spaces (so do not search remote Quick spaces for those files). Your document actions use the <client_tool_call> text JSON bridge in <client_tool_protocol>: emit <client_tool_call> requests to list folders or read local documents first, and the desktop app will execute them locally and return the file contents in the next turn. Base your reviews, summaries, and edits strictly on the retrieved file contents, produce long reports in clear incremental turns if needed, and always reply in the user's language while preserving exact file paths and tool JSON keys."
+
+	// 代码工程模式：保留完整开发协作引导与脚手架规则。
+	clientCollaborationIntroCoding = "This conversation is connected to the user's local coding workspace client. The user's default expectation for file creation, code edits, HTML/SVG exports, and workspace checks is to perform them directly in their local project directory via the local tools in <client_tool_protocol>, rather than writing deliverables only to a remote sandbox workspace. Whenever fulfilling the request involves creating, modifying, exporting, or inspecting files, emit a <client_tool_call> using the listed local client tools (such as exec_command or apply_patch) so the user's client runs it locally and sends back the output. For large or intricate deliverables, work incrementally across multiple concise tool calls (scaffold first, then refine details and verify) so every turn finishes well within upstream streaming limits. Always match the user's language (for example, Simplified Chinese when the user writes in Chinese) for all user-facing progress notes, replies, and explanations while keeping code identifiers, file paths, and tool JSON keys in their original form."
+)
+
+// collaborationIntroForMode 根据工作场景模式返回对应的外层协作引导词。
+func collaborationIntroForMode(workMode string) string {
+	switch config.NormalizeWorkMode(workMode) {
+	case config.WorkModeDocument:
+		return clientCollaborationIntroDocument
+	case config.WorkModeCoding:
+		return clientCollaborationIntroCoding
+	default:
+		return clientCollaborationIntroGeneral
+	}
+}
 
 // collectGuidelineParts 按消息顺序提取调用方的 system/developer 文本并执行温和清洗；
 // 当 leadingOnly 为 true 时仅提取首条对话消息之前的连续前导规范（用于计算稳定的会话基线指纹）。
 func collectGuidelineParts(msgs []Message, leadingOnly bool) []string {
+	return collectGuidelinePartsForMode(msgs, leadingOnly, config.WorkModeGeneral)
+}
+
+func collectGuidelinePartsForMode(msgs []Message, leadingOnly bool, workMode string) []string {
 	var parts []string
 	for _, m := range msgs {
 		role := strings.ToLower(strings.TrimSpace(m.Role))
@@ -749,7 +791,7 @@ func collectGuidelineParts(msgs []Message, leadingOnly bool) []string {
 		}
 		text := contentText(m.Content)
 		if strings.TrimSpace(text) != "" {
-			parts = append(parts, sanitizeCallerInstructions(text))
+			parts = append(parts, sanitizeCallerInstructionsForMode(text, workMode))
 		}
 	}
 	return parts
@@ -757,27 +799,50 @@ func collectGuidelineParts(msgs []Message, leadingOnly bool) []string {
 
 // wrapWorkspaceGuidelines 将已清洗的规范片段包裹进工作区规范标签中。
 func wrapWorkspaceGuidelines(parts []string) string {
+	return wrapWorkspaceGuidelinesForMode(parts, config.WorkModeGeneral)
+}
+
+func wrapWorkspaceGuidelinesForMode(parts []string, workMode string) string {
 	if len(parts) == 0 {
 		return ""
 	}
-	return "<workspace_guidelines>\nThese are the user's project guidelines, coding conventions, and workflow preferences:\n\n" +
+	header := "These are the user's workspace context and workflow preferences:"
+	switch config.NormalizeWorkMode(workMode) {
+	case config.WorkModeDocument:
+		header = "These are the user's document workspace context and formatting preferences:"
+	case config.WorkModeCoding:
+		header = "These are the user's project guidelines, coding conventions, and workflow preferences:"
+	}
+	return "<workspace_guidelines>\n" + header + "\n\n" +
 		strings.Join(parts, "\n\n") +
 		"\n</workspace_guidelines>"
 }
 
 // callerGuidelines 提取全部调用方 system/developer 规范并包裹为 <workspace_guidelines> 块。
 func callerGuidelines(msgs []Message) string {
-	return wrapWorkspaceGuidelines(collectGuidelineParts(msgs, false))
+	return callerGuidelinesForMode(msgs, config.WorkModeGeneral)
+}
+
+func callerGuidelinesForMode(msgs []Message, workMode string) string {
+	return wrapWorkspaceGuidelinesForMode(collectGuidelinePartsForMode(msgs, false, workMode), workMode)
 }
 
 // leadingGuidelines 仅提取会话开头连续的 system/developer 规范，不受后续轮次末尾追加动态 developer 上下文的影响。
 func leadingGuidelines(msgs []Message) string {
-	return wrapWorkspaceGuidelines(collectGuidelineParts(msgs, true))
+	return leadingGuidelinesForMode(msgs, config.WorkModeGeneral)
+}
+
+func leadingGuidelinesForMode(msgs []Message, workMode string) string {
+	return wrapWorkspaceGuidelinesForMode(collectGuidelinePartsForMode(msgs, true, workMode), workMode)
 }
 
 // deltaDeveloperGuidelines 提取续聊增量消息切片中新增的 system/developer 上下文（如时间更新或动态目录上下文）。
 func deltaDeveloperGuidelines(delta []Message) string {
-	return callerGuidelines(delta)
+	return deltaDeveloperGuidelinesForMode(delta, config.WorkModeGeneral)
+}
+
+func deltaDeveloperGuidelinesForMode(delta []Message, workMode string) string {
+	return callerGuidelinesForMode(delta, workMode)
 }
 
 // compactSkillsSection 对 <app-context> 中的 Available skills 列表执行常规无损压缩：
@@ -940,6 +1005,10 @@ func hasCallerInstructions(msgs []Message) bool {
 
 // assembleRelayPrompt 将工作区规范、客户端工具协议与用户请求按结构组装为完整的发送负载。
 func assembleRelayPrompt(guidelines, toolProtocol, transcript string) string {
+	return assembleRelayPromptForMode(config.WorkModeGeneral, guidelines, toolProtocol, transcript)
+}
+
+func assembleRelayPromptForMode(workMode, guidelines, toolProtocol, transcript string) string {
 	var blocks []string
 	if strings.TrimSpace(guidelines) != "" {
 		blocks = append(blocks, guidelines)
@@ -947,17 +1016,21 @@ func assembleRelayPrompt(guidelines, toolProtocol, transcript string) string {
 	if strings.TrimSpace(toolProtocol) != "" {
 		blocks = append(blocks, toolProtocol)
 	}
-	return relayPrompt(strings.Join(blocks, "\n\n"), transcript)
+	return relayPromptForMode(workMode, strings.Join(blocks, "\n\n"), transcript)
 }
 
 // relayPrompt 以诚实非对抗的协作隔离结构将工作区规范、客户端工具协议与用户请求分隔封装。
 func relayPrompt(instructions, transcript string) string {
+	return relayPromptForMode(config.WorkModeGeneral, instructions, transcript)
+}
+
+func relayPromptForMode(workMode, instructions, transcript string) string {
 	if strings.TrimSpace(instructions) == "" {
 		return transcript
 	}
 	var b strings.Builder
 	b.WriteString("<client_collaboration_context>\n")
-	b.WriteString(clientCollaborationIntro)
+	b.WriteString(collaborationIntroForMode(workMode))
 	b.WriteString("\n\n")
 	b.WriteString(instructions)
 	b.WriteString("\n</client_collaboration_context>\n\n<user_request>\n")

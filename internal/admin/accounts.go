@@ -114,7 +114,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	activeConversations, _ := s.store.CountConversations(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"service": "quickrelay-studio", "version": version.Current, "started_at": s.startedAt.Unix(), "accounts": counts,
-		"models": s.cfg.Models, "default_model": s.cfg.DefaultModel,
+		"models": s.cfg.Models, "default_model": s.cfg.DefaultModel, "work_mode": s.cfg.GetWorkMode(),
 		"api_keys_configured": keysConfigured, "webui_enabled": s.cfg.WebUI.Enabled,
 		"active_conversations": activeConversations, "usage_sync": s.accounts.UsageStatus(),
 	})

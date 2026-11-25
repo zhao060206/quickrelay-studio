@@ -1,15 +1,15 @@
 {
-  "version": "2.1.0",
-  "tag": "v2.1.0",
-  "published_at": "2026-11-25T04:59:00Z",
-  "release_notes": "QuickRelay Studio v2.1.0 更新内容：\n1. 新增防撞墙与长思考保护（guardrails）：\n   - /compact 会话压缩请求自动降档为 low，规避单步 64K Output 硬上限断流；\n   - 无可用本地工具时将 max 思考平滑限幅为 high（保留下游流式心跳保活）；\n   - 超长规范外置为 guidelines-*.txt 时仍保留 <env> 与工作目录摘要，减少无效思考。\n2. 新增内置 GitHub 在线更新与国内源自动降级（updater）：\n   - 支持从 GitHub 检测更新并在受阻时自动降级至 jsDelivr / gh-proxy / ghfast / 自定义镜像；\n   - 强制校验安装包 SHA-256 与防路径穿越解压，一键安装重启并完整保留 data/ 与 config.json。\n3. 修复并统一前后端版本标识，打包附带完整版 PDF 使用教程。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.1.0",
+  "version": "2.2.0",
+  "tag": "v2.2.0",
+  "published_at": "2026-11-25T05:31:16Z",
+  "release_notes": "QuickRelay Studio v2.2.0 更新内容：\n1. 新增三档工作场景模式（综合 / 文档办公 / 代码工程），支持顶部栏一键免重启热切换（work_mode）：\n   - 文档办公模式（document）：彻底去除本地编程/命令术语、明确提示文件在本机授权目录而非云端空间；\n   - 首轮尚未读入文件时自动将 high/max 思考平滑破冰降为 medium（读到文件后自动恢复高思考）；\n   - 超长规范在文档模式下不再上传易触发防注入怀疑的 guidelines-*.txt 附件，保留核心目录摘要与工具协议。\n2. 同时在 GitHub Releases 额外提供「文档办公专版」免配置压缩包（默认启用 work_mode=document）。\n3. 完整继承 v2.1.0 防撞墙保护与 GitHub 内置更新/国内源自动降级功能。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.2.0",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.1.0-win-x64.zip",
-      "size": 8603564,
-      "sha256": "79ce50f3056f429599d7ace6fff4aa523b9f605a0507285f5cc0a5983b5fa090",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.1.0/QuickRelay-Studio-v2.1.0-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.2.0-win-x64.zip",
+      "size": 8611601,
+      "sha256": "98a406d9b6ebf9575d1266e2caea6acce558340b903c248e21938b77a4d43905",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.2.0/QuickRelay-Studio-v2.2.0-win-x64.zip"
     }
   }
 }

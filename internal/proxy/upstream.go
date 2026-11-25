@@ -60,6 +60,7 @@ type ChatInput struct {
 	SystemPrompt   string // 兼容旧调用方直接传入完整指令文本
 	Guidelines     string // 工作区规范（<workspace_guidelines>），可在超帧时压缩或转为附件
 	ToolProtocol   string // 客户端工具协议与紧凑 JSON 工具表（<client_tool_protocol>），主帧内严格保护不裁剪
+	WorkMode       string // 工作场景模式：general | document | coding
 	ChatAgentID    string
 	CreateSession  bool
 	DeleteSession  bool
@@ -272,7 +273,7 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 	basePrompt := in.Prompt
 
 	payload := map[string]any{
-		"text":               renderTurnText(guidelines, toolProtocol, legacySystem, basePrompt),
+		"text":               renderTurnTextForMode(in.WorkMode, guidelines, toolProtocol, legacySystem, basePrompt),
 		"send_origin":        "programmatic",
 		"had_physical_input": false,
 		"surfaceType":        sess.Surface,
@@ -320,7 +321,7 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 			}
 			if len(failedImgs) > 0 {
 				basePrompt = in.Prompt + "\n\n[Note: failed to upload image attachment(s): " + strings.Join(failedImgs, "; ") + "]"
-				payload["text"] = renderTurnText(guidelines, toolProtocol, legacySystem, basePrompt)
+				payload["text"] = renderTurnTextForMode(in.WorkMode, guidelines, toolProtocol, legacySystem, basePrompt)
 			}
 			if len(attachments) > 0 {
 				payload["attachments"] = attachments
@@ -328,7 +329,7 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		}
 
 		preserveEnv := u.cfg == nil || u.cfg.Guardrails.PreserveEnvSummaryEnabled()
-		prepareFrameWithinBudgetOpts(payload, messageID, guidelines, toolProtocol, legacySystem, basePrompt, in.LatestUserText, attachments, failedImgs, preserveEnv,
+		prepareFrameWithinBudgetWithMode(payload, messageID, guidelines, toolProtocol, legacySystem, basePrompt, in.LatestUserText, attachments, failedImgs, preserveEnv, in.WorkMode,
 			func(name string, data []byte) (attachmentRef, error) {
 				att, attErr := uploadPromptAttachment(ctx, sess, threadID, name, data)
 				if attErr != nil {
@@ -349,7 +350,7 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		// 无带外附件能力时仍尝试单帧技能列表压缩，尽力保住工具协议
 		if n, err := userMessageBytes(payload); err == nil && n > maxUserMessageBytes && guidelines != "" {
 			if compacted := compactSkillsSection(guidelines); compacted != guidelines {
-				payload["text"] = renderTurnText(compacted, toolProtocol, legacySystem, basePrompt)
+				payload["text"] = renderTurnTextForMode(in.WorkMode, compacted, toolProtocol, legacySystem, basePrompt)
 			}
 		}
 	}
@@ -1095,16 +1096,20 @@ func resolveTurnSections(in ChatInput) (guidelines, toolProtocol, legacySystem s
 
 // renderTurnText 根据是否拆分工作区规范与工具协议来拼装本轮发送的完整用户文本。
 func renderTurnText(guidelines, toolProtocol, legacySystem, prompt string) string {
+	return renderTurnTextForMode(config.WorkModeGeneral, guidelines, toolProtocol, legacySystem, prompt)
+}
+
+func renderTurnTextForMode(workMode, guidelines, toolProtocol, legacySystem, prompt string) string {
 	if guidelines != "" || toolProtocol != "" {
-		return assembleRelayPrompt(guidelines, toolProtocol, prompt)
+		return assembleRelayPromptForMode(workMode, guidelines, toolProtocol, prompt)
 	}
-	return relayPrompt(legacySystem, prompt)
+	return relayPromptForMode(workMode, legacySystem, prompt)
 }
 
 // prepareFrameWithinBudget 在不超过上游 64 KB 帧限制的前提下尽量保留完整上下文，并严格优先保护 <client_tool_protocol>：
 // 1) 长对话正文优先上传为 prompt-<id8>.txt；
 // 2) 若仍超限则先压缩 <app-context> 中的冗长技能列表；
-// 3) 仍超限则将完整原始工作区规范上传为 guidelines-<id8>.txt，主帧内仅保留短指引 + 完整工具协议。
+// 3) 仍超限则将完整原始工作区规范上传为 guidelines-<id8>.txt，主帧内仅保留短指引 + 完整工具协议（document 模式下跳过外置，直接精简内联以防风控）。
 func prepareFrameWithinBudget(
 	payload map[string]any,
 	messageID string,
@@ -1113,7 +1118,7 @@ func prepareFrameWithinBudget(
 	failedImgs []string,
 	attachFn func(name string, data []byte) (attachmentRef, error),
 ) {
-	prepareFrameWithinBudgetOpts(payload, messageID, rawGuidelines, toolProtocol, legacySystem, prompt, latestUser, attachments, failedImgs, true, attachFn)
+	prepareFrameWithinBudgetWithMode(payload, messageID, rawGuidelines, toolProtocol, legacySystem, prompt, latestUser, attachments, failedImgs, true, config.WorkModeGeneral, attachFn)
 }
 
 func prepareFrameWithinBudgetOpts(
@@ -1123,6 +1128,19 @@ func prepareFrameWithinBudgetOpts(
 	attachments []map[string]any,
 	failedImgs []string,
 	preserveEnvSummary bool,
+	attachFn func(name string, data []byte) (attachmentRef, error),
+) {
+	prepareFrameWithinBudgetWithMode(payload, messageID, rawGuidelines, toolProtocol, legacySystem, prompt, latestUser, attachments, failedImgs, preserveEnvSummary, config.WorkModeGeneral, attachFn)
+}
+
+func prepareFrameWithinBudgetWithMode(
+	payload map[string]any,
+	messageID string,
+	rawGuidelines, toolProtocol, legacySystem, prompt, latestUser string,
+	attachments []map[string]any,
+	failedImgs []string,
+	preserveEnvSummary bool,
+	workMode string,
 	attachFn func(name string, data []byte) (attachmentRef, error),
 ) {
 	fits := func() bool {
@@ -1146,7 +1164,7 @@ func prepareFrameWithinBudgetOpts(
 			curPrompt = shortText
 			attachments = append(attachments, fileAttachmentMeta(att, attachmentMimeType))
 			payload["attachments"] = attachments
-			payload["text"] = renderTurnText(curGuidelines, toolProtocol, legacySystem, curPrompt)
+			payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
 		}
 	}
 	if fits() {
@@ -1157,7 +1175,7 @@ func prepareFrameWithinBudgetOpts(
 	if curGuidelines != "" {
 		if compacted := compactSkillsSection(curGuidelines); len(compacted) < len(curGuidelines) {
 			curGuidelines = compacted
-			payload["text"] = renderTurnText(curGuidelines, toolProtocol, legacySystem, curPrompt)
+			payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
 		}
 	}
 	if fits() {
@@ -1166,29 +1184,39 @@ func prepareFrameWithinBudgetOpts(
 	if rawGuidelines != "" {
 		if indexed := compactSkillsIndexOnly(rawGuidelines); len(indexed) < len(curGuidelines) {
 			curGuidelines = indexed
-			payload["text"] = renderTurnText(curGuidelines, toolProtocol, legacySystem, curPrompt)
+			payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
 		}
 	}
 	if fits() {
 		return
 	}
 
-	// 第三步：规范自身仍超帧预算时，将完整未压缩的工作区规范上传为 guidelines-<id8>.txt，
-	// 保证 <client_tool_protocol> 与本机工具 JSON 100% 完整留在主帧，绝不被 fitUserMessage 误裁。
+	// 第三步：规范自身仍超帧预算时：
+	// - document 模式严禁上传易引发模型防注入怀疑的 guidelines-*.txt，直接精简为内联摘要；
+	// - general / coding 模式上传完整原始规范为 guidelines-<id8>.txt，并内联环境摘要，确保 <client_tool_protocol> 100% 完整留在主帧。
 	if rawGuidelines != "" {
-		if att, err := attachFn(attachmentGuidelinesName(messageID), []byte(rawGuidelines)); err == nil && att.Path != "" {
-			envSummary := ""
-			if preserveEnvSummary {
-				envSummary = extractEnvSummary(rawGuidelines)
+		envSummary := ""
+		if preserveEnvSummary {
+			envSummary = extractEnvSummary(rawGuidelines)
+		}
+		if config.NormalizeWorkMode(workMode) == config.WorkModeDocument {
+			curGuidelines = compactGuidelinesInline(envSummary)
+			payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
+			if envSummary != "" && !fits() {
+				curGuidelines = compactGuidelinesInline("")
+				payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
 			}
+			return
+		}
+		if att, err := attachFn(attachmentGuidelinesName(messageID), []byte(rawGuidelines)); err == nil && att.Path != "" {
 			curGuidelines = attachmentGuidelinesNoteWithEnv(att.Name, envSummary)
 			attachments = append(attachments, fileAttachmentMeta(att, attachmentMimeType))
 			payload["attachments"] = attachments
-			payload["text"] = renderTurnText(curGuidelines, toolProtocol, legacySystem, curPrompt)
+			payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
 			// 若极端情况下内联环境摘要导致超出帧预算，自动回退为不含摘要的短指引
 			if envSummary != "" && !fits() {
 				curGuidelines = attachmentGuidelinesNote(att.Name)
-				payload["text"] = renderTurnText(curGuidelines, toolProtocol, legacySystem, curPrompt)
+				payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
 			}
 		}
 	}

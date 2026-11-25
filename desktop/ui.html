@@ -575,7 +575,7 @@
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
       </div>
       <span class="brand-name">QuickRelay</span>
-      <span class="brand-meta" id="brandVersion">2.1.0</span>
+      <span class="brand-meta" id="brandVersion">2.2.0</span>
     </div>
 
     <nav class="nav-group" id="navMenu">
@@ -661,6 +661,11 @@
       </div>
 
       <div class="topbar-actions">
+        <div class="seg-group" id="topWorkModeSeg" title="切换工作场景模式（免重启热生效）">
+          <button class="seg-btn active" data-mode="general" title="综合协作：代码与通用文档兼顾">综合</button>
+          <button class="seg-btn" data-mode="document" title="文档办公：专为论文审稿与 Word/PDF 办公防拒答优化">文档办公</button>
+          <button class="seg-btn" data-mode="coding" title="代码工程：完整保留编程脚手架协作指导">代码</button>
+        </div>
         <button class="top-quota-pill" id="topQuotaPill" title="查看账号池配额明细">
           <span class="dot"></span>
           <span class="mono">余量 --</span>
@@ -1362,10 +1367,19 @@
             <div class="card-head">
               <div>
                 <h2 class="card-title">防撞墙与压缩保护 (guardrails)</h2>
-                <div class="field-hint" style="margin-top:2px;">规避上游单步 64K Output 硬墙，消除 /compact 断流与多余思考</div>
+                <div class="field-hint" style="margin-top:2px;">按使用场景适配协作引导，规避云端拒答、单步 64K 硬墙与 /compact 断流</div>
               </div>
             </div>
             <div class="form-grid">
+              <div class="field" style="grid-column:1/-1;">
+                <label class="field-label">工作场景模式 (work_mode，保存或顶部切换后无需重启即刻生效)</label>
+                <select class="select" id="cfgWorkMode">
+                  <option value="general">综合协作 (general) — 代码与文档通用，措辞中立（推荐）</option>
+                  <option value="document">文档与学术办公 (document) — 专为论文审稿、Word/PDF 办公优化</option>
+                  <option value="coding">代码工程 (coding) — 完整开发脚手架与命令执行协作指导</option>
+                </select>
+                <span class="field-hint" id="workModeHint">综合协作模式：同时兼容日常代码开发与文档撰写，提示词中立平衡。</span>
+              </div>
               <div class="field">
                 <div class="switch-row">
                   <div>
@@ -1493,7 +1507,7 @@
     <div class="modal-body" id="updateModalBody">
       <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;background:var(--bg-deep);border:1px solid var(--border-hair);border-radius:10px;padding:12px 14px;">
         <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;">
-          <span style="font-size:12.5px;color:var(--text-secondary);">当前版本：<strong class="mono" id="updCurVer" style="color:var(--text-primary);">2.1.0</strong></span>
+          <span style="font-size:12.5px;color:var(--text-secondary);">当前版本：<strong class="mono" id="updCurVer" style="color:var(--text-primary);">2.2.0</strong></span>
           <span style="font-size:12.5px;color:var(--text-secondary);">最新版本：<strong class="mono" id="updLatestVer" style="color:var(--accent-ink);">--</strong></span>
           <span class="keycap" id="updSourceTag" style="display:none;">--</span>
         </div>
@@ -1590,7 +1604,8 @@
     updateCheckResult: null,
     updateStatus: null,
     updatePollTimer: null,
-    updateAutoChecked: false
+    updateAutoChecked: false,
+    workMode: "general"
   };
 
   function $(id) { return document.getElementById(id); }
@@ -1911,6 +1926,7 @@
     try {
       const res = await callHostApi("getStatus");
       state.statusData = res;
+      if (res && res.work_mode) renderWorkModeUi(res.work_mode);
       renderPoolMetrics();
     } catch (_) {}
   }
@@ -3176,8 +3192,44 @@
       if ($("cfgUpdaterMode")) $("cfgUpdaterMode").value = upd.mode || "auto";
       if ($("cfgUpdaterRepo")) $("cfgUpdaterRepo").value = upd.repo || "zhao060206/quickrelay-studio";
       if ($("cfgUpdaterMirror")) $("cfgUpdaterMirror").value = upd.custom_mirror || "";
+      renderWorkModeUi(obj.work_mode || state.workMode || "general");
       $("cfgRawJson").value = JSON.stringify(obj, null, 2);
     } catch (e) { showToast("error", "配置解析失败: " + e.message); }
+  }
+
+  const WORK_MODE_HINTS = {
+    general: "综合协作模式：兼顾代码开发与日常文档办公，措辞中立自然。",
+    document: "文档与学术办公模式：彻底去除编程/命令术语，首轮读文件自动破冰降档，且不上传易引发风控的 guidelines 附件，专为论文审稿与 Word/PDF 办公优化。",
+    coding: "代码工程模式：保留完整前端/后端开发协作引导、脚手架分步建议与命令行调用偏好。"
+  };
+  const WORK_MODE_LABELS = { general: "综合协作", document: "文档办公", coding: "代码工程" };
+
+  function normalizeWorkModeUi(m) {
+    const v = String(m || "").trim().toLowerCase();
+    return (v === "document" || v === "coding") ? v : "general";
+  }
+
+  function renderWorkModeUi(mode) {
+    const norm = normalizeWorkModeUi(mode);
+    state.workMode = norm;
+    const seg = $("topWorkModeSeg");
+    if (seg) {
+      seg.querySelectorAll(".seg-btn").forEach((b) => b.classList.toggle("active", b.getAttribute("data-mode") === norm));
+    }
+    if ($("cfgWorkMode")) $("cfgWorkMode").value = norm;
+    if ($("workModeHint")) $("workModeHint").textContent = WORK_MODE_HINTS[norm] || WORK_MODE_HINTS.general;
+  }
+
+  async function switchWorkModeNow(mode) {
+    const norm = normalizeWorkModeUi(mode);
+    renderWorkModeUi(norm);
+    try {
+      const res = await callHostApi("setWorkMode", { workMode: norm });
+      const imm = res && res.applied_immediately;
+      showToast("success", `已切换为「${WORK_MODE_LABELS[norm]}」模式${imm ? "（免重启已生效）" : "（已写入配置）"}`);
+    } catch (err) {
+      showToast("error", "切换场景模式失败: " + err.message);
+    }
   }
 
   function collectConfigJson() {
@@ -3194,6 +3246,7 @@
     baseObj.session_reuse = !!$("cfgSessionReuse").checked;
     baseObj.session_ttl = $("cfgSessionTtl").value.trim() || "24h";
     baseObj.api_keys = $("cfgApiKeys").value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    baseObj.work_mode = ($("cfgWorkMode") && normalizeWorkModeUi($("cfgWorkMode").value)) || state.workMode || "general";
     baseObj.guardrails = {
       compact_downgrade: $("cfgGuardCompact") ? !!$("cfgGuardCompact").checked : true,
       no_tool_max_cap: $("cfgGuardNoToolMax") ? !!$("cfgGuardNoToolMax").checked : true,
@@ -3220,6 +3273,16 @@
   $("btnReloadConfig").addEventListener("click", loadConfig);
   $("btnSaveConfig").addEventListener("click", () => saveConfig(false));
   $("btnSaveRestart").addEventListener("click", () => saveConfig(true));
+  if ($("topWorkModeSeg")) {
+    $("topWorkModeSeg").addEventListener("click", (e) => {
+      const btn = e.target.closest(".seg-btn");
+      if (!btn) return;
+      switchWorkModeNow(btn.getAttribute("data-mode"));
+    });
+  }
+  if ($("cfgWorkMode")) {
+    $("cfgWorkMode").addEventListener("change", (e) => renderWorkModeUi(e.target.value));
+  }
   $("btnToggleRawJson").addEventListener("click", () => {
     const wrap = $("rawJsonWrap");
     if (wrap.style.display === "none") {
@@ -3300,8 +3363,8 @@
   function renderUpdateCheckResult(res) {
     if (!res) return;
     state.updateCheckResult = res;
-    $("updCurVer").textContent = "v" + (res.current_version || "2.1.0");
-    $("brandVersion").textContent = res.current_version || "2.1.0";
+    $("updCurVer").textContent = "v" + (res.current_version || "2.2.0");
+    $("brandVersion").textContent = res.current_version || "2.2.0";
     $("updLatestVer").textContent = res.latest_version ? ("v" + res.latest_version) : "--";
 
     const srcTag = $("updSourceTag");

@@ -1,4 +1,4 @@
-# QuickRelay Studio v2.1.0
+# QuickRelay Studio v2.2.0
 
 **QuickRelay Studio** 是一款基于 Go 与 WebView2 桌面端打造的独立双协议 AI 反代网关与账号池管理控制台。支持将多个 AWS Quick 账号聚合为标准的 **OpenAI** 与 **Anthropic Messages** API，免改造直连 **Claude Code**、**Codex CLI** 及各类开源 SDK，并内置完整的请求明细统计与 1M 上下文持久化会话追踪。
 
@@ -17,7 +17,11 @@
      - `claude-haiku-*` 轻量模型自动分流至 `fast`，其余 `sonnet`/`opus` 走 `smart`；
      - 当请求携带 `AskUserQuestion` 工具时，自动将模型输出的 `<decision>` 交互标签转为标准原生 `tool_use` 卡片选项。
 
-2. **防撞墙与长思考保护（v2.1.0 新增）**
+2. **工作场景模式与防撞墙保护（v2.2.0 新增与升级）**
+   - **三档工作场景一键热切换（顶部状态栏免重启切换 `work_mode`）**：
+     - **`general`（综合协作，默认）**：兼顾日常代码与文档任务，提示词中立通用；
+     - **`document`（文档与学术办公专属）**：专为论文审稿、Word/PDF/PPT/Excel 办公用户优化——彻底去除“本地编程/命令执行”偏见措辞、明确告知模型文件在本机授权目录（无需搜云端 Quick 空间）、首轮尚未读入文件时自动将 `high`/`max` 平滑破冰为 `medium`（读到文件后自动恢复满血思考）、且超长系统规范不外置成容易引发防注入警觉的 `guidelines-*.txt` 附件；
+     - **`coding`（代码工程）**：保留完整前后端开发脚手架、HTML/SVG 与增量验证指导。
    - **规避上游单步 64K Output 硬墙**：针对 AWS 上游单轮 64,000 Output Token 硬上限导致的“约 10 分钟断流”与 `/compact` 失败，提供可配置三项自动防护（可在「配置」页面独立开关）：
      - **`/compact` 自动降档（`guardrails.compact_downgrade`）**：识别会话压缩摘要指令后自动将本轮 `thinking_effort` 降为 `low`，避免过度推理耗尽输出预算而报 `Server error mid-response`；
      - **无工具请求 `max` 限幅（`guardrails.no_tool_max_cap`）**：纯文本长思考且无可用本地工具时自动将 `max` 平滑限幅至 `high`，既保留充分推理又降低单轮撞墙概率（仍保持下游流式心跳保活）；

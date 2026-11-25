@@ -3,7 +3,7 @@ package version
 
 const (
 	// Current 为当前发行版本号。
-	Current = "2.1.0"
+	Current = "2.2.0"
 	// RepoOwner 为官方 GitHub 仓库所有者。
 	RepoOwner = "zhao060206"
 	// RepoName 为官方 GitHub 仓库名称。

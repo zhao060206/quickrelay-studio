@@ -36,6 +36,7 @@ type settings struct {
 	OAuth            config.OAuth      `json:"oauth"`
 	WebUI            config.WebUI      `json:"webui"`
 	Usage            config.Usage      `json:"usage"`
+	WorkMode         string            `json:"work_mode"`
 	Guardrails       config.Guardrails `json:"guardrails"`
 	Updater          config.Updater    `json:"updater"`
 }
@@ -48,7 +49,7 @@ func settingsFromConfig(cfg config.Config) settings {
 		WorkingSessionID: cfg.WorkingSessionID, Timezone: cfg.Timezone, Locale: cfg.Locale,
 		ThinkingEffort: cfg.ThinkingEffort, ChatAgentID: cfg.ChatAgentID, KeepSessions: cfg.KeepSessions,
 		SessionReuse: cfg.SessionReuse, SessionTTL: cfg.SessionTTL, OAuth: cfg.OAuth, WebUI: cfg.WebUI, Usage: cfg.Usage,
-		Guardrails: cfg.Guardrails, Updater: cfg.Updater,
+		WorkMode: config.NormalizeWorkMode(cfg.WorkMode), Guardrails: cfg.Guardrails, Updater: cfg.Updater,
 	}
 }
 
@@ -92,7 +93,7 @@ func (value settings) config(keys []string, path string) config.Config {
 		WorkingSessionID: value.WorkingSessionID, Timezone: value.Timezone, Locale: value.Locale,
 		ThinkingEffort: value.ThinkingEffort, ChatAgentID: value.ChatAgentID, KeepSessions: value.KeepSessions,
 		SessionReuse: value.SessionReuse, SessionTTL: value.SessionTTL, OAuth: value.OAuth, WebUI: value.WebUI, Usage: value.Usage,
-		Guardrails: guardrailsCfg, Updater: updaterCfg, Path: path,
+		WorkMode: config.NormalizeWorkMode(value.WorkMode), Guardrails: guardrailsCfg, Updater: updaterCfg, Path: path,
 	}
 }
 
@@ -145,6 +146,9 @@ func (value settings) validate() error {
 		return fmt.Errorf("thinking_effort must be empty, off, low, medium, high or max")
 	}
 	if err := config.ValidateUpdater(value.Updater); err != nil {
+		return err
+	}
+	if err := config.ValidateWorkMode(value.WorkMode); err != nil {
 		return err
 	}
 	return nil
@@ -220,7 +224,43 @@ func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "config_save_failed", "Could not save configuration; check field values and config directory permissions")
 		return
 	}
+	s.cfg.SetWorkMode(candidate.WorkMode)
 	s.saved = candidate
 	s.restartNeeded = true
 	s.writeSettingsLocked(w)
+}
+
+// handleWorkModeSet 热切换工作场景模式并立即持久化到 config.json，无需重启网关。
+func (s *Server) handleWorkModeSet(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		WorkMode string `json:"work_mode"`
+	}
+	if !decodeJSON(w, r, &input, 16<<10) {
+		return
+	}
+	if err := config.ValidateWorkMode(input.WorkMode); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_work_mode", err.Error())
+		return
+	}
+	mode := config.NormalizeWorkMode(input.WorkMode)
+
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	candidate := s.saved
+	candidate.Path = s.cfg.Path
+	candidate.SetModelAliases(s.saved.GetModelAliases())
+	candidate.WorkMode = mode
+	if strings.TrimSpace(candidate.Path) != "" {
+		if err := candidate.Save(); err != nil {
+			writeError(w, http.StatusInternalServerError, "config_save_failed", "Could not persist work_mode to config.json")
+			return
+		}
+	}
+	s.cfg.SetWorkMode(mode)
+	s.saved = candidate
+	writeJSON(w, http.StatusOK, map[string]any{
+		"work_mode":           mode,
+		"applied_immediately": true,
+	})
 }

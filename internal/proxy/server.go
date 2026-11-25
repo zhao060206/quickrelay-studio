@@ -256,19 +256,26 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 	if req.ParallelToolCalls != nil {
 		parallelTools = *req.ParallelToolCalls
 	}
-	bridgePrompt := buildToolBridgePrompt(req, choiceMode, choiceName, parallelTools)
+	workMode := s.cfg.GetWorkMode()
+	bridgePrompt := buildToolBridgePromptForMode(req, choiceMode, choiceName, parallelTools, workMode)
 	bridgeActive := bridgePrompt != ""
-	leadingGuide := leadingGuidelines(req.Messages)
-	fullGuide := callerGuidelines(req.Messages)
+	leadingGuide := leadingGuidelinesForMode(req.Messages, workMode)
+	fullGuide := callerGuidelinesForMode(req.Messages, workMode)
 	baseHash := conversationBaseHash(leadingGuide, bridgePrompt)
 
 	rawThinkingEffort := resolveThinkingEffort(req, s.cfg.ThinkingEffort)
 	thinkingEffort := rawThinkingEffort
 	isCompact := isCompactionRequest(req, prompt)
-	if guardedEffort, guardReason := applyThinkingGuards(thinkingEffort, isExplicitThinkingOff(req), isCompact, bridgeActive, choiceMode, s.cfg); guardReason != "" {
+	explicitOff := isExplicitThinkingOff(req)
+	if guardedEffort, guardReason := applyThinkingGuards(thinkingEffort, explicitOff, isCompact, bridgeActive, choiceMode, s.cfg); guardReason != "" {
 		log.Printf("chat %s thinking_guard reason=%s effort=%q->%q bridge=%t choice=%q",
 			idPrefix, guardReason, thinkingEffort, guardedEffort, bridgeActive, choiceMode)
 		thinkingEffort = guardedEffort
+	}
+	if wmEffort, wmReason := applyWorkModeGuards(thinkingEffort, explicitOff, isCompact, bridgeActive, choiceMode, workMode, hasToolResultHistory(req.Messages)); wmReason != "" {
+		log.Printf("chat %s thinking_guard reason=%s effort=%q->%q work_mode=%s",
+			idPrefix, wmReason, thinkingEffort, wmEffort, workMode)
+		thinkingEffort = wmEffort
 	}
 	turnTimeout := s.turnTimeoutFor(thinkingEffort)
 	ctx, cancel := context.WithTimeout(r.Context(), turnTimeout)
@@ -306,7 +313,7 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 	var images []ImageAttachment
 	if s.cfg.SessionReuse && conv.baseHash == baseHash {
 		if delta, ok := conv.delta(req.Messages); ok {
-			deltaGuide := deltaDeveloperGuidelines(delta)
+			deltaGuide := deltaDeveloperGuidelinesForMode(delta, workMode)
 			if deltaPrompt, deltaImages, dErr := formatPromptWithImages(ctx, delta); dErr == nil && (hasVisibleText(deltaPrompt) || len(deltaImages) > 0 || deltaGuide != "") {
 				promptText = deltaPrompt
 				images = deltaImages
@@ -336,6 +343,7 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		Title:          titleFor(lastUserText(req.Messages)),
 		Guidelines:     turnGuidelines,
 		ToolProtocol:   bridgePrompt,
+		WorkMode:       workMode,
 		ChatAgentID:    s.cfg.ChatAgentID,
 		CreateSession:  true,
 		DeleteSession:  !s.cfg.SessionReuse && !s.cfg.KeepSessions,

@@ -16,8 +16,42 @@ import (
 	"quickrelay-studio/internal/version"
 )
 
-// modelAliasMu 保护运行时动态更新的 ModelAliases 映射表，避免放在 Config 结构体中引发按值拷贝锁告警。
-var modelAliasMu sync.RWMutex
+// modelAliasMu 与 workModeMu 分别保护运行时动态更新的映射与工作场景模式，避免放进 Config 结构体触发按值拷贝锁告警。
+var (
+	modelAliasMu sync.RWMutex
+	workModeMu   sync.RWMutex
+)
+
+const (
+	// WorkModeGeneral 为默认综合模式（代码与通用文档兼顾，措辞中立）。
+	WorkModeGeneral = "general"
+	// WorkModeDocument 为文档与学术办公专属模式（去编程化、首轮破冰、规避指南附件触发风控）。
+	WorkModeDocument = "document"
+	// WorkModeCoding 为代码工程模式（保留完整开发协作引导与脚手架规则）。
+	WorkModeCoding = "coding"
+)
+
+// NormalizeWorkMode 规范化工作场景模式；未知或空值返回默认 general。
+func NormalizeWorkMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case WorkModeDocument:
+		return WorkModeDocument
+	case WorkModeCoding:
+		return WorkModeCoding
+	default:
+		return WorkModeGeneral
+	}
+}
+
+// ValidateWorkMode 校验 work_mode 配置值是否合法（允许空串代表默认 general）。
+func ValidateWorkMode(raw string) error {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", WorkModeGeneral, WorkModeDocument, WorkModeCoding:
+		return nil
+	default:
+		return fmt.Errorf("work_mode must be general, document or coding")
+	}
+}
 
 // Duration is a time.Duration encoded as a Go duration string ("5m", "1h").
 type Duration time.Duration
@@ -151,6 +185,7 @@ type Config struct {
 	OAuth            OAuth      `json:"oauth"`
 	WebUI            WebUI      `json:"webui"`
 	Usage            Usage      `json:"usage"`
+	WorkMode         string     `json:"work_mode,omitempty"`
 	Guardrails       Guardrails `json:"guardrails"`
 	Updater          Updater    `json:"updater"`
 
@@ -196,6 +231,7 @@ func Default() Config {
 			RefreshInterval: Duration(5 * time.Minute),
 			MaxAttempts:     3,
 		},
+		WorkMode: WorkModeGeneral,
 		Guardrails: Guardrails{
 			CompactDowngrade:   boolPtr(true),
 			NoToolMaxCap:       boolPtr(true),
@@ -250,10 +286,32 @@ func Load(configPath string) (*Config, error) {
 func (c *Config) FileValues() Config {
 	value := *c
 	value.ModelAliases = c.GetModelAliases()
+	value.WorkMode = c.GetWorkMode()
 	if c.originalDatabase != "" && c.Database == c.resolvedDatabase {
 		value.Database = c.originalDatabase
 	}
 	return value
+}
+
+// GetWorkMode 线程安全地读取当前生效的工作场景模式。
+func (c *Config) GetWorkMode() string {
+	if c == nil {
+		return WorkModeGeneral
+	}
+	workModeMu.RLock()
+	defer workModeMu.RUnlock()
+	return NormalizeWorkMode(c.WorkMode)
+}
+
+// SetWorkMode 线程安全地更新运行时工作场景模式，立即对后续请求生效。
+func (c *Config) SetWorkMode(mode string) {
+	if c == nil {
+		return
+	}
+	norm := NormalizeWorkMode(mode)
+	workModeMu.Lock()
+	defer workModeMu.Unlock()
+	c.WorkMode = norm
 }
 
 // LookupModelAlias 线程安全地按小写名称查询运行时自定义的模型路由别名。
@@ -445,6 +503,11 @@ func applyDefaults(c *Config) {
 		c.Updater.Mode = strings.ToLower(strings.TrimSpace(c.Updater.Mode))
 	}
 	c.Updater.CustomMirror = strings.TrimRight(strings.TrimSpace(c.Updater.CustomMirror), "/")
+	if strings.TrimSpace(c.WorkMode) == "" {
+		c.WorkMode = d.WorkMode
+	} else {
+		c.WorkMode = NormalizeWorkMode(c.WorkMode)
+	}
 	if len(c.ModelAliases) > 0 {
 		c.SetModelAliases(c.ModelAliases)
 	}
@@ -480,6 +543,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("oauth.build_stage must be prod, beta, integ or dev")
 	}
 	if err := ValidateUpdater(c.Updater); err != nil {
+		return err
+	}
+	if err := ValidateWorkMode(c.WorkMode); err != nil {
 		return err
 	}
 	return nil

@@ -104,6 +104,48 @@ func applyThinkingGuards(effort string, explicitOff bool, isCompact bool, bridge
 	return effort, ""
 }
 
+// hasToolResultHistory 检测当前对话历史中是否已有客户端工具执行结果回传，
+// 用于区分“首次建立工具协作的破冰轮次”与“已读入文件后的深度分析轮次”。
+func hasToolResultHistory(msgs []Message) bool {
+	for _, m := range msgs {
+		role := strings.ToLower(strings.TrimSpace(m.Role))
+		if role == "tool" || role == "function" || len(m.ToolCalls) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// applyWorkModeGuards 针对文档与学术办公场景的首轮工具调用执行平滑破冰降档：
+// 首轮尚未收到工具回传时，将 high / max 暂降为 medium，抑制过长自我怀疑引发的拒答；
+// 第二轮开始已存在工具回传记录后，恢复原本的 high / max 深度推理能力。
+func applyWorkModeGuards(effort string, explicitOff bool, isCompact bool, bridgeActive bool, choiceMode string, workMode string, hasToolHistory bool) (string, string) {
+	if config.NormalizeWorkMode(workMode) != config.WorkModeDocument {
+		return effort, ""
+	}
+	if isCompact || explicitOff || !bridgeActive || choiceMode == "none" || hasToolHistory {
+		return effort, ""
+	}
+	if effort == "high" || effort == "max" {
+		return "medium", "document_first_turn_icebreak"
+	}
+	return effort, ""
+}
+
+// compactGuidelinesInline 在文档办公模式不希望上传 guidelines-*.txt 附件触发防注入警觉时，
+// 构造精简内联版 <workspace_guidelines>，保留环境目录摘要并优先保护完整 <client_tool_protocol>。
+func compactGuidelinesInline(envSummary string) string {
+	var b strings.Builder
+	b.WriteString("<workspace_guidelines>\n")
+	b.WriteString("Client workspace preferences summarized inline to keep focus on the user's documents and local actions.")
+	if trimmed := strings.TrimSpace(envSummary); trimmed != "" {
+		b.WriteString("\n\nKey workspace environment summary:\n")
+		b.WriteString(trimmed)
+	}
+	b.WriteString("\n</workspace_guidelines>")
+	return b.String()
+}
+
 // extractEnvSummary 从完整工作区规范中提取 <env> 环境块与关键工作目录元信息，
 // 在规范外置为附件时仍将其保留在主消息帧内，消除模型翻查附件路径引发的多余思考。
 func extractEnvSummary(rawGuidelines string) string {

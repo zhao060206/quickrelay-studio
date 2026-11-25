@@ -44,17 +44,17 @@ func TestCheckAutoFallbackAndModes(t *testing.T) {
 	defer failServer.Close()
 
 	cnManifest := ReleaseManifest{
-		Version:      "2.2.0",
-		Tag:          "v2.2.0",
+		Version:      "9.9.0",
+		Tag:          "v9.9.0",
 		PublishedAt:  "2026-11-26T00:00:00Z",
 		ReleaseNotes: "新增更新降级测试说明",
-		ReleaseURL:   "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.2.0",
+		ReleaseURL:   "https://github.com/zhao060206/quickrelay-studio/releases/tag/v9.9.0",
 		Assets: map[string]ManifestAsset{
 			"windows_amd64": {
-				Name:   "QuickRelay-Studio-v2.2.0-win-x64.zip",
+				Name:   "QuickRelay-Studio-v9.9.0-win-x64.zip",
 				Size:   1024,
 				SHA256: stringsRepeat("a", 64),
-				URL:    "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.2.0/QuickRelay-Studio-v2.2.0-win-x64.zip",
+				URL:    "https://github.com/zhao060206/quickrelay-studio/releases/download/v9.9.0/QuickRelay-Studio-v9.9.0-win-x64.zip",
 			},
 		},
 	}
@@ -86,7 +86,7 @@ func TestCheckAutoFallbackAndModes(t *testing.T) {
 	if !resAuto.FallbackUsed || resAuto.SourceKind != "cn" || resAuto.SourceUsed != "gh-proxy" {
 		t.Fatalf("expected fallback to cn gh-proxy, got %+v", resAuto)
 	}
-	if !resAuto.HasUpdate || resAuto.LatestVersion != "2.2.0" || resAuto.CurrentVersion != version.Current {
+	if !resAuto.HasUpdate || resAuto.LatestVersion != "9.9.0" || resAuto.CurrentVersion != version.Current {
 		t.Fatalf("unexpected version result: %+v", resAuto)
 	}
 

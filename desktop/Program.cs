@@ -825,7 +825,7 @@ namespace QuickRelayStudioDesktop
 
         private void InitializeFormWindow()
         {
-            this.Text = "QuickRelay Studio 2.1.0";
+            this.Text = "QuickRelay Studio 2.2.0";
             this.AutoScaleMode = AutoScaleMode.None;
             this.WindowState = FormWindowState.Normal;
             this.StartPosition = FormStartPosition.CenterScreen;
@@ -1417,6 +1417,10 @@ namespace QuickRelayStudioDesktop
                     ApplyDownloadedUpdate(reqId, GetDictString(msg, "stagingDir"));
                     break;
 
+                case "setWorkMode":
+                    await HandleSetWorkModeAsync(reqId, GetDictString(msg, "workMode"));
+                    break;
+
                 case "clearLogs":
                     lock (_logLock)
                     {
@@ -1504,6 +1508,46 @@ namespace QuickRelayStudioDesktop
                 string raw = await _apiClient.PostRawJsonAsync("/api/logins/" + Uri.EscapeDataString(id) + "/callback", _json.Serialize(payload));
                 SendApiResponse(reqId, true, raw, string.Empty);
                 await RefreshAccountsAndPushAsync();
+            }
+            catch (Exception ex)
+            {
+                SendApiResponse(reqId, false, "null", ex.Message);
+            }
+        }
+
+        private async Task HandleSetWorkModeAsync(string reqId, string workMode)
+        {
+            string mode = (workMode ?? string.Empty).Trim().ToLowerInvariant();
+            if (mode != "general" && mode != "document" && mode != "coding")
+            {
+                mode = "general";
+            }
+            try
+            {
+                if (_serviceState == "running")
+                {
+                    Dictionary<string, object> payload = new Dictionary<string, object>();
+                    payload["work_mode"] = mode;
+                    string raw = await _apiClient.PutRawJsonAsync("/api/work-mode", _json.Serialize(payload));
+                    PushLocalConfigToWeb();
+                    SendApiResponse(reqId, true, raw, string.Empty);
+                    return;
+                }
+
+                string rawCfg = LoadLocalConfigJsonString();
+                Dictionary<string, object> parsed = _json.Deserialize<Dictionary<string, object>>(rawCfg);
+                if (parsed == null)
+                {
+                    parsed = new Dictionary<string, object>();
+                }
+                parsed["work_mode"] = mode;
+                string formatted = PrettyPrintConfigDict(parsed);
+                File.WriteAllText(_configPath, formatted, new UTF8Encoding(false));
+                PushLocalConfigToWeb();
+                Dictionary<string, object> resp = new Dictionary<string, object>();
+                resp["work_mode"] = mode;
+                resp["applied_immediately"] = false;
+                SendApiResponse(reqId, true, _json.Serialize(resp), string.Empty);
             }
             catch (Exception ex)
             {
