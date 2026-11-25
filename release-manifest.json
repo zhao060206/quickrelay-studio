@@ -1,15 +1,15 @@
 {
-  "version": "2.2.1",
-  "tag": "v2.2.1",
-  "published_at": "2026-11-25T05:55:09Z",
-  "release_notes": "QuickRelay Studio v2.2.1 更新内容：\n1. 修复在线更新器下载大文件时因过早取消 Context 引发 context canceled 的问题，现支持完整流式下载与国内源自动降级；\n2. 完整包含 v2.2.0 三档工作场景模式（综合 / 文档办公 / 代码工程）免重启热切换及文档防拒答优化；\n3. 完整包含 v2.1.0 防撞墙与 /compact 降档保护功能。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.2.1",
+  "version": "2.3.0",
+  "tag": "v2.3.0",
+  "published_at": "2026-11-25T10:13:24Z",
+  "release_notes": "QuickRelay Studio v2.3.0 更新内容（强烈推荐升级）：\n1. 消除续聊每轮重复灌入 ~20,000 Token 工具表的黑洞：\n   - 同一会话首次发送完整工具表，工具列表未变时续聊仅附 ~90 Token 极简提醒（每 24 轮自动锚定刷新一次），大幅减少无效 cache_write 膨胀；\n   - 工具列表微调时直接在原 thread_id 内平滑更新，不再换号重开。\n2. 大幅提升会话复用率，告别无故“重头再来”：\n   - conv_key 与 delta() 忽略前导 system 动态提示（时间/工作模式切换）变化，精准复用既有 1M 会话与历史缓存；\n   - 自动隔离 [SUGGESTION MODE:] / 标题生成等无工具旁路辅助请求，防止覆盖主会话；\n   - 账号 Token 到期刷新（retryRefresh）成功后继续沿用原会话，不清空 thread_id。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.3.0",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.2.1-win-x64.zip",
-      "size": 8611857,
-      "sha256": "d2fdeb0fe289c19c1a94cb8967666e9f37d5f9800d85d20b7dbefcde7389a29e",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.2.1/QuickRelay-Studio-v2.2.1-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.3.0-win-x64.zip",
+      "size": 8616683,
+      "sha256": "2fa35685383f1d22728e8cf920c2ece70ba5c237b2875034343ed755c4b11882",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.3.0/QuickRelay-Studio-v2.3.0-win-x64.zip"
     }
   }
 }

@@ -41,18 +41,64 @@ func (c *conversation) idle() time.Duration {
 	return time.Since(time.Unix(0, last))
 }
 
-// delta 将传入完整消息列表的哈希前缀与已持久化的历史消息哈希对比，
-// 仅当长度严格递增且已有前缀逐条一致时，返回本次需要增量发送的新增消息。
+// nonLeadingMessages 跳过消息序列开头连续的 system / developer 消息，提取真实对话消息前缀，
+// 使前导动态提示或工作区说明变动时不再破坏多轮会话前缀匹配。
+func nonLeadingMessages(msgs []Message) []Message {
+	idx := 0
+	for idx < len(msgs) {
+		role := strings.ToLower(strings.TrimSpace(msgs[idx].Role))
+		if role != "system" && role != "developer" {
+			break
+		}
+		idx++
+	}
+	return msgs[idx:]
+}
+
+// nonLeadingMessageFingerprints 为非前导消息逐条生成带 "nl:" 前缀的指纹，以与旧版记录区分并保持无缝兼容。
+func nonLeadingMessageFingerprints(msgs []Message) []string {
+	trimmed := nonLeadingMessages(msgs)
+	out := make([]string, len(trimmed))
+	for i, m := range trimmed {
+		out[i] = "nl:" + messageFingerprint(m)
+	}
+	return out
+}
+
+// delta 将传入消息列表的非前导对话序列与已持久化前缀对比：
+// - 新版 "nl:" 记录忽略开头 system/developer 动态变更，只要对话消息前缀一致即增量复用；
+// - 旧版无 "nl:" 前缀记录保持逐条前缀兼容，同时支持跳过前导 system 条数微调后继续复用。
 func (c *conversation) delta(msgs []Message) ([]Message, bool) {
-	if c.threadID == "" || len(c.msgHashes) == 0 || len(msgs) <= len(c.msgHashes) {
+	if c.threadID == "" || len(c.msgHashes) == 0 {
 		return nil, false
 	}
-	for i, expected := range c.msgHashes {
-		if messageFingerprint(msgs[i]) != expected {
+	if strings.HasPrefix(c.msgHashes[0], "nl:") {
+		cur := nonLeadingMessages(msgs)
+		if len(cur) <= len(c.msgHashes) {
 			return nil, false
 		}
+		for i, expected := range c.msgHashes {
+			if "nl:"+messageFingerprint(cur[i]) != expected {
+				return nil, false
+			}
+		}
+		return cur[len(c.msgHashes):], true
 	}
-	return msgs[len(c.msgHashes):], true
+
+	// 兼容旧版未带 nl: 前缀的历史持久化记录
+	if len(msgs) > len(c.msgHashes) {
+		matched := true
+		for i, expected := range c.msgHashes {
+			if messageFingerprint(msgs[i]) != expected {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return msgs[len(c.msgHashes):], true
+		}
+	}
+	return nil, false
 }
 
 func (c *conversation) clearInMemory() {
@@ -170,7 +216,7 @@ func (s *conversationStore) save(c *conversation, threadID string, accountID int
 	c.threadID = threadID
 	c.accountID = accountID
 	c.baseHash = baseHash
-	c.msgHashes = messageFingerprints(msgs)
+	c.msgHashes = nonLeadingMessageFingerprints(msgs)
 	c.loaded = true
 	c.touch()
 
@@ -216,6 +262,32 @@ func (s *conversationStore) reset(c *conversation) {
 	if err := s.store.DeleteConversation(ctx, c.key); err != nil {
 		log.Printf("conversation delete key=%s failed: %v", c.key, err)
 	}
+}
+
+// shortSHA256 返回输入文本的 SHA-256 前 32 位小写 hex（空串返回 ""）。
+func shortSHA256(text string) string {
+	if text == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:16])
+}
+
+// encodeBaseHash 将静态规范摘要与工具定义摘要编码到 base_hash 列，保持表结构免迁移。
+func encodeBaseHash(guideHash, toolHash string) string {
+	return "v2:" + guideHash + ":" + toolHash
+}
+
+// splitBaseHash 解析持久化记录中的规范摘要与工具定义摘要（兼容旧版纯 SHA-256 值）。
+func splitBaseHash(stored string) (guideHash, toolHash string) {
+	if strings.HasPrefix(stored, "v2:") {
+		rest := strings.TrimPrefix(stored, "v2:")
+		if idx := strings.IndexByte(rest, ':'); idx >= 0 {
+			return rest[:idx], rest[idx+1:]
+		}
+		return rest, ""
+	}
+	return stored, ""
 }
 
 // conversationBaseHash 计算会话基线的 SHA-256 指纹，仅纳入会话开头静态工作区规范与工具协议，
@@ -281,29 +353,41 @@ func writeCanonicalContent(h interface{ Write([]byte) (int, error) }, content an
 	}
 }
 
-// conversationKey 标识一条 OpenAI 会话：优先采用请求头 X-Conversation-Id 或 X-Thread-Id，
-// 否则结合鉴权身份、前导基线哈希及首条对话消息指纹计算，保证随着多轮拼接与尾部动态上下文新增而保持稳定。
+// conversationKey 标识一条会话：
+// 1) 优先使用显式请求头 X-Conversation-Id / X-Thread-Id；
+// 2) 旁路无工具辅助请求（建议/标题）分配一次性隔离键防止污染主会话；
+// 3) 正常主会话仅绑定鉴权身份、是否有工具及首条非 system/developer 消息指纹，
+//    不再把易变的系统提示词或 work_mode 焊死在会话路由键中，大幅提升多轮复用命中率。
 func conversationKey(r *http.Request, req *ChatRequest, baseHash string) string {
 	for _, header := range []string{"X-Conversation-Id", "X-Thread-Id"} {
 		if id := strings.TrimSpace(r.Header.Get(header)); id != "" {
 			return "h:" + id
 		}
 	}
+	if isAuxiliarySideRequest(req, "") {
+		return "aux:" + uuid()
+	}
 	h := sha256.New()
 	h.Write([]byte(r.Header.Get("Authorization")))
 	h.Write([]byte{0})
 	h.Write([]byte(r.Header.Get("X-Api-Key")))
-	h.Write([]byte{0})
-	h.Write([]byte(baseHash))
+	hasToolsFlag := "t0"
+	if len(req.Tools) > 0 || len(req.Functions) > 0 {
+		hasToolsFlag = "t1"
+	}
 	for _, m := range req.Messages {
 		role := strings.ToLower(strings.TrimSpace(m.Role))
 		if role == "system" || role == "developer" {
 			continue
 		}
 		h.Write([]byte{0})
+		h.Write([]byte(hasToolsFlag))
+		h.Write([]byte{0})
 		h.Write([]byte(messageFingerprint(m)))
 		return "c:" + hex.EncodeToString(h.Sum(nil))
 	}
+	h.Write([]byte{0})
+	h.Write([]byte(baseHash))
 	for _, m := range req.Messages {
 		h.Write([]byte{0})
 		h.Write([]byte(messageFingerprint(m)))

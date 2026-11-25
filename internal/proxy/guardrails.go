@@ -104,6 +104,40 @@ func applyThinkingGuards(effort string, explicitOff bool, isCompact bool, bridge
 	return effort, ""
 }
 
+// isAuxiliarySideRequest 识别客户端发起的无工具旁路辅助请求（例如建议输入、生成会话标题），
+// 使其使用独立一次性会话键与不写库隔离，防止覆盖或污染主编程/文档会话缓存。
+func isAuxiliarySideRequest(req *ChatRequest, prompt string) bool {
+	if req == nil || len(req.Tools) > 0 || len(req.Functions) > 0 {
+		return false
+	}
+	var parts []string
+	for _, m := range req.Messages {
+		if text := strings.TrimSpace(contentText(m.Content)); text != "" {
+			if len(text) > 1024 {
+				text = text[:1024]
+			}
+			parts = append(parts, text)
+		}
+	}
+	if trimmed := strings.TrimSpace(prompt); trimmed != "" {
+		if len(trimmed) > 1024 {
+			trimmed = trimmed[:1024]
+		}
+		parts = append(parts, trimmed)
+	}
+	lower := strings.ToLower(strings.Join(parts, "\n"))
+	for _, sig := range []string{
+		"[suggestion mode:",
+		"you are coming up with a succinct title for an agent chat session",
+		"generate a concise title",
+	} {
+		if strings.Contains(lower, sig) {
+			return true
+		}
+	}
+	return false
+}
+
 // hasToolResultHistory 检测当前对话历史中是否已有客户端工具执行结果回传，
 // 用于区分“首次建立工具协作的破冰轮次”与“已读入文件后的深度分析轮次”。
 func hasToolResultHistory(msgs []Message) bool {

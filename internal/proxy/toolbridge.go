@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -166,6 +168,59 @@ func buildToolBridgePromptForMode(req *ChatRequest, mode, name string, parallel 
 		b.WriteString("- You must request at least one action before answering.\n")
 	}
 	b.WriteString("</client_tool_protocol>")
+	return b.String()
+}
+
+// toolProtocolFingerprint 仅基于归一化工具定义列表、tool_choice 与并发/强制模式计算稳定短指纹，
+// 不受 work_mode 协作措辞变化影响，用于判断同一会话续聊时工具集是否真正发生变动。
+func toolProtocolFingerprint(req *ChatRequest, mode, name string, parallel bool) string {
+	if req == nil || mode == "none" {
+		return ""
+	}
+	defs := collectToolDefinitions(req.Tools, req.Functions)
+	if len(defs) == 0 {
+		return ""
+	}
+	payload := struct {
+		Tools    []toolDefinition `json:"tools"`
+		Choice   any              `json:"tool_choice,omitempty"`
+		Mode     string           `json:"mode"`
+		Name     string           `json:"name,omitempty"`
+		Parallel bool             `json:"parallel"`
+	}{
+		Tools:    defs,
+		Choice:   req.ToolChoice,
+		Mode:     mode,
+		Name:     name,
+		Parallel: parallel,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:16])
+}
+
+// buildResumeToolReminder 为复用已有 thread_id 且工具定义未变的续聊轮次生成极简协议提醒，
+// 避免每轮重复注入约 20,000 Token 的工具 JSON 定义导致 KV Cache 与上下文额度迅速耗尽。
+func buildResumeToolReminder(mode, name string, parallel bool) string {
+	var b strings.Builder
+	b.WriteString("<client_tool_protocol>\n")
+	b.WriteString("Continue using the client tool definitions and schemas already established earlier in this session.\n")
+	b.WriteString(`Format: emit <client_tool_call>{"name":"TOOL_NAME","arguments":{...}}</client_tool_call> with no code fences, or answer normally in plain text if no action is needed.`)
+	if parallel {
+		b.WriteString("\n- Multiple independent actions may be emitted sequentially in one turn.")
+	} else {
+		b.WriteString("\n- Request at most one action per turn.")
+	}
+	if mode == "function" && name != "" {
+		fmt.Fprintf(&b, "\n- You must call %q.", name)
+	}
+	if mode == "required" {
+		b.WriteString("\n- You must request at least one action before answering.")
+	}
+	b.WriteString("\n</client_tool_protocol>")
 	return b.String()
 }
 

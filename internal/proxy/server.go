@@ -119,12 +119,14 @@ type preparedTurn struct {
 	choiceName    string
 	parallelTools bool
 	bridgeActive  bool
-	baseHash      string
-	fullGuide     string
-	fullPrompt    string
-	fullImages    []ImageAttachment
-	fullLoaded    bool
-	fallbackText  string
+	baseHash                string
+	fullGuide               string
+	fullBridgePrompt        string
+	fullPrompt              string
+	fullImages              []ImageAttachment
+	fullLoaded              bool
+	fallbackText            string
+	auxRequest              bool
 
 	in                     ChatInput
 	requestedThinkingEffort string
@@ -261,7 +263,10 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 	bridgeActive := bridgePrompt != ""
 	leadingGuide := leadingGuidelinesForMode(req.Messages, workMode)
 	fullGuide := callerGuidelinesForMode(req.Messages, workMode)
-	baseHash := conversationBaseHash(leadingGuide, bridgePrompt)
+	toolHash := toolProtocolFingerprint(req, choiceMode, choiceName, parallelTools)
+	guideHash := shortSHA256(leadingGuide)
+	baseHash := encodeBaseHash(guideHash, toolHash)
+	isAux := isAuxiliarySideRequest(req, prompt)
 
 	rawThinkingEffort := resolveThinkingEffort(req, s.cfg.ThinkingEffort)
 	thinkingEffort := rawThinkingEffort
@@ -299,7 +304,9 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		bridgeActive:      bridgeActive,
 		baseHash:          baseHash,
 		fullGuide:               fullGuide,
+		fullBridgePrompt:        bridgePrompt,
 		fallbackText:            prompt,
+		auxRequest:              isAux,
 		requestedThinkingEffort: rawThinkingEffort,
 		startedAt:               time.Now(),
 		maxAttempts:       s.maxAttempts(),
@@ -311,7 +318,7 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 	promptText := ""
 	turnGuidelines := ""
 	var images []ImageAttachment
-	if s.cfg.SessionReuse && conv.baseHash == baseHash {
+	if s.cfg.SessionReuse && !isAux && conv.threadID != "" {
 		if delta, ok := conv.delta(req.Messages); ok {
 			deltaGuide := deltaDeveloperGuidelinesForMode(delta, workMode)
 			if deltaPrompt, deltaImages, dErr := formatPromptWithImages(ctx, delta); dErr == nil && (hasVisibleText(deltaPrompt) || len(deltaImages) > 0 || deltaGuide != "") {
@@ -332,6 +339,20 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		turnGuidelines = fullGuide
 	}
 
+	// 续聊工具表瘦身：同一 thread_id 内只要工具指纹未变且未到 24 轮周期重锚点，
+	// 仅发 ~90 Token 极简提醒，消除每轮重复灌入 ~20,000 Token 工具 Schema 的黑洞。
+	turnToolProtocol := bridgePrompt
+	toolCompact := false
+	if t.resume && bridgeActive && toolHash != "" {
+		_, prevToolHash := splitBaseHash(conv.baseHash)
+		turnCount := len(nonLeadingMessages(req.Messages)) / 2
+		needPeriodicAnchor := turnCount > 0 && turnCount%24 == 0
+		if prevToolHash == toolHash && !needPeriodicAnchor {
+			turnToolProtocol = buildResumeToolReminder(choiceMode, choiceName, parallelTools)
+			toolCompact = true
+		}
+	}
+
 	threadID := strings.TrimSpace(r.Header.Get("X-Thread-Id"))
 	t.in = ChatInput{
 		Prompt:         promptText,
@@ -342,11 +363,11 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		ThreadID:       threadID,
 		Title:          titleFor(lastUserText(req.Messages)),
 		Guidelines:     turnGuidelines,
-		ToolProtocol:   bridgePrompt,
+		ToolProtocol:   turnToolProtocol,
 		WorkMode:       workMode,
 		ChatAgentID:    s.cfg.ChatAgentID,
 		CreateSession:  true,
-		DeleteSession:  !s.cfg.SessionReuse && !s.cfg.KeepSessions,
+		DeleteSession:  (!s.cfg.SessionReuse && !s.cfg.KeepSessions) || isAux,
 	}
 	if t.resume {
 		t.in.ThreadID = conv.threadID
@@ -359,8 +380,8 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		t.requestedModel = "(default)"
 	}
 	turnSystemChars := len(t.in.Guidelines) + len(t.in.ToolProtocol)
-	log.Printf("chat %s start proto=%s model=%s upstream_model=%s thinking_effort=%q timeout=%s stream=%t messages=%d images=%d prompt_chars=%d system_chars=%d reuse=%t thread=%q",
-		t.id, protocol, t.requestedModel, model, thinkingEffort, turnTimeout, req.Stream, len(req.Messages), len(t.in.Images), len(promptText), turnSystemChars, t.resume, t.in.ThreadID)
+	log.Printf("chat %s start proto=%s model=%s upstream_model=%s thinking_effort=%q timeout=%s stream=%t messages=%d images=%d prompt_chars=%d system_chars=%d reuse=%t tool_compact=%t thread=%q",
+		t.id, protocol, t.requestedModel, model, thinkingEffort, turnTimeout, req.Stream, len(req.Messages), len(t.in.Images), len(promptText), turnSystemChars, t.resume, toolCompact, t.in.ThreadID)
 
 	return t, nil
 }
@@ -396,6 +417,7 @@ func (t *preparedTurn) resetConversation() {
 	t.in.ThreadID = ""
 	t.in.CreateSession = true
 	t.in.Guidelines = t.fullGuide
+	t.in.ToolProtocol = t.fullBridgePrompt
 	if fErr := t.loadFull(); fErr != nil {
 		log.Printf("chat %s reset conversation image load failed: %v", t.id, fErr)
 		t.in.Prompt = t.fallbackText
@@ -407,7 +429,7 @@ func (t *preparedTurn) resetConversation() {
 }
 
 func (t *preparedTurn) saveConversation(res ChatResult) {
-	if t.server.cfg.SessionReuse && res.ThreadID != "" && t.usedAccount != nil {
+	if !t.auxRequest && t.server.cfg.SessionReuse && res.ThreadID != "" && t.usedAccount != nil {
 		t.server.sessions.save(t.conv, res.ThreadID, t.usedAccount.ID, t.baseHash, t.req.Messages)
 	}
 }
@@ -556,23 +578,27 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamStarted func() bool, res
 			return res, err
 		}
 		wasResume := t.resume
-		t.resetConversation()
 		switch action {
 		case retryRefresh:
 			if t.refreshedAccounts[acct.ID] {
+				t.resetConversation()
 				t.blockedAccounts[acct.ID] = true
 				break
 			}
 			t.refreshedAccounts[acct.ID] = true
 			refreshed, refreshErr := t.server.accounts.RefreshOne(t.ctx, acct.ID)
 			if refreshErr == nil && !refreshed.Disabled {
+				// 刷新同一账号 Token 成功时保留既有 thread_id 与增量上下文，不清空会话
 				t.preferredAccount = acct.ID
 			} else {
+				t.resetConversation()
 				t.blockedAccounts[acct.ID] = true
 			}
 		case retryNextAccount:
+			t.resetConversation()
 			t.blockedAccounts[acct.ID] = true
 		case retryNewSession:
+			t.resetConversation()
 			if wasResume {
 				t.preferredAccount = acct.ID
 				log.Printf("chat %s session resume failed; retrying with full transcript", t.id)
