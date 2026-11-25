@@ -1,15 +1,15 @@
 {
-  "version": "2.4.1",
-  "tag": "v2.4.1",
-  "published_at": "2026-11-25T14:03:11Z",
-  "release_notes": "QuickRelay Studio v2.4.1 更新内容：\n1. AWS Quick 全量私有渲染标签与死链清洗（流式与非流式一致）：\n   - 完整过滤 <sources>...</sources> 来源引用块（含末尾未闭合残片与孤立闭合标签）；\n   - 支持多引用合并角标 [@0cc622, @8dbdfb] 与单引用 [@0cc622] 精准剥离；\n   - 全面清洗 kg://、qw-file://、qw-tool://、mention:// 平台私有协议死链（纯角标删除，可读文件名/人名保留文本，不影响普通 http/https 链接）；\n   - 升级 <decisions> 复数问题包裹、</invoke> 闭合变体及 multi=\"true\" 属性转换，同时剥离 <artifact> 工件占位、<decision_response> 与 [ACP_ROUTE:...] / [CHAT_AGENT_DELEGATE:...] 内部控制标记；\n   - 免疫流式 UTF-8 分片边界，并 100% 保护 ``` / ~~~ 围栏代码块与行内反引号 `...` 内容不被误删。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.1",
+  "version": "2.4.2",
+  "tag": "v2.4.2",
+  "published_at": "2026-11-25T14:56:40Z",
+  "release_notes": "QuickRelay Studio v2.4.2 更新内容：\n1. 修复 20 秒 WebSocket 握手超时与 SSE 首包预热竞态锁死流式重试的问题：\n   - 新增 OnDispatched 门控信号：仅在 WebSocket 建连成功并已发出 user_message 进入等待模型响应阶段后，才允许启动 high/max/附件请求的 20s 首包 SSE 预热；\n   - 将 WebSocket 拨号握手超时收敛至 12s，彻底避免代理短时波动时抢先发出空 SSE 响应头导致 max_attempts 自动重试被锁死。\n2. 修复续聊遇网络超时/临时故障跨账号重试时的上下文丢失隐患：\n   - 补齐 retryTemporary 重试路由策略，并将 context.DeadlineExceeded 明确归入可重试瞬态错误；\n   - 续聊遇网络超时等非限流临时故障时，优先在原绑定账号原地重连 1 次，尽力保住云端既有百万 Token 缓存；\n   - 仅当原账号原地重连再次失败或命中 429 限流时才切往备号，并在切号前强制新建 thread_id、完整携带前文历史与完整工具表，杜绝把旧账号增量错发给新账号；\n   - 全账号因网络断连均失败时保留既有持久化会话绑定，网络恢复后仍可无损续聊。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.2",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.4.1-win-x64.zip",
-      "size": 8654656,
-      "sha256": "634c70fa30258932c5d2a8af400d305674c6bffd9d98ad4fd8dcaf8fb1df5e4c",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.1/QuickRelay-Studio-v2.4.1-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.4.2-win-x64.zip",
+      "size": 8658081,
+      "sha256": "6c8174bbc59372216bd69ac43ee7aee37bb1601788d0f0236332fd2747bbff41",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.2/QuickRelay-Studio-v2.4.2-win-x64.zip"
     }
   }
 }

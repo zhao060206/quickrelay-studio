@@ -908,6 +908,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		turn.ctx,
 		turn.needsThinkingHeartbeat(),
 		isStarted,
+		turn.upstreamWaitingSince,
 		ensureStarted,
 		sendAnthropicPing,
 		lastWrite,

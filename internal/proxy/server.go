@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"quickrelay-studio/internal/accounts"
@@ -136,11 +137,29 @@ type preparedTurn struct {
 	maxAttempts int
 	usedAccount *store.Account
 
-	blockedAccounts   map[int64]bool
-	attemptedAccounts map[int64]bool
-	refreshedAccounts map[int64]bool
-	pinnedFirst       bool
-	preferredAccount  int64
+	blockedAccounts     map[int64]bool
+	attemptedAccounts   map[int64]bool
+	refreshedAccounts   map[int64]bool
+	sameAccountRetried  map[int64]bool
+	pinnedFirst         bool
+	preferredAccount    int64
+	upstreamWaitingNano atomic.Int64
+}
+
+func (t *preparedTurn) markUpstreamWaiting() {
+	t.upstreamWaitingNano.Store(time.Now().UnixNano())
+}
+
+func (t *preparedTurn) clearUpstreamWaiting() {
+	t.upstreamWaitingNano.Store(0)
+}
+
+func (t *preparedTurn) upstreamWaitingSince() time.Time {
+	ns := t.upstreamWaitingNano.Load()
+	if ns <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
 }
 
 // needsThinkingHeartbeat 判断当前轮次是否需要开启长耗时首包预热与 SSE 保活心跳（覆盖 high / max 思考档及图片/文档附件请求）。
@@ -178,6 +197,7 @@ func startSSEHeartbeat(
 	ctx context.Context,
 	isMaxThinking bool,
 	isStarted func() bool,
+	waitingSince func() time.Time,
 	prestart func(),
 	ping func(),
 	lastWrite func() time.Time,
@@ -220,8 +240,16 @@ func startSSEHeartbeat(
 				return
 			case <-ticker.C:
 				if !isStarted() {
-					if isMaxThinking && time.Since(beginAt) >= prestartDelay {
-						prestart()
+					if isMaxThinking {
+						// 仅在 WebSocket 建连成功并已发出 user_message 进入上游思考阶段后才计入首包预热延迟，
+						// 防止拨号超时期间过早发送 SSE 头部而锁死后续自动重试。
+						since := beginAt
+						if waitingSince != nil {
+							since = waitingSince()
+						}
+						if !since.IsZero() && time.Since(since) >= prestartDelay {
+							prestart()
+						}
 					}
 					continue
 				}
@@ -314,9 +342,10 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		requestedThinkingEffort: rawThinkingEffort,
 		startedAt:               time.Now(),
 		maxAttempts:       s.maxAttempts(),
-		blockedAccounts:   make(map[int64]bool),
-		attemptedAccounts: make(map[int64]bool),
-		refreshedAccounts: make(map[int64]bool),
+		blockedAccounts:    make(map[int64]bool),
+		attemptedAccounts:  make(map[int64]bool),
+		refreshedAccounts:  make(map[int64]bool),
+		sameAccountRetried: make(map[int64]bool),
 	}
 
 	promptText := ""
@@ -415,8 +444,9 @@ func (t *preparedTurn) loadFull() error {
 	return nil
 }
 
-func (t *preparedTurn) resetConversation() {
-	t.server.sessions.reset(t.conv)
+// switchToFullTranscript 将当前轮切换为新建会话与完整历史/工具表发送，但不提前销毁持久化会话映射，
+// 以便在后续重试仍因临时网络故障失败时保留原账号既有缓存，待切号成功后由 saveConversation 自然覆盖。
+func (t *preparedTurn) switchToFullTranscript() {
 	t.resume = false
 	t.in.ThreadID = ""
 	t.in.CreateSession = true
@@ -430,6 +460,11 @@ func (t *preparedTurn) resetConversation() {
 	}
 	t.in.Prompt = t.fullPrompt
 	t.in.Images = t.fullImages
+}
+
+func (t *preparedTurn) resetConversation() {
+	t.server.sessions.reset(t.conv)
+	t.switchToFullTranscript()
 }
 
 func (t *preparedTurn) saveConversation(res ChatResult) {
@@ -480,7 +515,7 @@ func (t *preparedTurn) selectAccount() (*store.Account, *Session, error) {
 			if selectErr != nil {
 				t.blockedAccounts[accountID] = true
 				log.Printf("chat %s preferred account %d unavailable; selecting another account", t.id, accountID)
-				t.resetConversation()
+				t.switchToFullTranscript()
 				continue
 			}
 		} else {
@@ -535,6 +570,12 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamStarted func() bool, res
 			}
 			return res, err
 		}
+		// 终极防线：若当前仍处于续聊状态但选中账号已不是原会话所属账号，
+		// 必须强制切换为新会话并携带完整历史与完整工具表，杜绝把旧账号 thread_id 与精简增量发给新账号。
+		if t.resume && t.conv != nil && t.conv.accountID != 0 && acct.ID != t.conv.accountID {
+			log.Printf("chat %s switched account %d->%d during resume; rebuilding full transcript", t.id, t.conv.accountID, acct.ID)
+			t.switchToFullTranscript()
+		}
 		if resetOutput != nil {
 			resetOutput()
 		}
@@ -543,7 +584,11 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamStarted func() bool, res
 		t.attempts++
 		log.Printf("chat %s attempt=%d/%d account=%s", t.id, t.attempts, t.maxAttempts, accountLogLabel(acct))
 		attemptStarted := time.Now()
-		res, err = t.server.upstream.Chat(t.ctx, sess, t.in, onEvent)
+		t.clearUpstreamWaiting()
+		attemptIn := t.in
+		attemptIn.OnDispatched = t.markUpstreamWaiting
+		res, err = t.server.upstream.Chat(t.ctx, sess, attemptIn, onEvent)
+		t.clearUpstreamWaiting()
 		attemptDuration := time.Since(attemptStarted)
 		if err == nil {
 			text, toolCalls := t.responseOutput(res)
@@ -608,6 +653,19 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamStarted func() bool, res
 				log.Printf("chat %s session resume failed; retrying with full transcript", t.id)
 			} else {
 				t.blockedAccounts[acct.ID] = true
+			}
+		case retryTemporary:
+			if wasResume {
+				if !t.sameAccountRetried[acct.ID] && !isRateLimitTemporary(err) {
+					// 续聊遇网络超时/临时故障时优先在原绑定账号原地重连 1 次，尽力保住云端既有上下文缓存。
+					t.sameAccountRetried[acct.ID] = true
+					t.preferredAccount = acct.ID
+					log.Printf("chat %s temporary error on resumed account %s; retrying same account once to preserve cache", t.id, accountLogLabel(acct))
+				} else {
+					// 原账号已重连失败或命中 429 限流，切往其他账号前先切换为完整历史与完整工具表重建。
+					t.switchToFullTranscript()
+					log.Printf("chat %s temporary error after same-account retry or rate limit; switching account with full transcript", t.id)
+				}
 			}
 		}
 	}
@@ -956,6 +1014,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		turn.ctx,
 		turn.needsThinkingHeartbeat(),
 		isStarted,
+		turn.upstreamWaitingSince,
 		prestartSSE,
 		sendKeepalive,
 		lastWrite,

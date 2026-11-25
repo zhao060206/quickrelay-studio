@@ -48,6 +48,9 @@ func retryActionFor(err error) retryAction {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, ErrUserMessageTooLarge) {
 		return retryStop
 	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return retryTemporary
+	}
 	if errors.Is(err, ErrEmptyResponse) {
 		return retryTemporary
 	}
@@ -180,6 +183,28 @@ func retryActionForMessage(msg string, status int) (retryAction, bool) {
 		}
 	}
 	return retryStop, false
+}
+
+// isRateLimitTemporary 判断同属 retryTemporary 的故障是否由速率/并发限流触发。
+// 命中限流时应立即换号避让；网络抖动/握手超时等非限流故障则优先在原绑定账号原地重连一次保缓存。
+func isRateLimitTemporary(err error) bool {
+	if err == nil {
+		return false
+	}
+	var upstreamErr *UpstreamError
+	if errors.As(err, &upstreamErr) {
+		if upstreamErr.StatusCode == http.StatusTooManyRequests {
+			return true
+		}
+		normalized := strings.NewReplacer("_", "", "-", "", ".", "", " ", "").Replace(strings.ToLower(strings.TrimSpace(upstreamErr.Code)))
+		normalized = strings.TrimSuffix(normalized, "exception")
+		switch normalized {
+		case "throttling", "throttled", "toomanyrequests", "ratelimitexceeded", "ratelimited":
+			return true
+		}
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "rate limit") || strings.Contains(lower, "throttl")
 }
 
 func invalidChatRequest(err error) bool {

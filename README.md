@@ -1,4 +1,4 @@
-# QuickRelay Studio v2.4.1
+# QuickRelay Studio v2.4.2
 
 **QuickRelay Studio** 是一款基于 Go 与 WebView2 桌面端打造的独立双协议 AI 反代网关与账号池管理控制台。支持将多个 AWS Quick 账号聚合为标准的 **OpenAI** 与 **Anthropic Messages** API，免改造直连 **Claude Code**、**Codex CLI** 及各类开源 SDK，并内置完整的请求明细统计与 1M 上下文持久化会话追踪。
 
@@ -9,17 +9,18 @@
 1. **双协议原生网关**
    - **OpenAI 协议**：完整兼容 `POST /v1/chat/completions` 与 `GET /v1/models`。
    - **Anthropic Messages 协议**：原生支持 `POST /v1/messages`（含流式 SSE 与同步 JSON，完整支持 `type: "document"` PDF/文本文档附件直传）及本地 `POST /v1/messages/count_tokens` 估算。
-   - **深度思考 (`high` / `max` / `xhigh`) 与大工具流式加固（v2.4.0 增强）**：
+   - **深度思考 (`high` / `max` / `xhigh`) 与大工具流式加固（v2.4.0 ~ v2.4.2 持续增强）**：
      - 流式 `<client_tool_call>` 刚吐出工具名即实时闭合 `thinking`/`text` 并早启 `tool_use` / `tool_calls` 块，消除大工具参数写入期间长时间零帧输出导致的 180 秒假死断流；
      - 当请求携带 `max` / `xhigh` 思考强度时，自动将单轮总超时由常规 `request_timeout`（默认 `15m`）拉长至 `max_thinking_timeout`（默认 `30m`），上游 WebSocket 静默读超时由 `2m` 扩至 `5m`；
-     - `high`/`max`/附件请求等待超 `20s` 自动首包 SSE 预热，静默达 `15s` 定期发 `event: ping` / `: keepalive`，下游异常断连第一时间自动取消上游止损。
+     - `high`/`max`/附件请求仅在 WebSocket 握手建连成功并已发送 `user_message` 进入等待模型响应阶段后，超过 `20s` 才触发首包 SSE 预热（`event: ping` / `: keepalive`），并将拨号握手超时收敛为 `12s`，彻底解除拨号与预热同在 `20s` 撞车导致的流式自动重试锁死（v2.4.2 修复）；
    - **Claude Code 专属优化**：
      - 直连 `/v1/messages` 免除额外适配开销；
      - `claude-haiku-*` 轻量模型自动分流至 `fast`，其余 `sonnet`/`opus` 走 `smart`；
      - 当请求携带 `AskUserQuestion` 工具时，自动将模型输出的 `<decision>` / `<decisions>` 交互标签转为标准原生 `tool_use` 卡片选项；
      - **全量 AWS Quick 私有标签静默清洗（v2.4.1 增强）**：在流式与非流式输出中自动清除 `<sources>` 来源引用块、`[@xxxxxx, @yyyyyy]` 多引用角标、`kg://`/`qw-file://`/`qw-tool://`/`mention://` 私有死链、`<artifact>` 工件占位及内部路由控制标记（同时 100% 保护代码块与行内反引号）。
 
-2. **高稳定 1M 会话复用与续聊缓存瘦身（v2.3.0 ~ v2.4.0 重磅优化）**
+2. **高稳定 1M 会话复用与续聊缓存瘦身（v2.3.0 ~ v2.4.2 重磅优化）**
+   - **续聊临时故障原地重连保缓存与切号全量重建（v2.4.2 新增）**：续聊期间遇到网络抖动/超时先尝试在原绑定账号原地重连 1 次，尽力保住云端几十万 Token 缓存；若原账号连续失败或命中 429 限流需切换备号，自动切换为新建 `thread_id` 并完整重建历史消息与完整工具表，彻底杜绝将旧账号增量发给新账号；全网断连期间仍妥善保留原持久化会话绑定，待网络恢复后无损续聊。
    - **彻底消除续聊双倍重传与假死慢响应（v2.4.0 新增）**：续聊增量 `delta` 自动跳过云端既有会话里模型刚吐出的上轮 `Assistant` 万字正文与工具参数 JSON，仅发送带精简目标摘要的 `Tool result`，彻底告别每轮触发 `prompt-*.txt` 外置上传与双倍 Cache Write；按 `Esc` 取消、超长输出拦截或 WebSocket `close 1000` 正常收尾不再误清既有百万 Token 缓存。
    - **消除续聊每轮 `+20,000 Token` 重复工具膨胀**：同一 `thread_id` 首轮下发完整工具表；工具集未变时续聊仅传 ~90 Token 极简提醒（每 24 轮自动锚定刷新一次）；工具变更时在同一 `thread_id` 内平滑更新而不换号重开。
    - **高稳定性会话键与旁路隔离**：`conv_key` 不再绑定易变的系统提示词动态内容或 `work_mode`，支持前导 `system` 变动时依然无损命中增量上下文；自动隔离标题生成 / 输入建议等无工具旁路请求，Token 续期也不再误拆线程。

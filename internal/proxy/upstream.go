@@ -29,6 +29,7 @@ const (
 
 // wsKeepaliveInterval 为 WebSocket 保活心跳周期，用于刷新上游 95 秒无应用层帧超时计时。
 var (
+	wsDialHandshakeTimeout       = 12 * time.Second
 	wsKeepaliveInterval          = 25 * time.Second
 	wsReadIdleTimeout            = 2 * time.Minute
 	wsReadIdleTimeoutMaxThinking = 5 * time.Minute
@@ -64,6 +65,8 @@ type ChatInput struct {
 	ChatAgentID    string
 	CreateSession  bool
 	DeleteSession  bool
+	// OnDispatched 当 WebSocket 建连成功并已发出 user_message 帧、进入等待模型响应阶段时触发，用于解锁 SSE 首包预热计时。
+	OnDispatched func()
 }
 
 // ToolCallState is a native tool invocation reported by the QuickWork agent.
@@ -176,7 +179,11 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 	}
 
 	dialer := *websocket.DefaultDialer
-	dialer.HandshakeTimeout = 20 * time.Second
+	handshakeTimeout := wsDialHandshakeTimeout
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = 12 * time.Second
+	}
+	dialer.HandshakeTimeout = handshakeTimeout
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
 	if err != nil {
 		detail := ""
@@ -360,6 +367,9 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 	}
 	if err := send(map[string]any{"type": "user_message", "payload": payload}); err != nil {
 		return ChatResult{}, fmt.Errorf("send user_message: %w", err)
+	}
+	if in.OnDispatched != nil {
+		in.OnDispatched()
 	}
 
 	result, err := u.readEvents(ctx, conn, gateway, threadID, effort, onEvent)
