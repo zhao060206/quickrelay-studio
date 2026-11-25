@@ -143,14 +143,18 @@ type preparedTurn struct {
 	preferredAccount  int64
 }
 
-// needsThinkingHeartbeat 判断当前轮次是否需要开启长思考提前预热与 SSE 保活心跳。
+// needsThinkingHeartbeat 判断当前轮次是否需要开启长耗时首包预热与 SSE 保活心跳（覆盖 high / max 思考档及图片/文档附件请求）。
 func (t *preparedTurn) needsThinkingHeartbeat() bool {
 	if t == nil {
 		return false
 	}
 	eff := strings.TrimSpace(t.in.ThinkingEffort)
 	reqEff := strings.TrimSpace(t.requestedThinkingEffort)
-	return strings.EqualFold(eff, "max") || strings.EqualFold(reqEff, "max")
+	return strings.EqualFold(eff, "max") ||
+		strings.EqualFold(reqEff, "max") ||
+		strings.EqualFold(eff, "high") ||
+		strings.EqualFold(reqEff, "high") ||
+		len(t.in.Images) > 0
 }
 
 func (s *Server) turnTimeoutFor(thinkingEffort string) time.Duration {
@@ -321,7 +325,7 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 	if s.cfg.SessionReuse && !isAux && conv.threadID != "" {
 		if delta, ok := conv.delta(req.Messages); ok {
 			deltaGuide := deltaDeveloperGuidelinesForMode(delta, workMode)
-			if deltaPrompt, deltaImages, dErr := formatPromptWithImages(ctx, delta); dErr == nil && (hasVisibleText(deltaPrompt) || len(deltaImages) > 0 || deltaGuide != "") {
+			if deltaPrompt, deltaImages, dErr := formatResumeDeltaWithImages(ctx, req.Messages, delta); dErr == nil && (hasVisibleText(deltaPrompt) || len(deltaImages) > 0 || deltaGuide != "") {
 				promptText = deltaPrompt
 				images = deltaImages
 				turnGuidelines = deltaGuide
@@ -668,7 +672,7 @@ func (t *preparedTurn) finishTurn(status, finish string, res ChatResult, toolCal
 		CostUSD:          costUSD,
 		ToolCallsCount:   toolCalls,
 		ImagesCount:      len(t.in.Images),
-		PromptPreview:    lastUserText(t.req.Messages),
+		PromptPreview:    requestLogPreview(t.req.Messages),
 	}
 	dbCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -708,13 +712,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if !req.Stream {
 		res, lastErr := turn.runChat(nil, nil, nil)
 		if lastErr != nil {
-			s.sessions.reset(turn.conv)
+			if shouldResetConversation(turn.conv, lastErr) {
+				s.sessions.reset(turn.conv)
+			}
 			status, code := chatErrorStatus(lastErr)
 			turn.finishTurn("failed", "", res, 0, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
 			return
 		}
-		turn.saveConversation(res)
+		if turn.ctx.Err() == nil {
+			turn.saveConversation(res)
+		}
 		text, toolCalls := turn.responseOutput(res)
 		message := map[string]any{"role": "assistant"}
 		if !hasVisibleText(text) {
@@ -760,14 +768,37 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var writeMu sync.Mutex
 	started := false
 	var lastWriteAt time.Time
+	var clientWriteErr error
+	noteWriteErrLocked := func(wErr error) bool {
+		if wErr == nil {
+			return false
+		}
+		if clientWriteErr == nil {
+			clientWriteErr = wErr
+			if turn.cancel != nil {
+				turn.cancel()
+			}
+		}
+		return true
+	}
+	getClientWriteErr := func() error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return clientWriteErr
+	}
 	writeRawLocked := func(payload map[string]any) {
+		if clientWriteErr != nil {
+			return
+		}
 		body, _ := json.Marshal(payload)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", body)
+		if _, wErr := fmt.Fprintf(w, "data: %s\n\n", body); noteWriteErrLocked(wErr) {
+			return
+		}
 		flusher.Flush()
 		lastWriteAt = time.Now()
 	}
 	ensureStartedLocked := func() {
-		if started {
+		if started || clientWriteErr != nil {
 			return
 		}
 		started = true
@@ -811,10 +842,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	sendKeepalive := func() {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		if !started {
+		if !started || clientWriteErr != nil {
 			return
 		}
-		_, _ = fmt.Fprint(w, ": keepalive\n\n")
+		if _, wErr := fmt.Fprint(w, ": keepalive\n\n"); noteWriteErrLocked(wErr) {
+			return
+		}
 		flusher.Flush()
 		lastWriteAt = time.Now()
 	}
@@ -846,6 +879,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		bridgeStream = newToolBridgeStream(turn.allowedTools, turn.choiceMode, turn.choiceName, turn.parallelTools)
 	}
 	emittedToolIdx := 0
+	startedTools := make(map[string]int)
 
 	emitText := func(chunk string) {
 		if chunk == "" {
@@ -863,7 +897,37 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		writeChunk(map[string]any{"content": chunk}, nil)
 	}
+	emitToolStart := func(ts ToolCallStart) {
+		if ts.ID == "" || ts.Name == "" {
+			return
+		}
+		if _, exists := startedTools[ts.ID]; exists {
+			return
+		}
+		idx := emittedToolIdx
+		emittedToolIdx++
+		startedTools[ts.ID] = idx
+		writeChunk(map[string]any{"tool_calls": []map[string]any{{
+			"index": idx,
+			"id":    ts.ID,
+			"type":  "function",
+			"function": map[string]any{
+				"name":      ts.Name,
+				"arguments": "",
+			},
+		}}}, nil)
+	}
 	emitToolReply := func(tc ToolCallReply) {
+		if idx, ok := startedTools[tc.ID]; ok {
+			delete(startedTools, tc.ID)
+			writeChunk(map[string]any{"tool_calls": []map[string]any{{
+				"index": idx,
+				"function": map[string]any{
+					"arguments": tc.Arguments,
+				},
+			}}}, nil)
+			return
+		}
 		writeChunk(map[string]any{"tool_calls": []map[string]any{{
 			"index": emittedToolIdx,
 			"id":    tc.ID,
@@ -919,12 +983,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			for _, tc := range outCalls {
 				emitToolReply(tc)
 			}
+			if ts := bridgeStream.PeekPendingStart(); ts != nil {
+				emitToolStart(*ts)
+			}
 		}
-		return nil
+		return getClientWriteErr()
 	}, isStarted, func() {
 		sawVisibleText = false
 		pendingText.Reset()
 		emittedToolIdx = 0
+		clear(startedTools)
 		if bridgeStream != nil {
 			bridgeStream.Reset()
 		}
@@ -932,7 +1000,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	})
 	stopHB()
 	if lastErr != nil {
-		s.sessions.reset(turn.conv)
+		if shouldResetConversation(turn.conv, lastErr) {
+			s.sessions.reset(turn.conv)
+		}
+		if wErr := getClientWriteErr(); wErr != nil {
+			turn.finishTurn("failed", "", res, 0, wErr)
+			return
+		}
 		if !isStarted() {
 			status, code := chatErrorStatus(lastErr)
 			turn.finishTurn("failed", "", res, 0, lastErr)
@@ -943,6 +1017,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeStreamError(lastErr.Error())
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
+		return
+	}
+	if getClientWriteErr() != nil || turn.ctx.Err() != nil {
+		errOut := getClientWriteErr()
+		if errOut == nil {
+			errOut = turn.ctx.Err()
+		}
+		turn.finishTurn("failed", "", res, emittedToolIdx, errOut)
 		return
 	}
 	turn.saveConversation(res)

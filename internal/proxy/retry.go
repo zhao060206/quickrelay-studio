@@ -75,7 +75,8 @@ func retryActionFor(err error) retryAction {
 	var closeErr *websocket.CloseError
 	if errors.As(err, &closeErr) {
 		switch closeErr.Code {
-		case websocket.CloseAbnormalClosure, websocket.CloseGoingAway, websocket.CloseInternalServerErr,
+		case websocket.CloseNormalClosure, websocket.CloseNoStatusReceived,
+			websocket.CloseAbnormalClosure, websocket.CloseGoingAway, websocket.CloseInternalServerErr,
 			websocket.CloseServiceRestart, websocket.CloseTryAgainLater:
 			return retryTemporary
 		default:
@@ -96,6 +97,26 @@ func retryActionFor(err error) retryAction {
 		return retryTemporary
 	}
 	return retryStop
+}
+
+// shouldResetConversation 判断单轮请求失败后是否真正需要销毁既有会话映射：
+// 用户取消（Esc）、单轮超时或已有成功历史记录时的临时错误/单轮内容拦截均保留 thread_id 与已落盘指纹，
+// 仅当上游明确返回会话过期/失效或当前账号不可用需要切换账号时才清理重建。
+func shouldResetConversation(conv *conversation, err error) bool {
+	if err == nil || conv == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	action := retryActionFor(err)
+	if action == retryNewSession || action == retryNextAccount {
+		return true
+	}
+	if conv.threadID != "" && len(conv.msgHashes) > 0 {
+		return false
+	}
+	return true
 }
 
 func retryActionForCode(code string) (retryAction, bool) {

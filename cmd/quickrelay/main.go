@@ -128,7 +128,7 @@ func runServer(args []string) int {
 		Addr:              listenAddr,
 		Handler:           handler,
 		ReadHeaderTimeout: 15 * time.Second,
-		ReadTimeout:       30 * time.Second,
+		ReadTimeout:       2 * time.Minute,
 		IdleTimeout:       120 * time.Second,
 	}
 

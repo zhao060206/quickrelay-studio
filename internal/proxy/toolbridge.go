@@ -1056,20 +1056,28 @@ func parseToolChoice(v any) (mode, name string) {
 	return "auto", ""
 }
 
+// ToolCallStart 表示流式工具标签刚出现头部工具名时的早启预告，用于在参数 JSON 生成期间提前开启客户端工具块并闭合 thinking 块。
+type ToolCallStart struct {
+	ID   string
+	Name string
+}
+
 // toolBridgeStream 在流式输出期间实时分离普通文本与 <client_tool_call> 工具标记，
 // 使普通文本与最终回复逐字即时上屏，且每个工具标记一闭合即立刻下发。
 type toolBridgeStream struct {
-	allowed      map[string]bool
-	choiceMode   string
-	choiceName   string
-	parallel     bool
-	buf          string
-	inTag        bool
-	tagOpen      string
-	tagClose     string
-	emittedText  bool
-	emittedCalls int
-	holdReleased bool
+	allowed          map[string]bool
+	choiceMode       string
+	choiceName       string
+	parallel         bool
+	buf              string
+	inTag            bool
+	tagOpen          string
+	tagClose         string
+	emittedText      bool
+	emittedCalls     int
+	holdReleased     bool
+	pendingStart     *ToolCallStart
+	pendingAnnounced bool
 }
 
 func newToolBridgeStream(allowed map[string]bool, choiceMode, choiceName string, parallel bool) *toolBridgeStream {
@@ -1089,6 +1097,58 @@ func (s *toolBridgeStream) Reset() {
 	s.emittedText = false
 	s.emittedCalls = 0
 	s.holdReleased = false
+	s.pendingStart = nil
+	s.pendingAnnounced = false
+}
+
+var (
+	rePendingToolName     = regexp.MustCompile(`"(?:name|tool)"\s*:\s*"([^"\\]+)"`)
+	rePendingToolArgsKey  = regexp.MustCompile(`"(?:arguments|parameters|input|args)"\s*:`)
+)
+
+// PeekPendingStart 在模型进入 <client_tool_call> 写入超大 JSON 参数的早期阶段，
+// 一旦识别出合法且允许的工具名称，立即预占调用名额并向下游返回 ToolCallStart，避免长时间零帧输出触发客户端假死或 180 秒超时。
+func (s *toolBridgeStream) PeekPendingStart() *ToolCallStart {
+	if !s.inTag || s.pendingAnnounced || s.pendingStart != nil {
+		return nil
+	}
+	if len(s.buf) < 12 {
+		return nil
+	}
+	head := s.buf
+	if closeIdx := strings.Index(head, s.tagClose); closeIdx >= 0 {
+		head = head[:closeIdx]
+	}
+	if len(head) > 512 {
+		head = head[:512]
+	}
+	nameLoc := rePendingToolName.FindStringSubmatchIndex(head)
+	if len(nameLoc) < 4 {
+		return nil
+	}
+	if argsLoc := rePendingToolArgsKey.FindStringIndex(head); argsLoc != nil && nameLoc[0] > argsLoc[0] {
+		return nil
+	}
+	rawName := head[nameLoc[2]:nameLoc[3]]
+	resolved := resolveToolName(rawName, s.allowed)
+	if resolved == "" {
+		return nil
+	}
+	if s.choiceMode == "function" && s.choiceName != "" && resolved != s.choiceName {
+		return nil
+	}
+	if !s.parallel && s.emittedCalls >= 1 {
+		return nil
+	}
+	s.emittedCalls++
+	ts := &ToolCallStart{
+		ID:   "call_" + strings.ReplaceAll(uuid(), "-", ""),
+		Name: resolved,
+	}
+	s.pendingStart = ts
+	s.pendingAnnounced = true
+	cp := *ts
+	return &cp
 }
 
 func (s *toolBridgeStream) acceptCall(r ToolCallReply) bool {
@@ -1121,7 +1181,18 @@ func (s *toolBridgeStream) Feed(delta string) (outText string, outCalls []ToolCa
 			s.inTag = false
 
 			parsed := repliesFromEnvelopes(parseToolEnvelopes(inner), s.allowed)
+			pending := s.pendingStart
+			s.pendingStart = nil
+			s.pendingAnnounced = false
 			if len(parsed) == 0 {
+				if pending != nil {
+					outCalls = append(outCalls, ToolCallReply{
+						ID:        pending.ID,
+						Name:      pending.Name,
+						Arguments: "{}",
+					})
+					continue
+				}
 				rawTag := s.tagOpen + inner + s.tagClose
 				textOut.WriteString(rawTag)
 				if hasVisibleText(rawTag) {
@@ -1129,7 +1200,12 @@ func (s *toolBridgeStream) Feed(delta string) (outText string, outCalls []ToolCa
 				}
 				continue
 			}
-			for _, tc := range parsed {
+			for i, tc := range parsed {
+				if i == 0 && pending != nil {
+					tc.ID = pending.ID
+					outCalls = append(outCalls, tc)
+					continue
+				}
 				if s.acceptCall(tc) {
 					outCalls = append(outCalls, tc)
 				}
@@ -1249,17 +1325,37 @@ func (s *toolBridgeStream) Feed(delta string) (outText string, outCalls []ToolCa
 // Flush 在上游流结束后刷出缓冲区中剩余文本或整段兜底解析（如整段围栏/裸 JSON 或流末未闭合标签的工具调用）。
 func (s *toolBridgeStream) Flush() (outText string, outCalls []ToolCallReply) {
 	if s.inTag {
-		if parsed := repliesFromEnvelopes(parseToolEnvelopes(s.buf), s.allowed); len(parsed) > 0 {
+		pending := s.pendingStart
+		s.pendingStart = nil
+		s.pendingAnnounced = false
+		parsed := repliesFromEnvelopes(parseToolEnvelopes(s.buf), s.allowed)
+		if len(parsed) > 0 {
 			s.buf = ""
 			s.inTag = false
 			s.tagOpen = ""
 			s.tagClose = ""
-			for _, tc := range parsed {
+			for i, tc := range parsed {
+				if i == 0 && pending != nil {
+					tc.ID = pending.ID
+					outCalls = append(outCalls, tc)
+					continue
+				}
 				if s.acceptCall(tc) {
 					outCalls = append(outCalls, tc)
 				}
 			}
 			return "", outCalls
+		}
+		if pending != nil {
+			s.buf = ""
+			s.inTag = false
+			s.tagOpen = ""
+			s.tagClose = ""
+			return "", []ToolCallReply{{
+				ID:        pending.ID,
+				Name:      pending.Name,
+				Arguments: "{}",
+			}}
 		}
 		out := s.tagOpen + s.buf
 		s.buf = ""

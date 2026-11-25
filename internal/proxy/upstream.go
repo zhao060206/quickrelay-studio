@@ -599,6 +599,9 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return res, ctxErr
 				}
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseNoStatusReceived) {
+					return res, nil
+				}
 				return res, fmt.Errorf("upstream WebSocket read: %w", err)
 			}
 			if msgType == websocket.TextMessage {

@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"quickrelay-studio/internal/config"
@@ -225,7 +226,66 @@ func (c *imageCollector) add(mimeType string, data []byte) string {
 	return name
 }
 
-// images 返回最终待上传的图片列表，超过单轮上限时保留最新的图片。
+// addDocument 注册一份待上传的文档附件（如 PDF），按内容 SHA-256 去重并保留安全可读文件名。
+func (c *imageCollector) addDocument(title, mimeType string, data []byte) string {
+	sum := sha256.Sum256(data)
+	hashHex := hex.EncodeToString(sum[:])
+	if name, ok := c.byHash[hashHex]; ok {
+		return name
+	}
+	ext := ".pdf"
+	if strings.EqualFold(mimeType, "text/plain") {
+		ext = ".txt"
+	}
+	safeTitle := sanitizeAttachmentTitle(title)
+	if safeTitle != "" && strings.HasSuffix(strings.ToLower(safeTitle), ext) {
+		safeTitle = safeTitle[:len(safeTitle)-len(ext)]
+	}
+	idx := len(c.order) + 1
+	var name string
+	if safeTitle != "" {
+		name = fmt.Sprintf("doc-%02d-%s-%s%s", idx, hashHex[:6], safeTitle, ext)
+	} else {
+		name = fmt.Sprintf("doc-%02d-%s%s", idx, hashHex[:8], ext)
+	}
+	c.byHash[hashHex] = name
+	c.order = append(c.order, ImageAttachment{
+		Name:       name,
+		MIMEType:   mimeType,
+		Data:       data,
+		SHA256:     hashHex,
+		IsDocument: true,
+	})
+	return name
+}
+
+func sanitizeAttachmentTitle(title string) string {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return ""
+	}
+	var b strings.Builder
+	count := 0
+	for _, r := range title {
+		if count >= 40 {
+			break
+		}
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_':
+			b.WriteRune(r)
+			count++
+		case r > 0x7f && (unicode.IsLetter(r) || unicode.IsDigit(r)):
+			b.WriteRune(r)
+			count++
+		case r == ' ':
+			b.WriteByte('_')
+			count++
+		}
+	}
+	return strings.Trim(b.String(), "._-")
+}
+
+// images 返回最终待上传的图片及文档附件列表，超过单轮上限时保留最新的附件。
 func (c *imageCollector) images() []ImageAttachment {
 	if c == nil || len(c.order) == 0 {
 		return nil
@@ -475,6 +535,110 @@ func fetchRemoteImage(ctx context.Context, rawURL string) (string, []byte, error
 	return mime, data, nil
 }
 
+func decodeDocumentBase64(declaredMIME, b64 string) (string, []byte, error) {
+	clean := strings.NewReplacer("\r", "", "\n", "", " ", "", "\t", "").Replace(strings.TrimSpace(b64))
+	if clean == "" {
+		return "", nil, fmt.Errorf("empty base64 document data")
+	}
+	if base64.StdEncoding.DecodedLen(len(clean)) > maxImageBytes+4 {
+		return "", nil, fmt.Errorf("document exceeds max %d bytes", maxImageBytes)
+	}
+	data, err := base64.StdEncoding.DecodeString(clean)
+	if err != nil {
+		data, err = base64.RawStdEncoding.DecodeString(clean)
+		if err != nil {
+			return "", nil, fmt.Errorf("invalid base64 document: %w", err)
+		}
+	}
+	if len(data) == 0 || len(data) > maxImageBytes {
+		return "", nil, fmt.Errorf("decoded document size %d out of range", len(data))
+	}
+	mime := normalizeImageMIME(declaredMIME)
+	if bytes.HasPrefix(data, []byte("%PDF-")) {
+		mime = "application/pdf"
+	}
+	if mime == "" || mime == "application/octet-stream" {
+		if utf8.Valid(data) {
+			mime = "text/plain"
+		}
+	}
+	if mime != "application/pdf" && !strings.HasPrefix(mime, "text/") {
+		return "", nil, fmt.Errorf("unsupported document mime %q", mime)
+	}
+	return mime, data, nil
+}
+
+func formatDocumentPart(p map[string]any, collector *imageCollector) string {
+	title, _ := p["title"].(string)
+	title = strings.TrimSpace(title)
+	rawURL, b64Data, b64MIME := extractImageSource(p)
+	if b64Data == "" {
+		if fileObj, ok := p["file"].(map[string]any); ok {
+			if title == "" {
+				if fn, ok := fileObj["filename"].(string); ok {
+					title = strings.TrimSpace(fn)
+				}
+			}
+			if fd, ok := fileObj["file_data"].(string); ok && strings.TrimSpace(fd) != "" {
+				rawURL = strings.TrimSpace(fd)
+			}
+		}
+	}
+	if collector == nil {
+		if title != "" {
+			return "[document: " + title + "]"
+		}
+		if rawURL != "" && !(len(rawURL) >= 5 && strings.EqualFold(rawURL[:5], "data:")) {
+			return "[document: " + rawURL + "]"
+		}
+		return "[document]"
+	}
+	if b64Data == "" && len(rawURL) >= 5 && strings.EqualFold(rawURL[:5], "data:") {
+		if comma := strings.IndexByte(rawURL, ','); comma > 5 {
+			meta := rawURL[5:comma]
+			parts := strings.Split(meta, ";")
+			if len(parts) > 0 {
+				b64MIME = parts[0]
+			}
+			for _, seg := range parts[1:] {
+				if strings.EqualFold(strings.TrimSpace(seg), "base64") {
+					b64Data = rawURL[comma+1:]
+					break
+				}
+			}
+		}
+	}
+	if b64Data != "" {
+		mime, data, err := decodeDocumentBase64(b64MIME, b64Data)
+		if err != nil {
+			log.Printf("document base64 decode skipped: %v", err)
+			if title != "" {
+				return "[document: " + title + "]"
+			}
+			return "[document]"
+		}
+		if strings.HasPrefix(mime, "text/") {
+			header := "<document>"
+			if title != "" {
+				header = fmt.Sprintf(`<document title="%s">`, strings.ReplaceAll(title, `"`, `'`) )
+			}
+			return "\n" + header + "\n" + string(data) + "\n</document>\n"
+		}
+		name := collector.addDocument(title, mime, data)
+		return "[attached document: " + name + "]"
+	}
+	if rawURL != "" {
+		if title != "" {
+			return fmt.Sprintf("[document: %s (%s)]", title, rawURL)
+		}
+		return "[document: " + rawURL + "]"
+	}
+	if title != "" {
+		return "[document: " + title + "]"
+	}
+	return "[document]"
+}
+
 func formatImagePart(ctx context.Context, p map[string]any, collector *imageCollector) string {
 	rawURL, b64Data, b64MIME := extractImageSource(p)
 	if collector == nil {
@@ -541,10 +705,18 @@ func contentTextWithCollector(ctx context.Context, v any, collector *imageCollec
 					}
 				case "image_url", "input_image", "image":
 					b.WriteString(formatImagePart(ctx, p, collector))
+				case "document":
+					b.WriteString(formatDocumentPart(p, collector))
 				case "input_audio":
 					b.WriteString("[audio]")
 				case "file":
-					b.WriteString("[file]")
+					if _, hasFile := p["file"]; hasFile {
+						b.WriteString(formatDocumentPart(p, collector))
+					} else if _, hasSrc := p["source"]; hasSrc {
+						b.WriteString(formatDocumentPart(p, collector))
+					} else {
+						b.WriteString("[file]")
+					}
 				default:
 					if t, ok := p["text"].(string); ok {
 						b.WriteString(t)
@@ -580,17 +752,64 @@ func roleLabel(role string) string {
 
 // formatPrompt 将 OpenAI 消息列表转换为传给 QuickWork user_message 的文本。
 func formatPrompt(msgs []Message) (string, error) {
-	return formatPromptCore(context.Background(), msgs, nil)
+	return formatPromptCore(context.Background(), msgs, msgs, nil, false, false)
 }
 
-// formatPromptWithImages 在格式化提示词的同时解码并去重所有可上传的图片附件。
+// formatPromptWithImages 在格式化提示词的同时解码并去重所有可上传的图片及文档附件。
 func formatPromptWithImages(ctx context.Context, msgs []Message) (string, []ImageAttachment, error) {
 	collector := newImageCollector()
-	prompt, err := formatPromptCore(ctx, msgs, collector)
+	prompt, err := formatPromptCore(ctx, msgs, msgs, collector, false, false)
 	if err != nil {
 		return "", nil, err
 	}
 	return prompt, collector.images(), nil
+}
+
+// formatResumeDeltaWithImages 专用于同一 thread_id 续聊的增量切片格式化：
+// 若增量切片以本轮之前模型刚在云端生成的首条 assistant 回复开头且后面紧跟工具回传或新提问，
+// 则跳过该重复 assistant 正文与万字工具 JSON，并在 tool result 上附带精简目标摘要（file_path/command 等），
+// 消除每轮无意义双倍回传导致的附件上传耗时与 KV Cache 写入膨胀。
+func formatResumeDeltaWithImages(ctx context.Context, allMsgs []Message, delta []Message) (string, []ImageAttachment, error) {
+	collector := newImageCollector()
+	prompt, err := formatPromptCore(ctx, allMsgs, delta, collector, true, true)
+	if err != nil {
+		return "", nil, err
+	}
+	return prompt, collector.images(), nil
+}
+
+var toolTargetKeys = []string{"file_path", "path", "target_file", "filename", "command", "cmd", "pattern", "query", "url", "uri", "dir", "directory"}
+
+func compactToolCallTarget(args string) string {
+	args = strings.TrimSpace(args)
+	if args == "" || args == "{}" {
+		return ""
+	}
+	var obj map[string]any
+	if json.Unmarshal([]byte(args), &obj) != nil || len(obj) == 0 {
+		return ""
+	}
+	for _, key := range toolTargetKeys {
+		raw, ok := obj[key]
+		if !ok {
+			continue
+		}
+		s, ok := raw.(string)
+		if !ok {
+			continue
+		}
+		s = strings.Join(strings.Fields(s), " ")
+		if s == "" {
+			continue
+		}
+		const maxTargetRunes = 120
+		if utf8.RuneCountInString(s) > maxTargetRunes {
+			runes := []rune(s)
+			s = strings.TrimSpace(string(runes[:maxTargetRunes-1])) + "…"
+		}
+		return s
+	}
+	return ""
 }
 
 // formatPromptCore converts an OpenAI transcript into the single text field that
@@ -598,16 +817,54 @@ func formatPromptWithImages(ctx context.Context, msgs []Message) (string, []Imag
 // separately via system_prompt, so they are not duplicated here. Plain user
 // prompts pass through unchanged. Tool calls and tool results are rendered
 // explicitly so the upstream agent can follow a client-side tool loop.
-func formatPromptCore(ctx context.Context, msgs []Message, collector *imageCollector) (string, error) {
+func formatPromptCore(ctx context.Context, allMsgs []Message, msgs []Message, collector *imageCollector, skipLeadingAssistant bool, includeToolTarget bool) (string, error) {
 	if len(msgs) == 0 {
 		return "", fmt.Errorf("messages must not be empty")
 	}
 
+	refMsgs := allMsgs
+	if len(refMsgs) == 0 {
+		refMsgs = msgs
+	}
 	toolNames := make(map[string]string)
-	for _, m := range msgs {
+	toolTargets := make(map[string]string)
+	for _, m := range refMsgs {
 		for _, tc := range m.ToolCalls {
-			if tc.ID != "" && tc.Function.Name != "" {
-				toolNames[tc.ID] = tc.Function.Name
+			if tc.ID != "" {
+				if tc.Function.Name != "" {
+					toolNames[tc.ID] = tc.Function.Name
+				}
+				if includeToolTarget {
+					if tgt := compactToolCallTarget(tc.Function.Arguments); tgt != "" {
+						toolTargets[tc.ID] = tgt
+					}
+				}
+			}
+		}
+	}
+
+	skipAssistantIdx := -1
+	if skipLeadingAssistant {
+		firstIdx := -1
+		followingCount := 0
+		for i, m := range msgs {
+			role := strings.ToLower(strings.TrimSpace(m.Role))
+			if role == "" {
+				role = "user"
+			}
+			if role == "system" || role == "developer" {
+				continue
+			}
+			if firstIdx < 0 {
+				firstIdx = i
+			} else {
+				followingCount++
+			}
+		}
+		if firstIdx >= 0 && followingCount > 0 {
+			firstRole := strings.ToLower(strings.TrimSpace(msgs[firstIdx].Role))
+			if firstRole == "assistant" {
+				skipAssistantIdx = firstIdx
 			}
 		}
 	}
@@ -616,12 +873,15 @@ func formatPromptCore(ctx context.Context, msgs []Message, collector *imageColle
 	singleUserText := ""
 	nonSystemCount := 0
 	blocks := make([]string, 0, len(msgs))
-	for _, m := range msgs {
+	for i, m := range msgs {
 		role := strings.ToLower(strings.TrimSpace(m.Role))
 		if role == "" {
 			role = "user"
 		}
 		if role == "system" || role == "developer" {
+			continue
+		}
+		if i == skipAssistantIdx {
 			continue
 		}
 		nonSystemCount++
@@ -681,6 +941,11 @@ func formatPromptCore(ctx context.Context, msgs []Message, collector *imageColle
 			}
 			if name != "" {
 				meta = append(meta, "name="+name)
+			}
+			if includeToolTarget && id != "" {
+				if tgt := toolTargets[id]; tgt != "" {
+					meta = append(meta, "target="+tgt)
+				}
 			}
 			if len(meta) > 0 {
 				label += " (" + strings.Join(meta, ", ") + ")"
@@ -1097,6 +1362,69 @@ func latestTurnPreview(msgs []Message) string {
 			parts = append(parts, label+": "+body)
 		}
 		return strings.Join(parts, "\n\n")
+	}
+	return lastUserText(msgs)
+}
+
+// requestLogPreview 生成供请求记录页面展示的精准摘要：
+// 若当前轮末尾是工具结果回传，在摘要前缀标明本轮所执行工具及参数目标，避免连续数十轮都只显示旧的 "继续"。
+func requestLogPreview(msgs []Message) string {
+	toolNames := make(map[string]string)
+	toolTargets := make(map[string]string)
+	for _, m := range msgs {
+		for _, tc := range m.ToolCalls {
+			if tc.ID != "" {
+				if tc.Function.Name != "" {
+					toolNames[tc.ID] = tc.Function.Name
+				}
+				if tgt := compactToolCallTarget(tc.Function.Arguments); tgt != "" {
+					toolTargets[tc.ID] = tgt
+				}
+			}
+		}
+	}
+	var toolLabels []string
+	for i := len(msgs) - 1; i >= 0; i-- {
+		role := strings.ToLower(strings.TrimSpace(msgs[i].Role))
+		if role == "system" || role == "developer" {
+			continue
+		}
+		if role == "tool" || role == "function" {
+			name := strings.TrimSpace(msgs[i].Name)
+			id := strings.TrimSpace(msgs[i].ToolCallID)
+			if name == "" && id != "" {
+				name = toolNames[id]
+			}
+			if name == "" {
+				name = "tool"
+			}
+			if tgt := toolTargets[id]; tgt != "" {
+				toolLabels = append(toolLabels, name+"("+tgt+")")
+			} else {
+				toolLabels = append(toolLabels, name)
+			}
+			continue
+		}
+		if len(toolLabels) > 0 {
+			break
+		}
+		if role == "user" {
+			if text := strings.TrimSpace(contentText(msgs[i].Content)); text != "" {
+				return text
+			}
+		}
+		break
+	}
+	if len(toolLabels) > 0 {
+		for l, r := 0, len(toolLabels)-1; l < r; l, r = l+1, r-1 {
+			toolLabels[l], toolLabels[r] = toolLabels[r], toolLabels[l]
+		}
+		userTail := lastUserText(msgs)
+		prefix := "[Tool -> " + strings.Join(toolLabels, ", ") + "]"
+		if userTail != "" {
+			return prefix + " " + userTail
+		}
+		return prefix
 	}
 	return lastUserText(msgs)
 }

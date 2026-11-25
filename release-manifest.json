@@ -1,15 +1,15 @@
 {
-  "version": "2.3.0",
-  "tag": "v2.3.0",
-  "published_at": "2026-11-25T10:13:24Z",
-  "release_notes": "QuickRelay Studio v2.3.0 更新内容（强烈推荐升级）：\n1. 消除续聊每轮重复灌入 ~20,000 Token 工具表的黑洞：\n   - 同一会话首次发送完整工具表，工具列表未变时续聊仅附 ~90 Token 极简提醒（每 24 轮自动锚定刷新一次），大幅减少无效 cache_write 膨胀；\n   - 工具列表微调时直接在原 thread_id 内平滑更新，不再换号重开。\n2. 大幅提升会话复用率，告别无故“重头再来”：\n   - conv_key 与 delta() 忽略前导 system 动态提示（时间/工作模式切换）变化，精准复用既有 1M 会话与历史缓存；\n   - 自动隔离 [SUGGESTION MODE:] / 标题生成等无工具旁路辅助请求，防止覆盖主会话；\n   - 账号 Token 到期刷新（retryRefresh）成功后继续沿用原会话，不清空 thread_id。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.3.0",
+  "version": "2.4.0",
+  "tag": "v2.4.0",
+  "published_at": "2026-11-25T11:13:50Z",
+  "release_notes": "QuickRelay Studio v2.4.0 更新内容（强烈推荐升级）：\n1. 彻底消除续聊双倍重发与附件拖慢问题：\n   - 续聊增量 delta 自动跳过云端既有会话里模型刚生成的上轮 Assistant 万字回复与工具参数 JSON，仅传回带精简目标摘要（文件路径/命令等）的 Tool result，告别每轮误触发 prompt-*.txt 上传与双倍 Cache Write 膨胀。\n2. 修复长工具参数生成期间卡死与 180 秒超时断连：\n   - 流式 <client_tool_call> 识别到工具名后立即闭合前序 thinking/text 块并提前下发 tool_use / tool_calls 首包，消除大工具写入期间长时间零帧输出引发的界面假死与超时重开；\n   - 为 high/max 思考及附件请求开启 20s 首包 SSE 预热与定期 ping 保活，放宽 ReadTimeout 并支持客户端断连即时取消上游止损。\n3. 修复百万 Token 缓存误杀与 WebSocket 误判失败：\n   - 按 Esc 取消（context canceled）、单轮超时或内容拦截不再误删已有会话映射，下一轮无缝沿用既有 1M thread_id；\n   - 正确识别上游 WebSocket close 1000 (Streaming completed successfully.) 为正常结束，零正文时自动触发重试；\n   - 新增 Anthropic /v1/messages 对 type: \"document\"（PDF 与文本文档）的完整支持。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.0",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.3.0-win-x64.zip",
-      "size": 8616683,
-      "sha256": "2fa35685383f1d22728e8cf920c2ece70ba5c237b2875034343ed755c4b11882",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.3.0/QuickRelay-Studio-v2.3.0-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.4.0-win-x64.zip",
+      "size": 8638152,
+      "sha256": "5c9bf06d3407dd9dd7433d14e4ef205f837f665c9dbeec7c7b840843afecf302",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.0/QuickRelay-Studio-v2.4.0-win-x64.zip"
     }
   }
 }

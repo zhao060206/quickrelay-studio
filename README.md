@@ -1,4 +1,4 @@
-# QuickRelay Studio v2.3.0
+# QuickRelay Studio v2.4.0
 
 **QuickRelay Studio** 是一款基于 Go 与 WebView2 桌面端打造的独立双协议 AI 反代网关与账号池管理控制台。支持将多个 AWS Quick 账号聚合为标准的 **OpenAI** 与 **Anthropic Messages** API，免改造直连 **Claude Code**、**Codex CLI** 及各类开源 SDK，并内置完整的请求明细统计与 1M 上下文持久化会话追踪。
 
@@ -8,16 +8,18 @@
 
 1. **双协议原生网关**
    - **OpenAI 协议**：完整兼容 `POST /v1/chat/completions` 与 `GET /v1/models`。
-   - **Anthropic Messages 协议**：原生支持 `POST /v1/messages`（含流式 SSE 与同步 JSON）及本地 `POST /v1/messages/count_tokens` 估算。
-   - **深度思考 (`max` / `xhigh`) 长耗时加固**：
+   - **Anthropic Messages 协议**：原生支持 `POST /v1/messages`（含流式 SSE 与同步 JSON，完整支持 `type: "document"` PDF/文本文档附件直传）及本地 `POST /v1/messages/count_tokens` 估算。
+   - **深度思考 (`high` / `max` / `xhigh`) 与大工具流式加固（v2.4.0 增强）**：
+     - 流式 `<client_tool_call>` 刚吐出工具名即实时闭合 `thinking`/`text` 并早启 `tool_use` / `tool_calls` 块，消除大工具参数写入期间长时间零帧输出导致的 180 秒假死断流；
      - 当请求携带 `max` / `xhigh` 思考强度时，自动将单轮总超时由常规 `request_timeout`（默认 `15m`）拉长至 `max_thinking_timeout`（默认 `30m`），上游 WebSocket 静默读超时由 `2m` 扩至 `5m`；
-     - 下游流式连接超过 `20s` 无首帧或静默达 `15s` 时，自动发送标准化 `event: ping` / `: keepalive` 保活心跳防止被客户端断开。
+     - `high`/`max`/附件请求等待超 `20s` 自动首包 SSE 预热，静默达 `15s` 定期发 `event: ping` / `: keepalive`，下游异常断连第一时间自动取消上游止损。
    - **Claude Code 专属优化**：
      - 直连 `/v1/messages` 免除额外适配开销；
      - `claude-haiku-*` 轻量模型自动分流至 `fast`，其余 `sonnet`/`opus` 走 `smart`；
      - 当请求携带 `AskUserQuestion` 工具时，自动将模型输出的 `<decision>` 交互标签转为标准原生 `tool_use` 卡片选项。
 
-2. **高稳定 1M 会话复用与续聊缓存瘦身（v2.3.0 重磅优化）**
+2. **高稳定 1M 会话复用与续聊缓存瘦身（v2.3.0 ~ v2.4.0 重磅优化）**
+   - **彻底消除续聊双倍重传与假死慢响应（v2.4.0 新增）**：续聊增量 `delta` 自动跳过云端既有会话里模型刚吐出的上轮 `Assistant` 万字正文与工具参数 JSON，仅发送带精简目标摘要的 `Tool result`，彻底告别每轮触发 `prompt-*.txt` 外置上传与双倍 Cache Write；按 `Esc` 取消、超长输出拦截或 WebSocket `close 1000` 正常收尾不再误清既有百万 Token 缓存。
    - **消除续聊每轮 `+20,000 Token` 重复工具膨胀**：同一 `thread_id` 首轮下发完整工具表；工具集未变时续聊仅传 ~90 Token 极简提醒（每 24 轮自动锚定刷新一次）；工具变更时在同一 `thread_id` 内平滑更新而不换号重开。
    - **高稳定性会话键与旁路隔离**：`conv_key` 不再绑定易变的系统提示词动态内容或 `work_mode`，支持前导 `system` 变动时依然无损命中增量上下文；自动隔离标题生成 / 输入建议等无工具旁路请求，Token 续期也不再误拆线程。
 

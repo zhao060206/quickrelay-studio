@@ -22,16 +22,19 @@ type anthropicTool struct {
 }
 
 type anthropicImageSource struct {
-	Type      string `json:"type"`
-	MediaType string `json:"media_type,omitempty"`
-	Data      string `json:"data,omitempty"`
-	URL       string `json:"url,omitempty"`
+	Type      string          `json:"type"`
+	MediaType string          `json:"media_type,omitempty"`
+	Data      string          `json:"data,omitempty"`
+	URL       string          `json:"url,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
 }
 
 type anthropicContentBlock struct {
 	Type      string                `json:"type"`
 	Text      string                `json:"text,omitempty"`
 	Thinking  string                `json:"thinking,omitempty"`
+	Title     string                `json:"title,omitempty"`
+	Context   string                `json:"context,omitempty"`
 	ID        string                `json:"id,omitempty"`
 	Name      string                `json:"name,omitempty"`
 	Input     json.RawMessage       `json:"input,omitempty"`
@@ -197,12 +200,150 @@ func convertAnthropicToolResultContent(raw json.RawMessage, isError bool) any {
 			if p := anthropicImagePart(blk.Source); p != nil {
 				parts = append(parts, p)
 			}
+		case "document":
+			parts = append(parts, convertAnthropicDocumentParts(blk)...)
 		}
 	}
 	if len(parts) == 0 {
 		return prefix + "(empty)"
 	}
 	return parts
+}
+
+func convertAnthropicDocumentParts(blk anthropicContentBlock) []any {
+	title := strings.TrimSpace(blk.Title)
+	ctxNote := strings.TrimSpace(blk.Context)
+	wrapDocText := func(body string) any {
+		var b strings.Builder
+		if title != "" {
+			b.WriteString(`<document title="`)
+			b.WriteString(strings.ReplaceAll(title, `"`, `'`))
+			b.WriteString(`">`)
+		} else {
+			b.WriteString("<document>")
+		}
+		b.WriteByte('\n')
+		if ctxNote != "" {
+			b.WriteString(ctxNote)
+			b.WriteString("\n\n")
+		}
+		b.WriteString(body)
+		b.WriteString("\n</document>")
+		return map[string]any{"type": "text", "text": b.String()}
+	}
+
+	if blk.Source == nil {
+		if strings.TrimSpace(blk.Text) != "" {
+			return []any{wrapDocText(blk.Text)}
+		}
+		return nil
+	}
+
+	srcType := strings.ToLower(strings.TrimSpace(blk.Source.Type))
+	switch srcType {
+	case "text":
+		if blk.Source.Data != "" {
+			return []any{wrapDocText(blk.Source.Data)}
+		}
+	case "content":
+		if len(blk.Source.Content) > 0 {
+			var s string
+			if json.Unmarshal(blk.Source.Content, &s) == nil && s != "" {
+				return []any{wrapDocText(s)}
+			}
+			var inner []anthropicContentBlock
+			if json.Unmarshal(blk.Source.Content, &inner) == nil {
+				var out []any
+				if title != "" || ctxNote != "" {
+					head := "<document"
+					if title != "" {
+						head += fmt.Sprintf(` title="%s"`, strings.ReplaceAll(title, `"`, `'`))
+					}
+					head += ">"
+					if ctxNote != "" {
+						head += "\n" + ctxNote
+					}
+					out = append(out, map[string]any{"type": "text", "text": head})
+				}
+				for _, ib := range inner {
+					switch ib.Type {
+					case "text":
+						if ib.Text != "" {
+							out = append(out, map[string]any{"type": "text", "text": ib.Text})
+						}
+					case "image":
+						if ip := anthropicImagePart(ib.Source); ip != nil {
+							out = append(out, ip)
+						}
+					}
+				}
+				if title != "" || ctxNote != "" {
+					out = append(out, map[string]any{"type": "text", "text": "</document>"})
+				}
+				return out
+			}
+		}
+	case "base64":
+		b64 := strings.TrimSpace(blk.Source.Data)
+		if b64 == "" {
+			return nil
+		}
+		media := normalizeImageMIME(blk.Source.MediaType)
+		if isTextDocumentMIME(media) {
+			if _, decoded, err := decodeDocumentBase64(media, b64); err == nil {
+				return []any{wrapDocText(string(decoded))}
+			}
+		}
+		if media == "" {
+			media = "application/pdf"
+		}
+		part := map[string]any{
+			"type": "document",
+			"source": map[string]any{
+				"type":       "base64",
+				"media_type": media,
+				"data":       b64,
+			},
+		}
+		if title != "" {
+			part["title"] = title
+		}
+		var parts []any
+		if ctxNote != "" {
+			parts = append(parts, map[string]any{"type": "text", "text": ctxNote + "\n"})
+		}
+		parts = append(parts, part)
+		return parts
+	case "url":
+		u := strings.TrimSpace(blk.Source.URL)
+		if u == "" {
+			return nil
+		}
+		part := map[string]any{
+			"type": "document",
+			"source": map[string]any{
+				"type": "url",
+				"url":  u,
+			},
+		}
+		if title != "" {
+			part["title"] = title
+		}
+		return []any{part}
+	}
+	return nil
+}
+
+func isTextDocumentMIME(media string) bool {
+	if strings.HasPrefix(media, "text/") {
+		return true
+	}
+	switch media {
+	case "application/json", "application/xml", "application/csv", "application/x-yaml", "application/yaml":
+		return true
+	default:
+		return false
+	}
 }
 
 func anthropicImagePart(src *anthropicImageSource) map[string]any {
@@ -314,6 +455,8 @@ func anthropicToChatRequest(ar *anthropicMessagesRequest) ChatRequest {
 				if imgPart := anthropicImagePart(blk.Source); imgPart != nil {
 					pendingParts = append(pendingParts, imgPart)
 				}
+			case "document":
+				pendingParts = append(pendingParts, convertAnthropicDocumentParts(blk)...)
 			}
 		}
 		flushUser()
@@ -433,13 +576,17 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	if !req.Stream {
 		res, lastErr := turn.runChat(nil, nil, nil)
 		if lastErr != nil {
-			s.sessions.reset(turn.conv)
+			if shouldResetConversation(turn.conv, lastErr) {
+				s.sessions.reset(turn.conv)
+			}
 			status, _ := chatErrorStatus(lastErr)
 			turn.finishTurn("failed", "", res, 0, lastErr)
 			writeAnthropicError(w, status, anthropicErrorType(status, lastErr), lastErr.Error())
 			return
 		}
-		turn.saveConversation(res)
+		if turn.ctx.Err() == nil {
+			turn.saveConversation(res)
+		}
 		text, toolCalls := turn.responseOutput(res)
 
 		var blocks []map[string]any
@@ -496,7 +643,28 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	var writeMu sync.Mutex
 	started := false
 	var lastWriteAt time.Time
+	var clientWriteErr error
+	noteWriteErrLocked := func(wErr error) bool {
+		if wErr == nil {
+			return false
+		}
+		if clientWriteErr == nil {
+			clientWriteErr = wErr
+			if turn.cancel != nil {
+				turn.cancel()
+			}
+		}
+		return true
+	}
+	getClientWriteErr := func() error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return clientWriteErr
+	}
 	writeEventLocked := func(event string, payload any) {
+		if clientWriteErr != nil {
+			return
+		}
 		if !started {
 			started = true
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -505,7 +673,9 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			w.WriteHeader(http.StatusOK)
 		}
 		body, _ := json.Marshal(payload)
-		_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, body)
+		if _, wErr := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, body); noteWriteErrLocked(wErr) {
+			return
+		}
 		flusher.Flush()
 		lastWriteAt = time.Now()
 	}
@@ -517,7 +687,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	ensureStarted := func() {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		if started {
+		if started || clientWriteErr != nil {
 			return
 		}
 		writeEventLocked("message_start", map[string]any{
@@ -550,10 +720,12 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	sendAnthropicPing := func() {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		if !started {
+		if !started || clientWriteErr != nil {
 			return
 		}
-		_, _ = fmt.Fprint(w, "event: ping\ndata: {\"type\":\"ping\"}\n\n")
+		if _, wErr := fmt.Fprint(w, "event: ping\ndata: {\"type\":\"ping\"}\n\n"); noteWriteErrLocked(wErr) {
+			return
+		}
 		flusher.Flush()
 		lastWriteAt = time.Now()
 	}
@@ -561,6 +733,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	nextBlockIdx := 0
 	openType := ""
 	openIdx := -1
+	startedToolIdx := make(map[string]int)
 	closeOpenBlock := func() {
 		if openType == "" {
 			return
@@ -652,21 +825,49 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			},
 		})
 	}
-	emitToolReply := func(tc ToolCallReply) {
+	emitToolStart := func(ts ToolCallStart) {
+		if ts.ID == "" || ts.Name == "" {
+			return
+		}
+		if _, exists := startedToolIdx[ts.ID]; exists {
+			return
+		}
 		ensureStarted()
 		closeOpenBlock()
 		idx := nextBlockIdx
 		nextBlockIdx++
+		startedToolIdx[ts.ID] = idx
 		writeEvent("content_block_start", map[string]any{
 			"type":  "content_block_start",
 			"index": idx,
 			"content_block": map[string]any{
 				"type":  "tool_use",
-				"id":    tc.ID,
-				"name":  tc.Name,
+				"id":    ts.ID,
+				"name":  ts.Name,
 				"input": map[string]any{},
 			},
 		})
+	}
+	emitToolReply := func(tc ToolCallReply) {
+		idx, alreadyStarted := startedToolIdx[tc.ID]
+		if alreadyStarted {
+			delete(startedToolIdx, tc.ID)
+		} else {
+			ensureStarted()
+			closeOpenBlock()
+			idx = nextBlockIdx
+			nextBlockIdx++
+			writeEvent("content_block_start", map[string]any{
+				"type":  "content_block_start",
+				"index": idx,
+				"content_block": map[string]any{
+					"type":  "tool_use",
+					"id":    tc.ID,
+					"name":  tc.Name,
+					"input": map[string]any{},
+				},
+			})
+		}
 		args := strings.TrimSpace(tc.Arguments)
 		if args == "" {
 			args = "{}"
@@ -723,7 +924,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			}
 			if !turn.bridgeActive {
 				emitFilteredText(ev.Text)
-				return nil
+				return getClientWriteErr()
 			}
 			outText, outCalls := bridgeStream.Feed(ev.Text)
 			if outText != "" {
@@ -732,8 +933,11 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			for _, tc := range outCalls {
 				emitToolReply(tc)
 			}
+			if ts := bridgeStream.PeekPendingStart(); ts != nil {
+				emitToolStart(*ts)
+			}
 		}
-		return nil
+		return getClientWriteErr()
 	}, isStarted, func() {
 		sawVisibleText = false
 		pendingText.Reset()
@@ -741,6 +945,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		nextBlockIdx = 0
 		openType = ""
 		openIdx = -1
+		clear(startedToolIdx)
 		if bridgeStream != nil {
 			bridgeStream.Reset()
 		}
@@ -749,7 +954,13 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	stopHB()
 
 	if lastErr != nil {
-		s.sessions.reset(turn.conv)
+		if shouldResetConversation(turn.conv, lastErr) {
+			s.sessions.reset(turn.conv)
+		}
+		if wErr := getClientWriteErr(); wErr != nil {
+			turn.finishTurn("failed", "", res, 0, wErr)
+			return
+		}
 		if !isStarted() {
 			status, _ := chatErrorStatus(lastErr)
 			turn.finishTurn("failed", "", res, 0, lastErr)
@@ -768,6 +979,14 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	if getClientWriteErr() != nil || turn.ctx.Err() != nil {
+		errOut := getClientWriteErr()
+		if errOut == nil {
+			errOut = turn.ctx.Err()
+		}
+		turn.finishTurn("failed", "", res, emittedTools, errOut)
+		return
+	}
 	turn.saveConversation(res)
 	if turn.bridgeActive {
 		remText, remCalls := bridgeStream.Flush()

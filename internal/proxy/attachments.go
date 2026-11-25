@@ -37,12 +37,13 @@ const (
 	maxConcurrentImageUploads = 3        // 图片附件并发上传上限
 )
 
-// ImageAttachment 表示从 OpenAI/Codex 请求消息中提取出的待上传图片附件。
+// ImageAttachment 表示从 OpenAI/Codex/Anthropic 请求消息中提取出的待上传图片或文档附件。
 type ImageAttachment struct {
-	Name     string
-	MIMEType string
-	Data     []byte
-	SHA256   string
+	Name       string
+	MIMEType   string
+	Data       []byte
+	SHA256     string
+	IsDocument bool
 }
 
 // attachmentError marks a failure in the out-of-band path that should fall
@@ -290,8 +291,12 @@ func uploadImageAttachments(ctx context.Context, sess *Session, threadID string,
 				return
 			}
 
+			attType := "image"
+			if item.IsDocument {
+				attType = "file"
+			}
 			meta := map[string]any{
-				"type":     "image",
+				"type":     attType,
 				"name":     att.Name,
 				"size":     att.Size,
 				"mimeType": item.MIMEType,
@@ -300,8 +305,8 @@ func uploadImageAttachments(ctx context.Context, sess *Session, threadID string,
 			if att.ID != "" {
 				meta["attachmentId"] = att.ID
 			}
-			log.Printf("user_message image attachment thread=%s bytes=%d mime=%s name=%s id=%s path=%s",
-				threadID, att.Size, item.MIMEType, att.Name, att.ID, att.Path)
+			log.Printf("user_message %s attachment thread=%s bytes=%d mime=%s name=%s id=%s path=%s",
+				attType, threadID, att.Size, item.MIMEType, att.Name, att.ID, att.Path)
 			outcomes[idx] = uploadOutcome{meta: meta}
 		}(i, img)
 	}
