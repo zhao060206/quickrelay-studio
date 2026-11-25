@@ -1,15 +1,15 @@
 {
-  "version": "2.4.0",
-  "tag": "v2.4.0",
-  "published_at": "2026-11-25T11:13:50Z",
-  "release_notes": "QuickRelay Studio v2.4.0 更新内容（强烈推荐升级）：\n1. 彻底消除续聊双倍重发与附件拖慢问题：\n   - 续聊增量 delta 自动跳过云端既有会话里模型刚生成的上轮 Assistant 万字回复与工具参数 JSON，仅传回带精简目标摘要（文件路径/命令等）的 Tool result，告别每轮误触发 prompt-*.txt 上传与双倍 Cache Write 膨胀。\n2. 修复长工具参数生成期间卡死与 180 秒超时断连：\n   - 流式 <client_tool_call> 识别到工具名后立即闭合前序 thinking/text 块并提前下发 tool_use / tool_calls 首包，消除大工具写入期间长时间零帧输出引发的界面假死与超时重开；\n   - 为 high/max 思考及附件请求开启 20s 首包 SSE 预热与定期 ping 保活，放宽 ReadTimeout 并支持客户端断连即时取消上游止损。\n3. 修复百万 Token 缓存误杀与 WebSocket 误判失败：\n   - 按 Esc 取消（context canceled）、单轮超时或内容拦截不再误删已有会话映射，下一轮无缝沿用既有 1M thread_id；\n   - 正确识别上游 WebSocket close 1000 (Streaming completed successfully.) 为正常结束，零正文时自动触发重试；\n   - 新增 Anthropic /v1/messages 对 type: \"document\"（PDF 与文本文档）的完整支持。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.0",
+  "version": "2.4.1",
+  "tag": "v2.4.1",
+  "published_at": "2026-11-25T14:03:11Z",
+  "release_notes": "QuickRelay Studio v2.4.1 更新内容：\n1. AWS Quick 全量私有渲染标签与死链清洗（流式与非流式一致）：\n   - 完整过滤 <sources>...</sources> 来源引用块（含末尾未闭合残片与孤立闭合标签）；\n   - 支持多引用合并角标 [@0cc622, @8dbdfb] 与单引用 [@0cc622] 精准剥离；\n   - 全面清洗 kg://、qw-file://、qw-tool://、mention:// 平台私有协议死链（纯角标删除，可读文件名/人名保留文本，不影响普通 http/https 链接）；\n   - 升级 <decisions> 复数问题包裹、</invoke> 闭合变体及 multi=\"true\" 属性转换，同时剥离 <artifact> 工件占位、<decision_response> 与 [ACP_ROUTE:...] / [CHAT_AGENT_DELEGATE:...] 内部控制标记；\n   - 免疫流式 UTF-8 分片边界，并 100% 保护 ``` / ~~~ 围栏代码块与行内反引号 `...` 内容不被误删。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.1",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.4.0-win-x64.zip",
-      "size": 8638152,
-      "sha256": "5c9bf06d3407dd9dd7433d14e4ef205f837f665c9dbeec7c7b840843afecf302",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.0/QuickRelay-Studio-v2.4.0-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.4.1-win-x64.zip",
+      "size": 8654656,
+      "sha256": "634c70fa30258932c5d2a8af400d305674c6bffd9d98ad4fd8dcaf8fb1df5e4c",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.1/QuickRelay-Studio-v2.4.1-win-x64.zip"
     }
   }
 }

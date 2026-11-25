@@ -176,3 +176,181 @@ func TestQuickOutputFilter_StreamingChunkBoundaries(t *testing.T) {
 		}
 	}
 }
+
+func assertStreamingMatchesClean(t *testing.T, input string, allowed map[string]bool) (string, []ToolCallReply) {
+	t.Helper()
+	wantText, wantCalls := cleanQuickOutput(input, allowed, func(tc ToolCallReply) bool { return true })
+	for chunkSize := 1; chunkSize <= 3; chunkSize++ {
+		filter := newQuickOutputFilter(allowed, func(tc ToolCallReply) bool { return true })
+		var gotText strings.Builder
+		var gotCalls []ToolCallReply
+		for i := 0; i < len(input); i += chunkSize {
+			end := min(len(input), i+chunkSize)
+			tOut, cOut := filter.Feed(input[i:end])
+			gotText.WriteString(tOut)
+			gotCalls = append(gotCalls, cOut...)
+		}
+		fOut, fcOut := filter.Flush()
+		gotText.WriteString(fOut)
+		gotCalls = append(gotCalls, fcOut...)
+
+		if gotText.String() != wantText {
+			t.Fatalf("chunkSize=%d streaming mismatch:\ngot:  %q\nwant: %q", chunkSize, gotText.String(), wantText)
+		}
+		if len(gotCalls) != len(wantCalls) {
+			t.Fatalf("chunkSize=%d tool calls count mismatch: got %d, want %d", chunkSize, len(gotCalls), len(wantCalls))
+		}
+		for idx := range wantCalls {
+			if gotCalls[idx].Name != wantCalls[idx].Name || gotCalls[idx].Arguments != wantCalls[idx].Arguments {
+				t.Fatalf("chunkSize=%d call[%d] mismatch:\ngot:  %+v\nwant: %+v", chunkSize, idx, gotCalls[idx], wantCalls[idx])
+			}
+		}
+	}
+	return wantText, wantCalls
+}
+
+// TestQuickOutput_StripsSourcesBlockAndLinks 还原真实截图中的 <sources> 块、末尾未闭合 <sources> 与孤立 </sources> 并验证流式一致性。
+func TestQuickOutput_StripsSourcesBlockAndLinks(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "screenshot_sources_block",
+			input: "最终结论如下。\n\n<sources>\n[quote-heavy content via file](qw-file://doc/123)\n</sources>",
+			want:  "最终结论如下。\n\n",
+		},
+		{
+			name:  "sources_in_middle_keeps_following_text",
+			input: "第一段。\n<sources>\n- [Ref 1](https://example.com)\n</sources>\n第二段内容。",
+			want:  "第一段。\n第二段内容。",
+		},
+		{
+			name:  "unclosed_trailing_sources",
+			input: "分析已完成。\n<sources>\n[quote-heavy content via file](qw-file://doc/1)",
+			want:  "分析已完成。\n",
+		},
+		{
+			name:  "orphan_closing_sources",
+			input: "已整理完文档。\n</sources>",
+			want:  "已整理完文档。\n",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, calls := assertStreamingMatchesClean(t, tc.input, nil)
+			if len(calls) != 0 {
+				t.Fatalf("unexpected tool calls: %+v", calls)
+			}
+			if got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestQuickOutput_MultiCitationsAndPrivateLinks 验证多引用角标 [@xxx, @yyy] 与 kg://、qw-file://、qw-tool://、mention:// 私有链接清洗且不误伤正常链接。
+func TestQuickOutput_MultiCitationsAndPrivateLinks(t *testing.T) {
+	input := "总结 [@0cc622, @8dbdfb] 与 [@abc123; @def456] 后，请 [@Alice](kg://person/1) 和 [@Bob](mention://U123) 检查" +
+		" [设计稿.docx](qw-file://file/1) 与工具 [[1]](qw-tool://tool/2) 或 [@0cc622](kg://ref/3)，" +
+		"参考 [官方仓库](https://github.com/zhao060206/quickrelay-studio) 即可。"
+
+	got, _ := assertStreamingMatchesClean(t, input, nil)
+	want := "总结 与 后，请 Alice 和 @Bob 检查 设计稿.docx 与工具 或，" +
+		"参考 [官方仓库](https://github.com/zhao060206/quickrelay-studio) 即可。"
+	if got != want {
+		t.Fatalf("got:\n  %q\nwant:\n  %q", got, want)
+	}
+}
+
+// TestQuickOutput_DecisionsPluralAndInvokeClose 验证 <decisions> 复数块、multi="true" 及 </invoke> 闭合变体转原生 AskUserQuestion 或 Markdown 列表。
+func TestQuickOutput_DecisionsPluralAndInvokeClose(t *testing.T) {
+	input := "请确认以下两项：\n" +
+		`<decisions>` +
+		`<decision question="选择目标目录？" multi="true"><option description="仅导出 PDF">PDF</option><option description="导出 Word">DOCX</option></decision>` +
+		`<decision question="是否覆盖旧文件？"><option>覆盖</option><option>新建副本</option></invoke>` +
+		`</decisions>`
+
+	gotText, calls := assertStreamingMatchesClean(t, input, map[string]bool{"AskUserQuestion": true})
+	if strings.Contains(gotText, "<decision") || strings.Contains(gotText, "</invoke>") {
+		t.Fatalf("decisions tags leaked into text: %q", gotText)
+	}
+	if len(calls) != 1 || calls[0].Name != "AskUserQuestion" {
+		t.Fatalf("expected 1 AskUserQuestion call, got %+v", calls)
+	}
+	var parsed struct {
+		Questions []struct {
+			Question    string `json:"question"`
+			MultiSelect bool   `json:"multiSelect"`
+			Options     []struct {
+				Label string `json:"label"`
+			} `json:"options"`
+		} `json:"questions"`
+	}
+	if err := json.Unmarshal([]byte(calls[0].Arguments), &parsed); err != nil {
+		t.Fatalf("invalid arguments JSON: %v", err)
+	}
+	if len(parsed.Questions) != 2 || !parsed.Questions[0].MultiSelect || parsed.Questions[1].MultiSelect {
+		t.Fatalf("unexpected multiSelect or question count: %+v", parsed.Questions)
+	}
+
+	// 验证降级 Markdown 时渲染两道题且剔除标签
+	mdText, mdCalls := assertStreamingMatchesClean(t, input, nil)
+	if len(mdCalls) != 0 {
+		t.Fatalf("expected 0 calls when tool unavailable")
+	}
+	if !strings.Contains(mdText, "**选择目标目录？**") || !strings.Contains(mdText, "**是否覆盖旧文件？**") {
+		t.Fatalf("markdown fallback missing questions: %q", mdText)
+	}
+}
+
+// TestQuickOutput_ArtifactAndControlMarkers 验证 <artifact>、<decision_response> 与路由控制标记均被准确清洗。
+func TestQuickOutput_ArtifactAndControlMarkers(t *testing.T) {
+	input := "报告已准备就绪。\n" +
+		`<artifact id="art-1" title="Chart"/>` + "\n" +
+		`<artifact type="text/html"><div>hidden</div></artifact>` + "\n" +
+		"[ACP_ROUTE:planner] [NOTCH_REPLY_STYLE:concise]\n" +
+		"[CHAT_AGENT_DELEGATE:\nagent=writer\ntask=summary\n]\n" +
+		"<decision_response>已确认选项A</decision_response>\n" +
+		"</option></artifact>收尾完成。"
+
+	got, _ := assertStreamingMatchesClean(t, input, nil)
+	want := "报告已准备就绪。\n\n已确认选项A\n收尾完成。"
+	if got != want {
+		t.Fatalf("got:\n  %q\nwant:\n  %q", got, want)
+	}
+}
+
+// TestQuickOutput_PreservesInlineCodeAndCodeFences 验证行内反引号与 ``` / ~~~ 围栏代码块内的所有标签原封不动保留。
+func TestQuickOutput_PreservesInlineCodeAndCodeFences(t *testing.T) {
+	input := "检查示例 `<sources>a</sources>` 与 `[@0cc622, @8dbdfb]` 以及 `[ACP_ROUTE:x]` 和 `[link](qw-file://demo)`：\n" +
+		"~~~xml\n" +
+		"<sources>\n<artifact id=\"1\"/>\n[@deadbeef]\n</sources>\n" +
+		"~~~\n" +
+		"普通正文结束 [@0cc622]。"
+
+	got, calls := assertStreamingMatchesClean(t, input, nil)
+	if len(calls) != 0 {
+		t.Fatalf("unexpected tool calls: %+v", calls)
+	}
+	for _, preserved := range []string{
+		"`<sources>a</sources>`",
+		"`[@0cc622, @8dbdfb]`",
+		"`[ACP_ROUTE:x]`",
+		"`[link](qw-file://demo)`",
+		"<artifact id=\"1\"/>",
+		"[@deadbeef]",
+	} {
+		if !strings.Contains(got, preserved) {
+			t.Fatalf("expected %q preserved, got:\n%s", preserved, got)
+		}
+	}
+	if strings.Contains(got, "普通正文结束 [@0cc622]") {
+		t.Fatalf("trailing bare citation should be stripped: %q", got)
+	}
+	if !strings.Contains(got, "普通正文结束。") {
+		t.Fatalf("missing clean tail: %q", got)
+	}
+}
