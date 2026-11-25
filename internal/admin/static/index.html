@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>QuickWork Console</title>
+    <link rel="stylesheet" href="/assets/app.css">
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main" data-i18n="skipContent">Skip to content</a>
+    <section id="login-view" class="login-view" aria-labelledby="login-title">
+      <form id="login-form" class="login-card">
+        <div class="login-heading"><span class="brand-mark" aria-hidden="true">Q</span><select class="language-select" data-language-select data-i18n-aria-label="language" aria-label="Language"><option value="en">English</option><option value="zh-CN">简体中文</option></select></div>
+        <p class="eyebrow">QUICKWORK OPENAI</p>
+        <h1 id="login-title" data-i18n="console">Management Console</h1>
+        <p class="muted" data-i18n="loginIntro">Manage upstream accounts, edit settings, and try the OpenAI-compatible API.</p>
+        <div id="login-notice" class="notice" role="status" data-i18n="checkingService">Checking service status…</div>
+        <label for="login-password" data-i18n="adminPassword">Console password</label>
+        <input id="login-password" type="password" autocomplete="current-password" maxlength="1024" required disabled>
+        <p id="login-error" class="form-error" role="alert"></p>
+        <button id="login-submit" class="button primary full-width" type="submit" data-i18n="signIn" disabled>Sign in</button>
+        <button id="login-retry" class="button subtle full-width" type="button" data-i18n="reconnect" hidden>Reconnect</button>
+        <p class="fine-print" data-i18n="loginSecurity">The administrator password is separate from inference API keys. Use HTTPS for remote access.</p>
+      </form>
+    </section>
+
+    <div id="app-view" class="app-shell" hidden>
+      <aside class="sidebar">
+        <a class="brand" href="/" data-i18n-aria-label="consoleHome" aria-label="QuickWork console home">
+          <span class="brand-mark" aria-hidden="true">Q</span>
+          <span><strong>QuickWork</strong><small data-i18n="console">Management Console</small></span>
+        </a>
+        <p class="nav-label" data-i18n="workspace">Workspace</p>
+        <nav class="navigation" data-i18n-aria-label="managementPages" aria-label="Management pages">
+          <button class="nav-item active" type="button" data-page="overview" aria-current="page"><span aria-hidden="true">◫</span><span class="nav-text" data-i18n="overview">Overview</span></button>
+          <button class="nav-item" type="button" data-page="accounts"><span aria-hidden="true">◎</span><span class="nav-text" data-i18n="accounts">Accounts</span></button>
+          <button class="nav-item" type="button" data-page="config"><span aria-hidden="true">⚙</span><span class="nav-text" data-i18n="settings">Settings</span></button>
+          <button class="nav-item" type="button" data-page="playground"><span aria-hidden="true">▷</span><span class="nav-text" data-i18n="playground">Playground</span></button>
+        </nav>
+        <div class="sidebar-footer"><span class="status-dot" aria-hidden="true"></span><span><span data-i18n="serverCredentials">Credentials stay on the server</span><br><small data-i18n="nativeGo">Native Go · OpenAI compatible</small></span></div>
+      </aside>
+
+      <div class="workspace">
+        <header class="topbar">
+          <div><p class="eyebrow">QUICKWORK OPENAI</p><h1 id="page-title" data-i18n="overview">Overview</h1></div>
+          <div class="toolbar">
+            <select class="language-select" data-language-select data-i18n-aria-label="language" aria-label="Language"><option value="en">English</option><option value="zh-CN">简体中文</option></select>
+            <button id="theme-toggle" class="button subtle" type="button" data-i18n="darkMode" data-i18n-aria-label="switchDark" aria-label="Switch to dark mode">Dark mode</button>
+            <button id="refresh-page" class="button" type="button" data-i18n="refresh">Refresh</button>
+            <button id="logout" class="button subtle" type="button" data-i18n="signOut">Sign out</button>
+          </div>
+        </header>
+        <main id="main" class="main-content" tabindex="-1">
+          <p id="app-notice" class="notice" role="status" hidden></p>
+          <p id="restart-notice" class="notice warning" role="status" data-i18n="restartNotice" hidden>Settings saved. Restart the service to apply the changes.</p>
+
+          <section id="page-overview" class="page" data-i18n-aria-label="serviceOverview" aria-label="Service overview">
+            <div class="page-intro"><div><h2 data-i18n="serviceOverview">Service overview</h2><p class="muted" data-i18n="overviewIntro">View real upstream attempts, recorded token usage, and account availability.</p></div><span class="badge" id="service-badge" data-i18n="loading">Loading</span></div>
+            <div class="metrics">
+              <article class="metric"><span data-i18n="storedAccounts">Stored accounts</span><strong id="metric-total">—</strong><small data-i18n="sqliteAccounts">Upstream accounts in SQLite</small></article>
+              <article class="metric"><span data-i18n="enabledAccounts">Enabled accounts</span><strong id="metric-enabled">—</strong><small data-i18n="rotationAccounts">Participating in request rotation</small></article>
+              <article class="metric"><span data-i18n="expiredTokens">Expired tokens</span><strong id="metric-expired">—</strong><small data-i18n="autoRefreshTokens">Refresh is attempted on requests</small></article>
+              <article class="metric"><span data-i18n="accountsWithErrors">Accounts with errors</span><strong id="metric-errors">—</strong><small data-i18n="manualRefreshHint">Refresh from the Accounts page</small></article>
+            </div>
+            <div class="metrics usage-metrics">
+              <article class="metric"><span data-i18n="upstreamCalls">Upstream calls</span><strong id="metric-calls">—</strong><small id="metric-call-outcomes">—</small></article>
+              <article class="metric"><span data-i18n="cumulativeDuration">Cumulative call time</span><strong id="metric-duration">—</strong><small data-i18n="attemptTimeHint">Attempt wall time, excluding backoff and refresh</small></article>
+              <article class="metric"><span data-i18n="reportedTokens">Reported tokens</span><strong id="metric-tokens">—</strong><small id="metric-token-breakdown">—</small></article>
+              <article class="metric"><span data-i18n="reportedCost">Reported cost (USD)</span><strong id="metric-cost">—</strong><small id="metric-cost-coverage">—</small></article>
+            </div>
+            <article class="panel"><div class="panel-heading"><h3 data-i18n="officialCredits">Official reported credits</h3><span class="badge neutral" data-i18n="separateUnits">Units are counted separately</span></div><div id="overview-credits" class="credit-list"></div><p class="field-hint" data-i18n="creditsHint">Credit amounts come only from official ACP metadata. Ordinary chat may not report them. Missing values are unknown; credits, USD, and minutes are never converted into one another.</p></article>
+            <div class="overview-grid">
+              <article class="panel">
+                <div class="panel-heading"><h3 data-i18n="runtime">Runtime status</h3><span class="badge neutral" data-i18n="currentProcess">Current process</span></div>
+                <dl class="details">
+                  <div><dt data-i18n="service">Service</dt><dd id="service-name">—</dd></div>
+                  <div><dt data-i18n="startedAt">Started at</dt><dd id="service-started">—</dd></div>
+                  <div><dt data-i18n="accountSelections">Account selections (legacy)</dt><dd id="service-uses">—</dd></div>
+                  <div><dt data-i18n="inferenceAuth">Inference API authentication</dt><dd id="service-api-auth">—</dd></div>
+                  <div><dt data-i18n="managementUI">Management UI</dt><dd id="service-webui">—</dd></div>
+                </dl>
+              </article>
+              <article class="panel">
+                <div class="panel-heading"><h3 data-i18n="modelAliases">Available model aliases</h3><span class="badge neutral" id="default-model">—</span></div>
+                <div id="model-list" class="chips"></div>
+                <p class="muted" data-i18n="modelsHint">Aliases come from the running configuration, not a live upstream model or quota lookup.</p>
+                <button class="button" type="button" data-open-page="playground" data-i18n="openPlayground">Open Playground</button>
+              </article>
+            </div>
+            <article class="panel getting-started">
+              <div><p class="eyebrow" data-i18n="getStarted">Get started</p><h3 data-i18n="startWithAccount">Start with an upstream account</h3><p class="muted" data-i18n="getStartedHint">Sign in from Accounts, then test chat with a separate inference API key.</p></div>
+              <button class="button primary" type="button" data-open-page="accounts" data-i18n="manageAccounts">Manage accounts</button>
+            </article>
+          </section>
+
+          <section id="page-accounts" class="page" data-i18n-aria-label="accounts" aria-label="Accounts" hidden>
+            <div class="page-intro"><div><h2 data-i18n="upstreamAccounts">Upstream accounts</h2><p class="muted" data-i18n="accountsIntro">Enabled accounts rotate in order. Disabling an account keeps its stored credentials.</p></div><div class="toolbar"><button id="sync-all-usage" class="button primary" type="button" data-i18n="syncAllUsage">Sync all usage</button><button id="refresh-all-accounts" class="button" type="button" data-i18n="refreshAllTokens">Refresh all tokens</button></div></div>
+            <article class="panel usage-sync-panel">
+              <div class="panel-heading"><div><h3 data-i18n="officialUsageSync">Official usage sync</h3><p class="muted" data-i18n="quotaUnitHint">The official profile reports monthly minutes. ACP credits and USD costs are separate measurements.</p></div><button class="button subtle" type="button" data-open-page="config" data-i18n="configureUsageSync">Configure sync</button></div>
+              <dl class="sync-details"><div><dt data-i18n="automaticSync">Automatic sync</dt><dd id="usage-sync-enabled">—</dd></div><div><dt data-i18n="syncInterval">Interval</dt><dd id="usage-sync-interval">—</dd></div><div><dt data-i18n="syncAttempts">Sync attempts</dt><dd id="usage-sync-attempts">—</dd></div><div><dt data-i18n="nextSync">Next run</dt><dd id="usage-sync-next">—</dd></div><div><dt data-i18n="syncState">Scheduler</dt><dd id="usage-sync-state">—</dd></div></dl>
+              <p class="field-hint" data-i18n="usageSyncHint">Automatic sync covers enabled accounts. Manual sync still works when automatic sync is off. Configure settings.usage and restart to apply changes.</p>
+            </article>
+            <article class="panel table-panel">
+              <div class="table-scroll"><table><thead><tr><th data-i18n="account">Account</th><th data-i18n="providerRegion">Provider / region</th><th data-i18n="status">Status</th><th data-i18n="tokenExpires">Token expires</th><th data-i18n="callsAndDuration">Calls / time</th><th data-i18n="tokensAndCost">Tokens / credits / USD</th><th data-i18n="officialMinutes">Official minutes quota</th><th data-i18n="actions">Actions</th></tr></thead><tbody id="accounts-body"></tbody></table></div>
+              <p id="accounts-empty" class="empty-state" data-i18n="noAccounts" hidden>No accounts yet. Connect an upstream account using the sign-in flow below.</p>
+            </article>
+            <p class="field-hint" data-i18n="usageStatisticsHint">Each real upstream attempt, including failures and retries, counts once. Statistics start when recording is enabled; older history is not reconstructed. Token totals use official turn_usage only. Missing quota or cost values mean unknown, not zero.</p>
+            <article class="panel">
+              <div class="panel-heading"><div><h3 data-i18n="addAccount">Add or reauthenticate an account</h3><p class="muted" data-i18n="addAccountHint">Sign in on the official website. The server exchanges credentials and stores the account.</p></div></div>
+              <form id="upstream-login-form" class="form-grid">
+                <div><label for="oauth-provider" data-i18n="provider">Provider</label><select id="oauth-provider"><option value="social">social</option><option value="enterprise">enterprise</option><option value="gateway">gateway</option><option value="social_gateway">social_gateway</option></select></div>
+                <div><label for="oauth-stage" data-i18n="environment">Environment</label><select id="oauth-stage"><option value="prod">prod</option><option value="beta">beta</option><option value="integ">integ</option><option value="dev">dev</option></select></div>
+                <div><label for="oauth-region" data-i18n="regionHint">Region (optional, e.g. us-east-1)</label><input id="oauth-region" autocomplete="off"></div>
+                <div class="form-grid-action"><button id="start-login" class="button primary" type="submit" data-i18n="startSignIn">Start sign-in</button></div>
+              </form>
+              <div id="oauth-flow" class="oauth-flow" hidden>
+                <div class="flow-heading"><strong id="oauth-flow-title" data-i18n="waitingSignIn">Waiting for sign-in</strong><span class="muted" id="oauth-flow-expires"></span></div>
+                <ol class="flow-steps"><li id="oauth-step-discovery" data-i18n="discoveryStep">Open discovery and sign in</li><li id="oauth-step-authorize" data-i18n="authorizeStep">Paste the callback to get an authorization link</li><li id="oauth-step-complete" data-i18n="completeStep">Authorize, then paste the final callback</li></ol>
+                <p class="notice" data-i18n="remoteCallbackHint">An unreachable localhost or 127.0.0.1 page is expected in remote / Docker mode. Copy the complete URL from the browser address bar and paste it below. No public callback port is needed.</p>
+                <div id="oauth-link-group" class="flow-link-group" hidden><a id="oauth-link" class="button primary" target="_blank" rel="noopener noreferrer" data-i18n="openOfficialSignIn">Open official sign-in</a><button id="copy-oauth-link" class="button" type="button" data-i18n="copyLink">Copy link</button></div>
+                <form id="oauth-callback-form">
+                  <label for="oauth-callback" data-i18n="fullCallbackURL">Complete callback URL from the browser address bar</label>
+                  <input id="oauth-callback" type="url" autocomplete="off" spellcheck="false" required>
+                  <p class="field-hint" data-i18n="callbackPrivacy">Include all query parameters. The field is cleared on submission and never saved in browser storage.</p>
+                  <button id="submit-callback" class="button primary" type="submit" data-i18n="submitCallback">Submit callback URL</button>
+                </form>
+                <div class="flow-footer"><button id="check-login" class="button subtle" type="button" data-i18n="updateSignIn">Update sign-in status</button><button id="cancel-login" class="button danger subtle" type="button" data-i18n="cancelSignIn">Cancel this sign-in</button></div>
+              </div>
+            </article>
+          </section>
+
+          <section id="page-config" class="page" data-i18n-aria-label="settings" aria-label="Settings" hidden>
+            <div class="page-intro"><div><h2 data-i18n="serviceSettings">Service settings</h2><p class="muted" data-i18n="settingsIntro">Changes are saved to disk, not hot-reloaded into the running process.</p></div><span class="badge neutral" data-i18n="restartRequired">Restart required after saving</span></div>
+            <form id="config-form" class="stack">
+              <article class="panel">
+                <div class="panel-heading"><h3 data-i18n="configuration">Configuration</h3><button id="reload-config" class="button" type="button" data-i18n="reload">Reload</button></div>
+                <p class="notice warning" data-i18n="settingsWarning">Keep the complete JSON structure. Listener, database, and WebUI changes require a restart. Disabling the WebUI will make this console unavailable.</p>
+                <p id="config-override" class="notice" data-i18n="listenerOverride" hidden>The listener is overridden by a startup argument. Editing the configuration will not override that argument.</p>
+                <p class="notice" data-i18n="usageSettingsHint">Official usage sync is controlled by usage.enabled, usage.refresh_interval (default 5m), and usage.max_attempts (1–5, default 3). Disabling it stops automatic sync, not manual sync. Save and restart to apply.</p>
+                <label for="config-json" data-i18n="settingsJSON">Settings JSON</label>
+                <textarea id="config-json" class="code-input" rows="25" autocomplete="off" spellcheck="false" required></textarea>
+              </article>
+              <article class="panel">
+                <div class="panel-heading"><h3 data-i18n="inferenceKeys">Inference API keys</h3><span id="api-key-count" class="badge neutral">—</span></div>
+                <p class="muted" data-i18n="keysHint">Existing keys are never sent to the browser. Leave blank to keep them; new values replace all keys.</p>
+                <label for="replacement-api-keys" data-i18n="replacementKeys">Replacement keys (one per line, optional)</label>
+                <textarea id="replacement-api-keys" rows="3" autocomplete="off" spellcheck="false"></textarea>
+                <label class="checkbox-label" for="clear-api-keys"><input id="clear-api-keys" type="checkbox"><span data-i18n="clearAllKeys">Clear all API keys (disable key authentication for inference)</span></label>
+              </article>
+              <div class="save-bar"><span class="muted" data-i18n="saveHint">After a successful save, restart the service to apply the new settings.</span><button id="save-config" class="button primary" type="submit" data-i18n="saveSettings">Save settings</button></div>
+            </form>
+          </section>
+
+          <section id="page-playground" class="page" data-i18n-aria-label="playground" aria-label="Playground" hidden>
+            <div class="page-intro"><div><h2 data-i18n="playground">Playground</h2><p class="muted" data-i18n="playgroundIntro">Send a real non-streaming upstream request. This may consume account quota.</p></div><span class="badge neutral">POST /v1/chat/completions</span></div>
+            <div class="playground-grid">
+              <form id="playground-form" class="panel stack">
+                <h3 data-i18n="sendMessage">Send a message</h3>
+                <div><label for="playground-model" data-i18n="modelAlias">Model alias</label><select id="playground-model" required></select></div>
+                <div><label for="playground-api-key" data-i18n="inferenceKeyLabel">Inference API key (not the administrator password)</label><input id="playground-api-key" type="password" autocomplete="off"><p id="playground-auth-hint" class="field-hint" data-i18n="keyMemoryHint">The key stays in this page's memory and is cleared on sign-out.</p></div>
+                <div><label for="playground-prompt" data-i18n="message">Message</label><textarea id="playground-prompt" rows="10" required></textarea></div>
+                <div class="toolbar"><button id="send-playground" class="button primary" type="submit" data-i18n="sendRequest">Send request</button><button id="cancel-playground" class="button" type="button" data-i18n="cancelRequest" disabled>Cancel request</button></div>
+              </form>
+              <article class="panel response-panel"><div class="panel-heading"><h3 data-i18n="modelResponse">Model response</h3><button id="clear-playground" class="button subtle" type="button" data-i18n="clearOutput">Clear output</button></div><p id="playground-state" class="muted" role="status" data-i18n="noRequest">No request sent</p><pre id="playground-output" class="response-output" aria-live="polite"></pre></article>
+            </div>
+          </section>
+        </main>
+        <footer class="workspace-footer" data-i18n="footer">QuickWork OpenAI · Upstream access credentials are never displayed in the console.</footer>
+      </div>
+    </div>
+  </body>
+</html>

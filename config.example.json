@@ -1,0 +1,53 @@
+{
+  "addr": "127.0.0.1:8080",
+  "database": "data/quickrelay.db",
+  "api_keys": [],
+  "models": [
+    "smart",
+    "fast",
+    "balanced",
+    "auto"
+  ],
+  "default_model": "smart",
+  "request_timeout": "15m0s",
+  "max_thinking_timeout": "30m0s",
+  "refresh_before": "10m0s",
+  "max_attempts": 3,
+  "app_version": "1.2.4660",
+  "surface": "QUICK_WORK_DESKTOP_WINDOWS",
+  "outpost_id": "",
+  "working_session_id": "",
+  "timezone": "Asia/Singapore",
+  "locale": "zh-CN",
+  "thinking_effort": "",
+  "chat_agent_id": "",
+  "keep_sessions": false,
+  "session_reuse": true,
+  "session_ttl": "24h0m0s",
+  "oauth": {
+    "provider": "social",
+    "build_stage": "prod",
+    "region": "",
+    "callback_port": 18080,
+    "timeout": "1h0m0s"
+  },
+  "webui": {
+    "enabled": true,
+    "session_ttl": "12h0m0s"
+  },
+  "usage": {
+    "enabled": true,
+    "refresh_interval": "5m0s",
+    "max_attempts": 3
+  },
+  "guardrails": {
+    "compact_downgrade": true,
+    "no_tool_max_cap": true,
+    "preserve_env_summary": true
+  },
+  "updater": {
+    "repo": "zhao060206/quickrelay-studio",
+    "mode": "auto",
+    "custom_mirror": ""
+  }
+}
