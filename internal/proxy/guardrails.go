@@ -337,16 +337,31 @@ func extractEnvSummary(rawGuidelines string) string {
 }
 
 var (
-	forbiddenRemoteToolKeywords = []string{
+	// alwaysForbiddenRemoteToolKeywords 无论当前是否上传附件或传入何种参数，一律 0 容忍直接阻断。
+	alwaysForbiddenRemoteToolKeywords = []string{
 		"web_search", "websearch", "web_fetch", "webfetch", "search_web", "online_search",
 		"internet", "browser", "browse", "download", "curl", "wget", "http_request", "fetch_url", "fetch",
-		"bash", "shell", "exec", "terminal", "command", "python", "code_interpreter", "run_code", "sandbox", "script",
 		"write", "create_file", "edit_file", "str_replace", "save_file", "delete", "remove_file", "patch", "mkdir",
 		"quick_space", "space_search", "search_space", "knowledge", "rag_",
 	}
+	// scriptRemoteToolKeywords 在无本轮上传附件时 0 容忍拦截；有上传附件时仅允许最多 2 次纯只读附件切片查看。
+	scriptRemoteToolKeywords = []string{
+		"bash", "shell", "exec", "terminal", "command", "python", "code_interpreter", "run_code", "sandbox", "script",
+	}
 	readonlyRemoteToolKeywords = []string{
 		"read", "view", "cat", "open", "inspect", "attachment", "file", "list",
+		"ripgrep", "rg", "grep", "fdfind", "fd", "find", "glob", "ls", "head", "tail", "stat", "wc",
 	}
+	dangerousRemoteCodeMarkers = []string{
+		"http://", "https://", "urllib", "requests", "httpx", "aiohttp", "curl ", "wget ", "socket.", "fetch(",
+		".write(", "write_text(", "write_bytes(", "mode='w", `mode="w`, ", 'w'", `, "w"`, ", 'wb'", `, "wb"`, ", 'a'", `, "a"`,
+		"shutil.", "os.makedirs", "mkdir", "ffmpeg", "moviepy", "cv2", "manim", "remotion", "playwright", "puppeteer",
+		"subprocess", "os.system", "pip install", "npm ", "npx ", "git ", ">> ", " > ", "tee ",
+	}
+	readonlyRemoteCodeMarkers = []string{
+		".txt", ".pdf", ".png", ".jpg", "open(", "read", "listdir", "glob", "pathlib", "os.walk", "cat ", "head ", "tail ",
+	}
+	windowsDrivePathRe = regexp.MustCompile(`(?:^|[^a-z0-9])[a-z]:[\\/]`)
 )
 
 func argsLookLikeUploadedAttachment(args string) bool {
@@ -359,16 +374,81 @@ func argsLookLikeUploadedAttachment(args string) bool {
 	return false
 }
 
-// classifyRemoteSandboxTool 判断启用客户端工具桥接时上游模型触发的云端原生工具是否越权。
-// 高危联网搜索/下载/命令行/写文件工具一律 0 容忍立即拦截；仅允许有限次数只读查看已上传附件。
-func classifyRemoteSandboxTool(name, args string, hasUploadedAttachments bool, allowedReadCount int) (blocked bool, reason string) {
+// argsHasDangerousRemoteAction 检查远端脚本/命令行参数是否包含联网、下载、写文件、子进程或媒体渲染等危险操作。
+func argsHasDangerousRemoteAction(args string) bool {
+	norm := strings.NewReplacer(`\"`, `"`, `\'`, `'`, `\\`, `\`, `\u003e`, `>`, `\u003c`, `<`).Replace(strings.ToLower(args))
+	for _, marker := range dangerousRemoteCodeMarkers {
+		if strings.Contains(norm, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// argsLookLikeReadonlyAttachmentScript 检查完整后的脚本参数是否确系对已上传附件的只读检索或切片读取。
+func argsLookLikeReadonlyAttachmentScript(args string) bool {
+	if argsLookLikeUploadedAttachment(args) {
+		return true
+	}
+	norm := strings.NewReplacer(`\"`, `"`, `\'`, `'`, `\\`, `\`).Replace(strings.ToLower(args))
+	for _, marker := range readonlyRemoteCodeMarkers {
+		if strings.Contains(norm, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// argsTargetUserLocalPath 检测远端只读工具参数是否试图探测用户的本地盘符或客户端会话目录。
+func argsTargetUserLocalPath(args string) bool {
+	if argsLookLikeUploadedAttachment(args) {
+		return false
+	}
+	normalized := strings.ReplaceAll(strings.ToLower(args), `\\`, `\`)
+	if windowsDrivePathRe.MatchString(normalized) {
+		return true
+	}
+	for _, prefix := range []string{"/sessions/", "/users/", "/home/"} {
+		if strings.Contains(normalized, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// classifyRemoteSandboxTool 按四级策略审计启用客户端工具桥接时的远端原生工具调用：
+// 1) 纯越权联网/下载/写文件工具一律 0 容忍立即拦截；
+// 2) 脚本/命令行工具仅在携带上传附件且无危险操作时允许有限次数只读查看附件；
+// 3) 只读文件/检索工具（含 ripgrep/fdfind）放行有限次数查看云端附件，但指向本机盘符仍立刻拦截；
+// 4) 未知陌生工具一律拦截。
+func classifyRemoteSandboxTool(name, args string, argsFinal, hasUploadedAttachments bool, allowedReadCount, scriptReadCount int) (blocked bool, reason string, isScriptRead bool) {
 	lowerName := strings.ToLower(strings.TrimSpace(name))
 	if lowerName == "" {
-		return false, ""
+		return false, "", false
 	}
-	for _, kw := range forbiddenRemoteToolKeywords {
+	for _, kw := range alwaysForbiddenRemoteToolKeywords {
 		if strings.Contains(lowerName, kw) {
-			return true, "forbidden_remote_tool"
+			return true, "forbidden_remote_tool", false
+		}
+	}
+	for _, kw := range scriptRemoteToolKeywords {
+		if strings.Contains(lowerName, kw) {
+			if !hasUploadedAttachments {
+				return true, "forbidden_remote_tool", false
+			}
+			if argsHasDangerousRemoteAction(args) {
+				return true, "forbidden_remote_code_action", false
+			}
+			if argsTargetUserLocalPath(args) {
+				return true, "remote_tool_targeting_local_path", false
+			}
+			if scriptReadCount >= 2 {
+				return true, "remote_read_limit_exceeded", false
+			}
+			if argsFinal && !argsLookLikeReadonlyAttachmentScript(args) {
+				return true, "forbidden_remote_tool", false
+			}
+			return false, "", true
 		}
 	}
 	isReadCandidate := argsLookLikeUploadedAttachment(args)
@@ -381,19 +461,19 @@ func classifyRemoteSandboxTool(name, args string, hasUploadedAttachments bool, a
 		}
 	}
 	if isReadCandidate {
+		if argsTargetUserLocalPath(args) {
+			return true, "remote_tool_targeting_local_path", false
+		}
 		if hasUploadedAttachments {
-			if allowedReadCount >= 4 {
-				return true, "remote_read_limit_exceeded"
+			if allowedReadCount >= 6 {
+				return true, "remote_read_limit_exceeded", false
 			}
-			return false, ""
+			return false, "", false
 		}
-		if argsLookLikeUploadedAttachment(args) {
-			if allowedReadCount >= 1 {
-				return true, "remote_read_limit_exceeded"
-			}
-			return false, ""
+		if allowedReadCount >= 2 {
+			return true, "remote_read_limit_exceeded", false
 		}
-		return true, "unexpected_remote_tool_without_attachments"
+		return false, "", false
 	}
-	return true, "unrecognized_remote_tool"
+	return true, "unrecognized_remote_tool", false
 }

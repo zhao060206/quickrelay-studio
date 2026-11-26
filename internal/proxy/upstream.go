@@ -36,6 +36,7 @@ var (
 	wsCompleteGracePeriod        = 5 * time.Second
 	wsCompleteGraceMaxThinking   = 10 * time.Second
 	wsNativeToolTimeout          = 45 * time.Second
+	wsNativeToolTotalTimeout     = 90 * time.Second
 )
 
 // ErrUserMessageTooLarge means the user_message frame cannot fit under the
@@ -597,11 +598,21 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 	var pendingFrames []string
 	checkedTools := make(map[string]string)
 	countedReadIDs := make(map[string]bool)
+	countedScriptIDs := make(map[string]bool)
 	allowedReadCount := 0
+	scriptReadCount := 0
 	var nativeToolActiveSince time.Time
+	var nativeToolTotalElapsed time.Duration
 	lastNativeToolName := ""
 
-	checkNativeTool := func(tc *ToolCallState) error {
+	pauseNativeToolTimer := func() {
+		if !nativeToolActiveSince.IsZero() {
+			nativeToolTotalElapsed += time.Since(nativeToolActiveSince)
+			nativeToolActiveSince = time.Time{}
+		}
+	}
+
+	checkNativeTool := func(tc *ToolCallState, argsFinal bool) error {
 		if !clientToolsActive || tc == nil {
 			return nil
 		}
@@ -611,18 +622,46 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 		if strings.TrimSpace(tc.Name) != "" {
 			lastNativeToolName = tc.Name
 		}
-		checkKey := tc.Name + "\x00" + tc.Arguments
+		auditArgs := tc.Arguments
+		if raw := rawArgs[tc.ID]; len(raw) > len(auditArgs) || strings.TrimSpace(auditArgs) == "{}" {
+			if strings.TrimSpace(raw) != "" {
+				auditArgs = raw
+			}
+		}
+		checkKey := fmt.Sprintf("%s\x00%s\x00%t", tc.Name, auditArgs, argsFinal)
 		if prevKey, ok := checkedTools[tc.ID]; ok && prevKey == checkKey {
 			return nil
 		}
-		if blocked, reason := classifyRemoteSandboxTool(tc.Name, tc.Arguments, hasUploadedAttachments, allowedReadCount); blocked {
-			log.Printf("upstream blocked remote sandbox tool thread=%s tool=%q reason=%s", threadID, tc.Name, reason)
+		priorReadCount := allowedReadCount
+		if countedReadIDs[tc.ID] && priorReadCount > 0 {
+			priorReadCount--
+		}
+		priorScriptCount := scriptReadCount
+		if countedScriptIDs[tc.ID] && priorScriptCount > 0 {
+			priorScriptCount--
+		}
+		blocked, reason, isScriptRead := classifyRemoteSandboxTool(tc.Name, auditArgs, argsFinal, hasUploadedAttachments, priorReadCount, priorScriptCount)
+		if blocked {
+			argPreview := strings.TrimSpace(auditArgs)
+			if len(argPreview) > 120 {
+				n := 120
+				for n > 0 && !utf8.RuneStart(argPreview[n]) {
+					n--
+				}
+				argPreview = argPreview[:n] + "..."
+			}
+			log.Printf("upstream blocked remote sandbox tool thread=%s tool=%q reason=%s args=%q", threadID, tc.Name, reason, argPreview)
 			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "remote sandbox tool blocked"), time.Now().Add(time.Second))
 			return &RemoteToolBlockedError{ToolName: tc.Name, Reason: reason}
 		}
 		if strings.TrimSpace(tc.Name) != "" {
 			checkedTools[tc.ID] = checkKey
-			if !countedReadIDs[tc.ID] {
+			if isScriptRead {
+				if !countedScriptIDs[tc.ID] {
+					countedScriptIDs[tc.ID] = true
+					scriptReadCount++
+				}
+			} else if !countedReadIDs[tc.ID] {
 				countedReadIDs[tc.ID] = true
 				allowedReadCount++
 			}
@@ -633,6 +672,10 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 	nativeTimeoutLimit := wsNativeToolTimeout
 	if nativeTimeoutLimit <= 0 {
 		nativeTimeoutLimit = 45 * time.Second
+	}
+	nativeTotalLimit := wsNativeToolTotalTimeout
+	if nativeTotalLimit <= 0 {
+		nativeTotalLimit = 90 * time.Second
 	}
 
 	for {
@@ -652,14 +695,18 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 		}
 		if clientToolsActive && !nativeToolActiveSince.IsZero() {
 			elapsed := time.Since(nativeToolActiveSince)
-			if elapsed >= nativeTimeoutLimit {
-				log.Printf("upstream blocked stalled remote tool thread=%s tool=%q elapsed=%s", threadID, lastNativeToolName, elapsed)
+			totalElapsed := nativeToolTotalElapsed + elapsed
+			if elapsed >= nativeTimeoutLimit || totalElapsed >= nativeTotalLimit {
+				log.Printf("upstream blocked stalled remote tool thread=%s tool=%q elapsed=%s total=%s", threadID, lastNativeToolName, elapsed, totalElapsed)
 				_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "remote tool timeout"), time.Now().Add(time.Second))
 				res, _ := finish()
 				return res, &RemoteToolBlockedError{ToolName: lastNativeToolName, Reason: "remote_tool_timeout"}
 			}
 			if rem := nativeTimeoutLimit - elapsed; rem < readWait {
 				readWait = rem
+			}
+			if totalRem := nativeTotalLimit - totalElapsed; totalRem < readWait {
+				readWait = totalRem
 			}
 		}
 		if len(pendingFrames) == 0 {
@@ -676,9 +723,12 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return res, ctxErr
 				}
-				if clientToolsActive && !nativeToolActiveSince.IsZero() && time.Since(nativeToolActiveSince) >= nativeTimeoutLimit {
-					log.Printf("upstream blocked stalled remote tool on read timeout thread=%s tool=%q", threadID, lastNativeToolName)
-					return res, &RemoteToolBlockedError{ToolName: lastNativeToolName, Reason: "remote_tool_timeout"}
+				if clientToolsActive && !nativeToolActiveSince.IsZero() {
+					elapsed := time.Since(nativeToolActiveSince)
+					if elapsed >= nativeTimeoutLimit || nativeToolTotalElapsed+elapsed >= nativeTotalLimit {
+						log.Printf("upstream blocked stalled remote tool on read timeout thread=%s tool=%q", threadID, lastNativeToolName)
+						return res, &RemoteToolBlockedError{ToolName: lastNativeToolName, Reason: "remote_tool_timeout"}
+					}
 				}
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseNoStatusReceived) {
 					return res, nil
@@ -728,7 +778,7 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 		eventCounts[env.Type]++
 		switch env.Type {
 		case "message_start":
-			nativeToolActiveSince = time.Time{}
+			pauseNativeToolTimer()
 			turnComplete = false
 			completeDeadline = time.Time{}
 			// 读附件或工具回调后的新消息段与前序正文之间插入空行，避免两段文字紧贴粘连。
@@ -791,7 +841,7 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 			if delta == "" {
 				continue
 			}
-			nativeToolActiveSince = time.Time{}
+			pauseNativeToolTimer()
 			turnComplete = false
 			completeDeadline = time.Time{}
 			thinking.WriteString(delta)
@@ -819,7 +869,7 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 			if delta == "" {
 				continue
 			}
-			nativeToolActiveSince = time.Time{}
+			pauseNativeToolTimer()
 			turnComplete = false
 			completeDeadline = time.Time{}
 			text.WriteString(delta)
@@ -891,7 +941,8 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 			}
 			tc := getTool(id, p.ToolName)
 			setToolArgs(tc, p.Arguments)
-			if bErr := checkNativeTool(tc); bErr != nil {
+			argsFinal := env.Type != "tool_start" || len(p.Arguments) > 0
+			if bErr := checkNativeTool(tc, argsFinal); bErr != nil {
 				res, _ := finish()
 				return res, bErr
 			}
@@ -920,7 +971,7 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 				delta = p.Progress.InputDelta
 			}
 			appendToolArgs(tc, delta)
-			if bErr := checkNativeTool(tc); bErr != nil {
+			if bErr := checkNativeTool(tc, false); bErr != nil {
 				res, _ := finish()
 				return res, bErr
 			}
@@ -960,7 +1011,7 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 				args = p.Arguments
 			}
 			setToolArgs(tc, args)
-			if bErr := checkNativeTool(tc); bErr != nil {
+			if bErr := checkNativeTool(tc, true); bErr != nil {
 				res, _ := finish()
 				return res, bErr
 			}
@@ -1003,7 +1054,7 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 					args = item.Function.Arguments
 				}
 				setToolArgs(tc, args)
-				if bErr := checkNativeTool(tc); bErr != nil {
+				if bErr := checkNativeTool(tc, true); bErr != nil {
 					res, _ := finish()
 					return res, bErr
 				}
@@ -1020,7 +1071,7 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 				completeDeadline = time.Now().Add(completeGrace)
 			}
 		case "tool_result":
-			nativeToolActiveSince = time.Time{}
+			pauseNativeToolTimer()
 			// 内置工具执行返回（例如读取大附件后）若紧接着输出正文，确保前后以空行分隔，避免旁白与回答粘连。
 			if text.Len() > 0 && !strings.HasSuffix(text.String(), "\n") {
 				text.WriteString("\n\n")

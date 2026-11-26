@@ -1,15 +1,15 @@
 {
-  "version": "2.4.6",
-  "tag": "v2.4.6",
-  "published_at": "2026-11-26T03:27:30Z",
-  "release_notes": "QuickRelay Studio v2.4.6 更新内容：\n1. 新增强制性「防云端沙箱越权空转」双层护栏：\n   - 在三档协作引导词与客户端工具协议（含续聊精简提醒）中明确禁用 AWS Quick 远端搜索、下载、命令行及写文件沙箱，强制所有真实动作通过 <client_tool_call> 委派给用户本机执行；\n   - 在 WebSocket 上行事件流中实时拦截越权原生工具调用（web_search / download / bash / write_file / quick_space 等高危工具 0 容忍立即熔断，仅放行有限次数的已上传附件只读查看），并新增 45 秒原生工具超时强制断开机制防止 tool_progress 死循环；\n   - 未向客户端开流前遇到拦截，自动在全新线程附带纠偏指令重发切回 <client_tool_call>（不计入账号失败计数）；已开流吐出旁白后再违规时立刻断开并重置受污染会话，彻底杜绝界面卡死在几百 Token 干等 15 分钟白烧上百万缓存。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.6",
+  "version": "2.4.7",
+  "tag": "v2.4.7",
+  "published_at": "2026-11-26T03:58:25Z",
+  "release_notes": "QuickRelay Studio v2.4.7 更新内容：\n1. 升级「防云端沙箱越权空转」为四级参数意图审计，彻底消除误杀循环：\n   - 精准识别 AWS Quick 官方容器查看外置上传大附件（prompt-*.txt / guidelines-*.txt / 图片与文档）所需的只读工具：放行 ripgrep / fdfind / read_file 等只读工具（有附件最多 6 次、续聊最多 2 次）及纯只读切片型 run_python（有附件最多 2 次），彻底终结重建上传附件时的 ripgrep / run_python 误杀死循环；\n   - 始终对 web_search / download / write_file / quick_space、流式 tool_progress 中途出现的联网/下载/写文件/媒体渲染/子进程动作、以及探测用户本机盘符（如 E:\\... / /sessions/...）的路径保持 0 容忍立即拦截；\n   - 新增单次 45 秒与单轮累计 90 秒原生工具硬超时强制断开机制，防止任何读工具循环挂起；优化拦截报错信息并保留开流前无损自动纠偏切回 <client_tool_call>。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.7",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.4.6-win-x64.zip",
-      "size": 8655076,
-      "sha256": "ba101e373c240c60e25971bc3b5f3b7c3fe70cd6ab97d0c5332445a6b2a82bb0",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.6/QuickRelay-Studio-v2.4.6-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.4.7-win-x64.zip",
+      "size": 8659790,
+      "sha256": "d79182749e7e3fc29853b6605e3d782d3d9f01fdf66cc8668d5cb04e375d752b",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.7/QuickRelay-Studio-v2.4.7-win-x64.zip"
     }
   }
 }

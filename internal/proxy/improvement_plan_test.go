@@ -2066,4 +2066,332 @@ func TestImprovement_RemoteSandboxToolBlockedAndAutoCorrected(t *testing.T) {
 			t.Fatalf("expected 200 OK when client sent no tools, got %d: %s", resp.StatusCode, string(raw))
 		}
 	})
+
+	t.Run("allow_ripgrep_and_fdfind_on_uploaded_attachment", func(t *testing.T) {
+		tenantSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/integration/quick-work/upload-attachment":
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{"attachmentId": "att-rg", "path": "/data/s3files/prompt-rg.txt"})
+			case "/integration/quick-work/attachment-dlp-status":
+				_ = json.NewEncoder(w).Encode(map[string]string{"dlpJobStatus": "COMPLETED", "policyAction": "ALLOW"})
+			}
+		}))
+		defer tenantSrv.Close()
+
+		wsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			for {
+				_, raw, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				mType, _, ok := decodeClientFrame(raw)
+				if !ok || mType != "user_message" {
+					continue
+				}
+				writeEv := func(v any) {
+					_ = conn.WriteMessage(websocket.BinaryMessage, encodeMockAIDPServerEvent(v))
+				}
+				writeEv(map[string]any{"type": "tool_start", "payload": map[string]any{"tool_id": "t_fd", "tool_name": "fdfind"}})
+				writeEv(map[string]any{"type": "tool_arguments", "payload": map[string]any{"tool_id": "t_fd", "arguments": map[string]any{"path": "."}}})
+				writeEv(map[string]any{"type": "tool_result", "payload": map[string]any{"tool_id": "t_fd"}})
+				writeEv(map[string]any{"type": "tool_start", "payload": map[string]any{"tool_id": "t_rg", "tool_name": "ripgrep"}})
+				writeEv(map[string]any{"type": "tool_arguments", "payload": map[string]any{"tool_id": "t_rg", "arguments": map[string]any{"path": "/data/s3files/prompt-rg.txt", "pattern": "重点"}}})
+				writeEv(map[string]any{"type": "tool_result", "payload": map[string]any{"tool_id": "t_rg"}})
+				writeEv(map[string]any{"type": "message_start", "payload": map[string]any{"message_id": "m_rg"}})
+				writeEv(map[string]any{"type": "text_delta", "payload": map[string]any{"delta": "已通过 ripgrep 检索上传附件并回答"}})
+				writeEv(map[string]any{"type": "message_complete", "payload": map[string]any{"continuation_expected": false}})
+				writeEv(map[string]any{"type": "turn_completed", "payload": map[string]any{}})
+			}
+		}))
+		defer wsSrv.Close()
+
+		dbPath := filepath.Join(t.TempDir(), "allow_rg.db")
+		st, _ := store.Open(dbPath)
+		defer st.Close()
+		_ = st.Save(context.Background(), &store.Account{
+			Email: "rg@example.com", Provider: "social", TenantURL: tenantSrv.URL,
+			WSHost: "ws://" + strings.TrimPrefix(wsSrv.URL, "http://"), WSPath: "/ws",
+			AccessToken: "jwt-rg", ActorARN: "arn:aws:quick:us-east-1:rg", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		})
+		cfg := config.Default()
+		srv := NewServer(&cfg, accounts.New(st, &cfg))
+		httpSrv := httptest.NewServer(srv.Handler())
+		defer httpSrv.Close()
+
+		b, _ := json.Marshal(map[string]any{
+			"model": "claude-opus-5", "max_tokens": 128, "stream": false,
+			"tools": clientTools,
+			"messages": []map[string]any{{
+				"role": "user",
+				"content": []map[string]any{
+					{"type": "text", "text": "检索这张图旁的说明"},
+					{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": base64.StdEncoding.EncodeToString(makeFakePNG(11))}},
+				},
+			}},
+		})
+		resp, err := (&http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}).Post(httpSrv.URL+"/v1/messages", "application/json", bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("POST: %v", err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), "已通过 ripgrep 检索上传附件并回答") {
+			t.Fatalf("expected 200 OK allowing fdfind+ripgrep on uploaded attachment, got %d: %s", resp.StatusCode, string(raw))
+		}
+	})
+
+	t.Run("block_ripgrep_targeting_user_local_path", func(t *testing.T) {
+		var texts []string
+		var mu sync.Mutex
+		var seq atomic.Int32
+		wsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			for {
+				_, raw, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				mType, payload, ok := decodeClientFrame(raw)
+				if !ok || mType != "user_message" {
+					continue
+				}
+				txt, _ := payload["text"].(string)
+				mu.Lock()
+				texts = append(texts, txt)
+				mu.Unlock()
+				n := seq.Add(1)
+				writeEv := func(v any) {
+					_ = conn.WriteMessage(websocket.BinaryMessage, encodeMockAIDPServerEvent(v))
+				}
+				if n == 1 {
+					// 先发空参 tool_start(ripgrep)，再在 tool_arguments 暴露本地盘符路径
+					writeEv(map[string]any{"type": "tool_start", "payload": map[string]any{"tool_id": "t_rg_local", "tool_name": "ripgrep"}})
+					writeEv(map[string]any{"type": "tool_arguments", "payload": map[string]any{"tool_id": "t_rg_local", "arguments": map[string]any{"path": `E:\codex\绘图\Rylume`, "pattern": "logo"}}})
+					time.Sleep(500 * time.Millisecond)
+					return
+				}
+				writeEv(map[string]any{"type": "message_start", "payload": map[string]any{"message_id": "m_rg_fixed"}})
+				writeEv(map[string]any{"type": "text_delta", "payload": map[string]any{"delta": `<client_tool_call>{"name":"Bash","arguments":{"command":"rg logo E:\\codex\\绘图\\Rylume"}}</client_tool_call>`}})
+				writeEv(map[string]any{"type": "message_complete", "payload": map[string]any{"continuation_expected": false}})
+				writeEv(map[string]any{"type": "turn_completed", "payload": map[string]any{}})
+			}
+		}))
+		defer wsSrv.Close()
+
+		dbPath := filepath.Join(t.TempDir(), "rg_local.db")
+		st, _ := store.Open(dbPath)
+		defer st.Close()
+		_ = st.Save(context.Background(), &store.Account{
+			Email: "rgl@example.com", Provider: "social",
+			WSHost: "ws://" + strings.TrimPrefix(wsSrv.URL, "http://"), WSPath: "/ws",
+			AccessToken: "jwt-rgl", ActorARN: "arn:aws:quick:us-east-1:rgl", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		})
+		cfg := config.Default()
+		srv := NewServer(&cfg, accounts.New(st, &cfg))
+		httpSrv := httptest.NewServer(srv.Handler())
+		defer httpSrv.Close()
+
+		b, _ := json.Marshal(map[string]any{
+			"model": "claude-opus-5", "max_tokens": 128, "stream": false,
+			"tools":    clientTools,
+			"messages": []map[string]any{{"role": "user", "content": `搜索 E:\codex\绘图\Rylume 里的 logo`}},
+		})
+		resp, err := (&http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}).Post(httpSrv.URL+"/v1/messages", "application/json", bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("POST: %v", err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), "Bash") {
+			t.Fatalf("expected auto-correction back to local Bash call when ripgrep targeted local drive, got %d: %s", resp.StatusCode, string(raw))
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(texts) != 2 || !strings.Contains(texts[1], "IMPORTANT CORRECTION") {
+			t.Fatalf("expected 2 attempts with IMPORTANT CORRECTION on second attempt, got %d", len(texts))
+		}
+	})
+
+	t.Run("allow_readonly_run_python_on_uploaded_attachment", func(t *testing.T) {
+		tenantSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/integration/quick-work/upload-attachment":
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{"attachmentId": "att-py", "path": "/data/s3files/prompt-abc.txt"})
+			case "/integration/quick-work/attachment-dlp-status":
+				_ = json.NewEncoder(w).Encode(map[string]string{"dlpJobStatus": "COMPLETED", "policyAction": "ALLOW"})
+			}
+		}))
+		defer tenantSrv.Close()
+
+		wsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			for {
+				_, raw, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				mType, _, ok := decodeClientFrame(raw)
+				if !ok || mType != "user_message" {
+					continue
+				}
+				writeEv := func(v any) {
+					_ = conn.WriteMessage(websocket.BinaryMessage, encodeMockAIDPServerEvent(v))
+				}
+				writeEv(map[string]any{"type": "tool_start", "payload": map[string]any{"tool_id": "t_py_ro", "tool_name": "run_python"}})
+				writeEv(map[string]any{"type": "tool_progress", "payload": map[string]any{"tool_id": "t_py_ro", "input_delta": `{"code":"print(open('/data/s3files/`}})
+				writeEv(map[string]any{"type": "tool_arguments", "payload": map[string]any{"tool_id": "t_py_ro", "arguments": map[string]any{"code": "print(open('/data/s3files/prompt-abc.txt').read()[-2000:])"}}})
+				writeEv(map[string]any{"type": "tool_result", "payload": map[string]any{"tool_id": "t_py_ro"}})
+				writeEv(map[string]any{"type": "message_start", "payload": map[string]any{"message_id": "m_py_ro"}})
+				writeEv(map[string]any{"type": "text_delta", "payload": map[string]any{"delta": "已通过只读切片读完上传附件并继续"}})
+				writeEv(map[string]any{"type": "message_complete", "payload": map[string]any{"continuation_expected": false}})
+				writeEv(map[string]any{"type": "turn_completed", "payload": map[string]any{}})
+			}
+		}))
+		defer wsSrv.Close()
+
+		dbPath := filepath.Join(t.TempDir(), "allow_py_ro.db")
+		st, _ := store.Open(dbPath)
+		defer st.Close()
+		_ = st.Save(context.Background(), &store.Account{
+			Email: "pyro@example.com", Provider: "social", TenantURL: tenantSrv.URL,
+			WSHost: "ws://" + strings.TrimPrefix(wsSrv.URL, "http://"), WSPath: "/ws",
+			AccessToken: "jwt-pyro", ActorARN: "arn:aws:quick:us-east-1:pyro", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		})
+		cfg := config.Default()
+		srv := NewServer(&cfg, accounts.New(st, &cfg))
+		httpSrv := httptest.NewServer(srv.Handler())
+		defer httpSrv.Close()
+
+		b, _ := json.Marshal(map[string]any{
+			"model": "claude-opus-5", "max_tokens": 128, "stream": false,
+			"tools": clientTools,
+			"messages": []map[string]any{{
+				"role": "user",
+				"content": []map[string]any{
+					{"type": "text", "text": "继续分析上传附件"},
+					{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": base64.StdEncoding.EncodeToString(makeFakePNG(22))}},
+				},
+			}},
+		})
+		resp, err := (&http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}).Post(httpSrv.URL+"/v1/messages", "application/json", bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("POST: %v", err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), "已通过只读切片读完上传附件并继续") {
+			t.Fatalf("expected 200 OK allowing readonly run_python slice on uploaded attachment, got %d: %s", resp.StatusCode, string(raw))
+		}
+	})
+
+	t.Run("block_run_python_downloading_during_tool_progress", func(t *testing.T) {
+		tenantSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/integration/quick-work/upload-attachment":
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{"attachmentId": "att-dl", "path": "/data/s3files/img-dl.png"})
+			case "/integration/quick-work/attachment-dlp-status":
+				_ = json.NewEncoder(w).Encode(map[string]string{"dlpJobStatus": "COMPLETED", "policyAction": "ALLOW"})
+			}
+		}))
+		defer tenantSrv.Close()
+
+		var seq atomic.Int32
+		var capTexts []string
+		var mu sync.Mutex
+		wsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			for {
+				_, raw, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				mType, payload, ok := decodeClientFrame(raw)
+				if !ok || mType != "user_message" {
+					continue
+				}
+				txt, _ := payload["text"].(string)
+				mu.Lock()
+				capTexts = append(capTexts, txt)
+				mu.Unlock()
+				n := seq.Add(1)
+				writeEv := func(v any) {
+					_ = conn.WriteMessage(websocket.BinaryMessage, encodeMockAIDPServerEvent(v))
+				}
+				if n == 1 {
+					writeEv(map[string]any{"type": "tool_start", "payload": map[string]any{"tool_id": "t_py_dl", "tool_name": "run_python"}})
+					writeEv(map[string]any{"type": "tool_progress", "payload": map[string]any{"tool_id": "t_py_dl", "input_delta": `{"code":"import urllib.request; urllib.request.urlretrieve('https://deepseek.com/logo.png'`}})
+					time.Sleep(600 * time.Millisecond)
+					return
+				}
+				writeEv(map[string]any{"type": "message_start", "payload": map[string]any{"message_id": "m_py_fixed"}})
+				writeEv(map[string]any{"type": "text_delta", "payload": map[string]any{"delta": `<client_tool_call>{"name":"Bash","arguments":{"command":"curl -sL https://deepseek.com/logo.png -o logo.png"}}</client_tool_call>`}})
+				writeEv(map[string]any{"type": "message_complete", "payload": map[string]any{"continuation_expected": false}})
+				writeEv(map[string]any{"type": "turn_completed", "payload": map[string]any{}})
+			}
+		}))
+		defer wsSrv.Close()
+
+		dbPath := filepath.Join(t.TempDir(), "py_dl.db")
+		st, _ := store.Open(dbPath)
+		defer st.Close()
+		_ = st.Save(context.Background(), &store.Account{
+			Email: "pydl@example.com", Provider: "social", TenantURL: tenantSrv.URL,
+			WSHost: "ws://" + strings.TrimPrefix(wsSrv.URL, "http://"), WSPath: "/ws",
+			AccessToken: "jwt-pydl", ActorARN: "arn:aws:quick:us-east-1:pydl", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		})
+		cfg := config.Default()
+		srv := NewServer(&cfg, accounts.New(st, &cfg))
+		httpSrv := httptest.NewServer(srv.Handler())
+		defer httpSrv.Close()
+
+		b, _ := json.Marshal(map[string]any{
+			"model": "claude-opus-5", "max_tokens": 128, "stream": false,
+			"tools": clientTools,
+			"messages": []map[string]any{{
+				"role": "user",
+				"content": []map[string]any{
+					{"type": "text", "text": "帮我把官网 Logo 下载到本地"},
+					{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": base64.StdEncoding.EncodeToString(makeFakePNG(23))}},
+				},
+			}},
+		})
+		start := time.Now()
+		resp, err := (&http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}).Post(httpSrv.URL+"/v1/messages", "application/json", bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("POST: %v", err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), "Bash") {
+			t.Fatalf("expected auto-correction to local Bash when run_python downloaded in tool_progress, got %d: %s", resp.StatusCode, string(raw))
+		}
+		if elapsed := time.Since(start); elapsed >= 400*time.Millisecond {
+			t.Fatalf("expected immediate termination during tool_progress without waiting 600ms sleep, took %v", elapsed)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(capTexts) != 2 || !strings.Contains(capTexts[1], "IMPORTANT CORRECTION") {
+			t.Fatalf("expected 2 turns with IMPORTANT CORRECTION, got %d", len(capTexts))
+		}
+	})
 }

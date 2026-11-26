@@ -825,7 +825,7 @@ namespace QuickRelayStudioDesktop
 
         private void InitializeFormWindow()
         {
-            this.Text = "QuickRelay Studio 2.4.6";
+            this.Text = "QuickRelay Studio 2.4.7";
             this.AutoScaleMode = AutoScaleMode.None;
             this.WindowState = FormWindowState.Normal;
             this.StartPosition = FormStartPosition.CenterScreen;

@@ -36,9 +36,9 @@ func (e *RemoteToolBlockedError) Error() string {
 	}
 	reason := strings.TrimSpace(e.Reason)
 	if reason == "" {
-		return fmt.Sprintf("%s: %s", ErrRemoteSandboxToolBlocked.Error(), name)
+		return fmt.Sprintf("%s: %s — use local client tools instead of AWS Quick remote sandbox tools", ErrRemoteSandboxToolBlocked.Error(), name)
 	}
-	return fmt.Sprintf("%s: %s (%s)", ErrRemoteSandboxToolBlocked.Error(), name, reason)
+	return fmt.Sprintf("%s: %s (%s) — use local client tools instead of AWS Quick remote sandbox tools", ErrRemoteSandboxToolBlocked.Error(), name, reason)
 }
 
 func (e *RemoteToolBlockedError) Unwrap() error {

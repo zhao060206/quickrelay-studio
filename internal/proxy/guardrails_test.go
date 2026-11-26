@@ -316,31 +316,49 @@ func TestTrimSuggestionMessages(t *testing.T) {
 
 func TestClassifyRemoteSandboxTool(t *testing.T) {
 	cases := []struct {
-		name      string
-		tool      string
-		args      string
-		hasAttach bool
-		readCount int
-		wantBlock bool
-		wantWhy   string
+		name       string
+		tool       string
+		args       string
+		argsFinal  bool
+		hasAttach  bool
+		readCount  int
+		scriptCnt  int
+		wantBlock  bool
+		wantWhy    string
+		wantScript bool
 	}{
-		{"web_search 0容忍拦截", "web_search", `{"q":"deepseek logo"}`, true, 0, true, "forbidden_remote_tool"},
-		{"download_file 0容忍拦截", "download_file", `{"url":"https://a.com/logo.png"}`, false, 0, true, "forbidden_remote_tool"},
-		{"execute_bash 0容忍拦截", "execute_bash", `{"cmd":"curl -O https://a.com"}`, true, 0, true, "forbidden_remote_tool"},
-		{"write_file 0容忍拦截", "write_file", `{"path":"a.py"}`, true, 0, true, "forbidden_remote_tool"},
-		{"quick_space_search 0容忍拦截", "quick_space_search", `{}`, true, 0, true, "forbidden_remote_tool"},
-		{"带附件时 read_file 允许", "read_file", `{"path":"prompt-1.txt"}`, true, 0, false, ""},
-		{"带附件时第4次 read_file 允许", "read_file", `{"path":"img-04.png"}`, true, 3, false, ""},
-		{"带附件时第5次超出配额拦截", "read_file", `{"path":"img-05.png"}`, true, 4, true, "remote_read_limit_exceeded"},
-		{"无附件时普通 read_file 拦截", "read_file", `{"path":"/etc/passwd"}`, false, 0, true, "unexpected_remote_tool_without_attachments"},
-		{"无当前轮附件但读历史上传路径放行1次", "read_file", `{"path":"/data/s3files/doc-01.pdf"}`, false, 0, false, ""},
-		{"未知陌生工具拦截", "render_video", `{}`, true, 0, true, "unrecognized_remote_tool"},
+		{"web_search 0容忍拦截", "web_search", `{"q":"deepseek logo"}`, true, true, 0, 0, true, "forbidden_remote_tool", false},
+		{"download_file 0容忍拦截", "download_file", `{"url":"https://a.com/logo.png"}`, true, false, 0, 0, true, "forbidden_remote_tool", false},
+		{"write_file 0容忍拦截", "write_file", `{"path":"a.py"}`, true, true, 0, 0, true, "forbidden_remote_tool", false},
+		{"quick_space_search 0容忍拦截", "quick_space_search", `{}`, true, true, 0, 0, true, "forbidden_remote_tool", false},
+		{"无附件时 execute_bash 0容忍拦截", "execute_bash", `{"cmd":"echo hi"}`, true, false, 0, 0, true, "forbidden_remote_tool", false},
+		{"无附件时 run_python 0容忍拦截", "run_python", `{"code":"print(open('/data/s3files/p.txt').read())"}`, true, false, 0, 0, true, "forbidden_remote_tool", false},
+		{"带附件时 run_python 空参起始放行", "run_python", `{}`, false, true, 0, 0, false, "", true},
+		{"带附件时 run_python 纯读上传切片放行", "run_python", `{"code":"print(open('/data/s3files/prompt-123.txt').read()[-4000:])"}`, true, true, 0, 0, false, "", true},
+		{"带附件时 run_python 第2次只读放行", "run_python", `{"code":"print(open('guidelines-1.txt').read()[:2000])"}`, true, true, 0, 1, false, "", true},
+		{"带附件时 run_python 第3次超出脚本上限拦截", "run_python", `{"code":"print(open('/data/s3files/prompt-123.txt').read())"}`, true, true, 0, 2, true, "remote_read_limit_exceeded", false},
+		{"带附件时 run_python tool_progress 出现 https:// 秒杀", "run_python", `{"code":"import urllib; urllib.request.urlopen('https://deepseek.com`, false, true, 0, 0, true, "forbidden_remote_code_action", false},
+		{"带附件时 run_python tool_progress 出现 write 秒杀", "run_python", `{"code":"open('out.txt', 'w').write('x')`, false, true, 0, 0, true, "forbidden_remote_code_action", false},
+		{"带附件时 run_python tool_progress 出现 ffmpeg 秒杀", "run_python", `{"code":"import subprocess; subprocess.run(['ffmpeg'`, false, true, 0, 0, true, "forbidden_remote_code_action", false},
+		{"带附件时 run_python 完整参数非读附件拦截", "run_python", `{"code":"print(1 + 1)"}`, true, true, 0, 0, true, "forbidden_remote_tool", false},
+		{"带附件时 run_python 指向用户本地盘符拦截", "run_python", `{"code":"print(open('E:\\codex\\app.py').read())"}`, true, true, 0, 0, true, "remote_tool_targeting_local_path", false},
+		{"带附件时 ripgrep 放行", "ripgrep", `{"pattern":"TODO"}`, true, true, 0, 0, false, "", false},
+		{"带附件时 fdfind 放行", "fdfind", `{"path":"."}`, true, true, 1, 0, false, "", false},
+		{"带附件时第6次 read_file 允许", "read_file", `{"path":"img-06.png"}`, true, true, 5, 0, false, "", false},
+		{"带附件时第7次超出配额拦截", "read_file", `{"path":"img-07.png"}`, true, true, 6, 0, true, "remote_read_limit_exceeded", false},
+		{"无本轮附件续聊回查 ripgrep 空参允许", "ripgrep", `{}`, false, false, 0, 0, false, "", false},
+		{"无本轮附件第2次读附件放行", "read_file", `{"path":"/data/s3files/doc-01.pdf"}`, true, false, 1, 0, false, "", false},
+		{"无本轮附件第3次超出配额拦截", "ripgrep", `{}`, false, false, 2, 0, true, "remote_read_limit_exceeded", false},
+		{"带附件但 ripgrep 指向本地 Windows 盘符拦截", "ripgrep", `{"path":"E:\\codex\\Rylume"}`, true, true, 0, 0, true, "remote_tool_targeting_local_path", false},
+		{"无附件但 fdfind 指向 /sessions 路径拦截", "fdfind", `{"path":"/sessions/demo"}`, true, false, 0, 0, true, "remote_tool_targeting_local_path", false},
+		{"未知陌生工具拦截", "render_video", `{}`, true, true, 0, 0, true, "unrecognized_remote_tool", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			blocked, reason := classifyRemoteSandboxTool(tc.tool, tc.args, tc.hasAttach, tc.readCount)
-			if blocked != tc.wantBlock || reason != tc.wantWhy {
-				t.Fatalf("classifyRemoteSandboxTool(%q) = (%v, %q), want (%v, %q)", tc.tool, blocked, reason, tc.wantBlock, tc.wantWhy)
+			blocked, reason, isScript := classifyRemoteSandboxTool(tc.tool, tc.args, tc.argsFinal, tc.hasAttach, tc.readCount, tc.scriptCnt)
+			if blocked != tc.wantBlock || reason != tc.wantWhy || isScript != tc.wantScript {
+				t.Fatalf("classifyRemoteSandboxTool(%q) = (%v, %q, %v), want (%v, %q, %v)",
+					tc.tool, blocked, reason, isScript, tc.wantBlock, tc.wantWhy, tc.wantScript)
 			}
 		})
 	}
