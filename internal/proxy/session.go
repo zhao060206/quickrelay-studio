@@ -17,6 +17,8 @@ type Session struct {
 	TenantURL        string
 	Provider         string
 	ActorARN         string
+	Email            string
+	DisplayName      string
 	Surface          string
 	OutpostID        string
 	WorkingSessionID string
@@ -42,6 +44,8 @@ func SessionFromAccount(a *store.Account, cfg *config.Config) *Session {
 		TenantURL:        a.TenantURL,
 		Provider:         a.Provider,
 		ActorARN:         a.ActorARN,
+		Email:            a.Email,
+		DisplayName:      a.DisplayName,
 		Surface:          surface,
 		OutpostID:        cfg.OutpostID,
 		WorkingSessionID: cfg.WorkingSessionID,

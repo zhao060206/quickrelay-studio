@@ -528,7 +528,7 @@ func anthropicErrorType(status int, err error) string {
 	switch {
 	case status == http.StatusUnauthorized:
 		return "authentication_error"
-	case status == http.StatusBadRequest:
+	case status == http.StatusBadRequest, status == http.StatusConflict:
 		return "invalid_request_error"
 	case status == http.StatusTooManyRequests:
 		return "rate_limit_error"
@@ -800,7 +800,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		if chunk == "" {
 			return
 		}
-		if _, outputStarted := streamProgress(); turn.bridgeActive && !outputStarted {
+		if _, outputStarted := streamProgress(); !turn.nativeOutpostActive && turn.bridgeActive && !outputStarted {
 			if flushed, shouldFlush := thinkBuf.Add(chunk, thinkingPrestreamMaxBytes, thinkingPrestreamHold); shouldFlush {
 				emitThinkingNow(flushed)
 			}
@@ -939,7 +939,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		bridgeStream = newToolBridgeStream(turn.allowedTools, turn.choiceMode, turn.choiceName, turn.parallelTools)
 	}
 	quickFilter := newQuickOutputFilter(turn.allowedTools, func(tc ToolCallReply) bool {
-		return turn.bridgeActive && emittedTools == 0 && bridgeStream.acceptCall(tc)
+		return !turn.nativeOutpostActive && turn.bridgeActive && emittedTools == 0 && bridgeStream.acceptCall(tc)
 	})
 	emitFilteredText := func(raw string) {
 		cleanText, calls := quickFilter.Feed(raw)
@@ -970,7 +970,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			if ev.Text == "" {
 				return nil
 			}
-			if !turn.bridgeActive {
+			if !turn.bridgeActive || turn.nativeOutpostActive {
 				emitFilteredText(ev.Text)
 				return getClientWriteErr()
 			}
@@ -983,6 +983,14 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			}
 			if ts := bridgeStream.PeekPendingStart(); ts != nil {
 				emitToolStart(*ts)
+			}
+		case "tool_call":
+			if turn.nativeOutpostActive && ev.ToolCall != nil {
+				emitToolReply(ToolCallReply{
+					ID:        ev.ToolCall.ID,
+					Name:      ev.ToolCall.Name,
+					Arguments: ev.ToolCall.Arguments,
+				})
 			}
 		}
 		return getClientWriteErr()
@@ -1040,12 +1048,14 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if turn.bridgeActive {
-		remText, remCalls := bridgeStream.Flush()
-		if remText != "" {
-			emitFilteredText(remText)
-		}
-		for _, tc := range remCalls {
-			emitToolReply(tc)
+		if !turn.nativeOutpostActive {
+			remText, remCalls := bridgeStream.Flush()
+			if remText != "" {
+				emitFilteredText(remText)
+			}
+			for _, tc := range remCalls {
+				emitToolReply(tc)
+			}
 		}
 		fText, fCalls := quickFilter.Flush()
 		if fText != "" {

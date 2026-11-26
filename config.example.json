@@ -24,6 +24,9 @@
   "keep_sessions": false,
   "session_reuse": true,
   "session_ttl": "24h0m0s",
+  "tool_mode": "auto",
+  "outpost_idle_ttl": "10m0s",
+  "outpost_max_sessions": 16,
   "oauth": {
     "provider": "social",
     "build_stage": "prod",

@@ -1,15 +1,15 @@
 {
-  "version": "2.4.9",
-  "tag": "v2.4.9",
-  "published_at": "2026-11-26T07:30:17Z",
-  "release_notes": "新增账号池 JSON 批量导入（桌面端与 WebUI 均支持拖拽 .json 文件自动上传、多选文件与粘贴 JSON），并在 SSE 保活之后保留禁用远端工具无输出纠偏能力。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.9",
+  "version": "2.5.0",
+  "tag": "v2.5.0",
+  "published_at": "2026-11-26T12:06:30Z",
+  "release_notes": "架构重磅升级：新增虚拟 Outpost 原生工具直通与常驻挂起 WebSocket 会话池，支持 /store/sessions + /events/batch 结构化历史冷导入、tool_mode 三模式热切换（PUT /api/tool-mode）、Agent 切换线程边界隔离及文本桥当前轮逐字保真，并自动清洗行首独立路由标记。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.5.0",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.4.9-win-x64.zip",
-      "size": 8717504,
-      "sha256": "37d73392fcbf52891ccb42642dc0f9954a7755922915572a792b975a76addafe",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.9/QuickRelay-Studio-v2.4.9-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.5.0-win-x64.zip",
+      "size": 8803031,
+      "sha256": "3b96dca3c742e237e39c70f7a451ab6d29140461c8c4aa8a42ef0c959eb327cc",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.5.0/QuickRelay-Studio-v2.5.0-win-x64.zip"
     }
   }
 }

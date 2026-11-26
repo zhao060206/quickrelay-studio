@@ -14,22 +14,21 @@ type ConversationRecord struct {
 	ThreadID          string
 	AccountID         int64
 	BaseHash          string
+	ChatAgentID       string
+	ChatAgentBound    bool
 	MessageHashes     []string
 	LastAssistantHash string
 	LastUsed          int64
 }
 
-// GetConversation 根据规范化的 conv_key 读取持久化的会话映射；若不存在则返回 (nil, nil)。
-func (s *Store) GetConversation(ctx context.Context, key string) (*ConversationRecord, error) {
-	if s == nil || s.db == nil || strings.TrimSpace(key) == "" {
-		return nil, nil
-	}
-	const q = `SELECT conv_key, thread_id, account_id, base_hash, message_hashes, last_assistant_hash, last_used
-		FROM conversations WHERE conv_key = ?`
+func scanConversationRow(row interface{ Scan(dest ...any) error }) (*ConversationRecord, error) {
 	var rec ConversationRecord
 	var hashesJSON string
-	err := s.db.QueryRowContext(ctx, q, key).Scan(
-		&rec.Key, &rec.ThreadID, &rec.AccountID, &rec.BaseHash, &hashesJSON, &rec.LastAssistantHash, &rec.LastUsed,
+	var boundInt int
+	err := row.Scan(
+		&rec.Key, &rec.ThreadID, &rec.AccountID, &rec.BaseHash,
+		&rec.ChatAgentID, &boundInt,
+		&hashesJSON, &rec.LastAssistantHash, &rec.LastUsed,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -37,6 +36,7 @@ func (s *Store) GetConversation(ctx context.Context, key string) (*ConversationR
 	if err != nil {
 		return nil, err
 	}
+	rec.ChatAgentBound = boundInt != 0
 	if strings.TrimSpace(hashesJSON) != "" {
 		if err := json.Unmarshal([]byte(hashesJSON), &rec.MessageHashes); err != nil {
 			// 若损坏则视作无历史前缀，回退重新建连
@@ -44,6 +44,27 @@ func (s *Store) GetConversation(ctx context.Context, key string) (*ConversationR
 		}
 	}
 	return &rec, nil
+}
+
+// GetConversation 根据规范化的 conv_key 读取持久化的会话映射；若不存在则返回 (nil, nil)。
+func (s *Store) GetConversation(ctx context.Context, key string) (*ConversationRecord, error) {
+	if s == nil || s.db == nil || strings.TrimSpace(key) == "" {
+		return nil, nil
+	}
+	const q = `SELECT conv_key, thread_id, account_id, base_hash, chat_agent_id, chat_agent_bound, message_hashes, last_assistant_hash, last_used
+		FROM conversations WHERE conv_key = ?`
+	return scanConversationRow(s.db.QueryRowContext(ctx, q, key))
+}
+
+// GetConversationByThreadID 按 thread_id 查询最近一次记录，用于显式 X-Thread-Id 跨键或旧库归属校验。
+func (s *Store) GetConversationByThreadID(ctx context.Context, threadID string) (*ConversationRecord, error) {
+	threadID = strings.TrimSpace(threadID)
+	if s == nil || s.db == nil || threadID == "" {
+		return nil, nil
+	}
+	const q = `SELECT conv_key, thread_id, account_id, base_hash, chat_agent_id, chat_agent_bound, message_hashes, last_assistant_hash, last_used
+		FROM conversations WHERE thread_id = ? ORDER BY last_used DESC LIMIT 1`
+	return scanConversationRow(s.db.QueryRowContext(ctx, q, threadID))
 }
 
 // UpsertConversation 新增或更新一条会话映射及其消息 SHA-256 指纹列表。
@@ -59,17 +80,25 @@ func (s *Store) UpsertConversation(ctx context.Context, rec *ConversationRecord)
 	if err != nil {
 		return err
 	}
-	const stmt = `INSERT INTO conversations (conv_key, thread_id, account_id, base_hash, message_hashes, last_assistant_hash, last_used)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+	boundInt := 0
+	if rec.ChatAgentBound {
+		boundInt = 1
+	}
+	const stmt = `INSERT INTO conversations (conv_key, thread_id, account_id, base_hash, chat_agent_id, chat_agent_bound, message_hashes, last_assistant_hash, last_used)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(conv_key) DO UPDATE SET
 			thread_id = excluded.thread_id,
 			account_id = excluded.account_id,
 			base_hash = excluded.base_hash,
+			chat_agent_id = excluded.chat_agent_id,
+			chat_agent_bound = excluded.chat_agent_bound,
 			message_hashes = excluded.message_hashes,
 			last_assistant_hash = excluded.last_assistant_hash,
 			last_used = excluded.last_used`
 	_, err = s.db.ExecContext(ctx, stmt,
-		rec.Key, rec.ThreadID, rec.AccountID, rec.BaseHash, string(encoded), rec.LastAssistantHash, rec.LastUsed,
+		rec.Key, rec.ThreadID, rec.AccountID, rec.BaseHash,
+		strings.TrimSpace(rec.ChatAgentID), boundInt,
+		string(encoded), rec.LastAssistantHash, rec.LastUsed,
 	)
 	return err
 }

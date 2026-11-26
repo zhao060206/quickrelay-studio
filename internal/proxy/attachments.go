@@ -151,6 +151,47 @@ func attachmentShortTextWithLatest(name, latestUser string) string {
 	return "The full conversation transcript for this turn is attached in " + name + " (you may inspect it with your built-in file reader to see full context). The latest user message is:\n" + preview
 }
 
+// attachmentHistoryWithCurrentTurn 当仅把先前历史外置为文本附件、同时当前轮仍能完整放进主帧时使用：
+// 历史存放在附件中，当前轮原始提问或工具结果逐字完整保留在主帧正文中。
+func attachmentHistoryWithCurrentTurn(name, currentTurn string, isToolTurn bool) string {
+	if strings.TrimSpace(currentTurn) == "" {
+		return "Earlier conversation history is in the attached file " + name + " — treat it as prior context you already read. Continue responding to this turn."
+	}
+	if isToolTurn {
+		return "Earlier conversation history is in the attached file " + name + " — treat it as prior context you already read (you do NOT need to inspect the attachment unless earlier context is needed). Respond directly to the current client tool result(s):\n\n" + currentTurn
+	}
+	return "Earlier conversation history is in the attached file " + name + " — treat it as prior context you already read (you do NOT need to inspect the attachment unless earlier context is needed). Respond directly to this new message:\n\n" + currentTurn
+}
+
+// attachmentOversizedCurrentTurnPreview 当当前轮本身单独超过单帧限制、完整全文已通过附件保全时，
+// 构造明确标注“正文仅为截断预览、完整原文在附件中”的安全正文字段。
+func attachmentOversizedCurrentTurnPreview(name, currentTurn string, isToolTurn bool, maxPreviewBytes int) string {
+	preview := strings.TrimSpace(currentTurn)
+	if preview == "" {
+		return "The full prompt (including the oversized current turn) exceeds the 64 KB inline message limit and is attached verbatim in " + name + ". Read the full attachment before responding."
+	}
+	if maxPreviewBytes <= 0 {
+		return "The current turn exceeds the 64 KB inline message limit, so it cannot be inlined completely. The COMPLETE verbatim prompt and current turn are preserved in the attached file " + name + ". Read the full attachment before responding."
+	}
+	truncated := false
+	if len(preview) > maxPreviewBytes {
+		n := maxPreviewBytes
+		for n > 0 && !utf8.RuneStart(preview[n]) {
+			n--
+		}
+		preview = strings.TrimSpace(preview[:n])
+		truncated = true
+	}
+	note := ""
+	if truncated {
+		note = "\n[truncated preview only — read the attached file " + name + " for the complete verbatim content]"
+	}
+	if isToolTurn {
+		return "The current client tool result(s) exceed the inline message limit. The COMPLETE verbatim content is attached in " + name + " (read the attachment for full content). Truncated preview:\n\n" + preview + note
+	}
+	return "The current user request exceeds the inline message limit. The COMPLETE verbatim content is attached in " + name + " (read the attachment for full content). Truncated preview:\n\n" + preview + note
+}
+
 // userMessageBytes returns the wire size of one user_message frame. The
 // upstream limit is checked against the reassembled inner JSON, not the
 // WebSocket envelope.

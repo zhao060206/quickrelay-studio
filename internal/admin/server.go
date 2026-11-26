@@ -103,6 +103,7 @@ func NewServer(cfg *config.Config, st *store.Store, mgr *accounts.Manager, addrO
 	server.routes.HandleFunc("GET /api/config", server.handleConfigGet)
 	server.routes.HandleFunc("PUT /api/config", server.handleConfigSave)
 	server.routes.HandleFunc("PUT /api/work-mode", server.handleWorkModeSet)
+	server.routes.HandleFunc("PUT /api/tool-mode", server.handleToolModeSet)
 	server.routes.HandleFunc("GET /api/analytics/summary", server.handleAnalyticsSummary)
 	server.routes.HandleFunc("GET /api/logs/requests", server.handleRequestLogs)
 	server.routes.HandleFunc("GET /api/logs/requests/export", server.handleRequestLogsExport)

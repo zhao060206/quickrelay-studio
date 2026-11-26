@@ -53,18 +53,21 @@ func NewUpstream(cfg *config.Config) *Upstream {
 
 // ChatInput is one upstream turn.
 type ChatInput struct {
-	Prompt         string
-	LatestUserText string
-	Images         []ImageAttachment
-	Model          string
-	ThinkingEffort string
-	ThreadID       string
-	Title          string
-	SystemPrompt   string // 兼容旧调用方直接传入完整指令文本
-	Guidelines     string // 工作区规范（<workspace_guidelines>），可在超帧时压缩或转为附件
-	ToolProtocol   string // 客户端工具协议与紧凑 JSON 工具表（<client_tool_protocol>），主帧内严格保护不裁剪
-	WorkMode       string // 工作场景模式：general | document | coding
-	ChatAgentID    string
+	Prompt            string
+	HistoryPrompt     string // 按消息边界拆分的先前历史文本（空表示无先前历史或无需拆分）
+	CurrentTurn       string // 按消息边界拆分的当前轮完整输入（空表示等价于 Prompt）
+	CurrentTurnIsTool bool   // 当前轮是否全部为客户端工具/函数回传结果
+	LatestUserText    string
+	Images            []ImageAttachment
+	Model             string
+	ThinkingEffort    string
+	ThreadID          string
+	Title             string
+	SystemPrompt      string // 兼容旧调用方直接传入完整指令文本
+	Guidelines        string // 工作区规范（<workspace_guidelines>），可在超帧时压缩或转为附件
+	ToolProtocol      string // 客户端工具协议与紧凑 JSON 工具表（<client_tool_protocol>），主帧内严格保护不裁剪
+	WorkMode          string // 工作场景模式：general | document | coding
+	ChatAgentID       string
 	CreateSession     bool
 	DeleteSession     bool
 	ClientToolsActive bool
@@ -325,8 +328,9 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 	}
 
 	// 单条 user_message 帧上限为 64 KB：存在必需附件时必须全部上传成功，
-	// 严禁在不支持附件或上传失败时仍派发残缺请求给模型；随后通过预算保护函数逐级外置/压缩
-	// prompt 与 workspace_guidelines，确保 <client_tool_protocol> 始终完整留在主帧中。
+	// 严禁在不支持附件或上传失败时仍派发残缺请求给模型；随后按消息边界保护当前轮意图：
+	// 小帧维持零附件，超限优先仅外置先前历史并完整内联当前轮；当轮单独超限且支持附件则上传全文并明确预览；
+	// 上传失败或无上传能力且无法无损装入时直接返回错误，绝不发出截半请求。
 	if len(in.Images) > 0 && (isGatewayProvider(sess.Provider) || strings.TrimSpace(sess.TenantURL) == "") {
 		return ChatResult{}, &UpstreamError{
 			StatusCode: http.StatusBadGateway,
@@ -335,8 +339,9 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		}
 	}
 	hasUploadedAttachments := len(in.Images) > 0
+	var attachments []map[string]any
+	var attachFn func(name string, data []byte) (attachmentRef, error)
 	if !isGatewayProvider(sess.Provider) && strings.TrimSpace(sess.TenantURL) != "" {
-		var attachments []map[string]any
 		if len(in.Images) > 0 {
 			imgMetas, uploadErr := uploadImageAttachments(ctx, sess, threadID, in.Images)
 			if uploadErr != nil {
@@ -349,33 +354,46 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 				payload["attachments"] = attachments
 			}
 		}
-
-		preserveEnv := u.cfg == nil || u.cfg.Guardrails.PreserveEnvSummaryEnabled()
-		prepareFrameWithinBudgetWithMode(payload, messageID, guidelines, toolProtocol, legacySystem, basePrompt, in.LatestUserText, attachments, nil, preserveEnv, in.WorkMode,
-			func(name string, data []byte) (attachmentRef, error) {
-				att, attErr := uploadPromptAttachment(ctx, sess, threadID, name, data)
-				if attErr != nil {
-					log.Printf("user_message attachment unavailable thread=%s name=%s bytes=%d: %v", threadID, name, len(data), attErr)
-					return attachmentRef{}, attErr
-				}
-				hasUploadedAttachments = true
-				if att.Path != "" {
-					log.Printf("user_message attachment thread=%s bytes=%d name=%s id=%s path=%s",
-						threadID, att.Size, att.Name, att.ID, att.Path)
-				}
-				return att, nil
-			})
-	} else {
-		// 无带外附件能力时仍尝试单帧技能列表压缩，尽力保住工具协议
-		if n, err := userMessageBytes(payload); err == nil && n > maxUserMessageBytes && guidelines != "" {
-			if compacted := compactSkillsSection(guidelines); compacted != guidelines {
-				payload["text"] = renderTurnTextForMode(in.WorkMode, compacted, toolProtocol, legacySystem, basePrompt)
+		attachFn = func(name string, data []byte) (attachmentRef, error) {
+			att, attErr := uploadPromptAttachment(ctx, sess, threadID, name, data)
+			if attErr != nil {
+				log.Printf("user_message attachment unavailable thread=%s name=%s bytes=%d: %v", threadID, name, len(data), attErr)
+				return attachmentRef{}, attErr
 			}
+			if att.Path == "" {
+				return attachmentRef{}, attachErr("attachment upload returned no workspace path for %s", name)
+			}
+			hasUploadedAttachments = true
+			log.Printf("user_message attachment thread=%s bytes=%d name=%s id=%s path=%s",
+				threadID, att.Size, att.Name, att.ID, att.Path)
+			return att, nil
 		}
 	}
 
-	if err := fitUserMessage(payload); err != nil {
+	preserveEnv := u.cfg == nil || u.cfg.Guardrails.PreserveEnvSummaryEnabled()
+	if err := prepareFrameWithinBudgetDetailed(
+		payload,
+		messageID,
+		guidelines,
+		toolProtocol,
+		legacySystem,
+		basePrompt,
+		in.HistoryPrompt,
+		in.CurrentTurn,
+		in.LatestUserText,
+		in.CurrentTurnIsTool,
+		attachments,
+		nil,
+		preserveEnv,
+		in.WorkMode,
+		attachFn,
+	); err != nil {
 		return ChatResult{}, err
+	}
+	if n, sizeErr := userMessageBytes(payload); sizeErr != nil {
+		return ChatResult{}, sizeErr
+	} else if n > maxUserMessageBytes {
+		return ChatResult{}, fmt.Errorf("%w: %d bytes after frame preparation", ErrUserMessageTooLarge, n)
 	}
 	if err := send(map[string]any{"type": "user_message", "payload": payload}); err != nil {
 		return ChatResult{}, fmt.Errorf("send user_message: %w", err)
@@ -1319,83 +1337,276 @@ func prepareFrameWithinBudgetWithMode(
 	workMode string,
 	attachFn func(name string, data []byte) (attachmentRef, error),
 ) {
-	fits := func() bool {
-		n, err := userMessageBytes(payload)
+	_ = prepareFrameWithinBudgetDetailed(
+		payload, messageID, rawGuidelines, toolProtocol, legacySystem,
+		prompt, "", "", latestUser, false,
+		attachments, failedImgs, preserveEnvSummary, workMode, attachFn,
+	)
+}
+
+func cloneAttachmentSlice(src []map[string]any) []map[string]any {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, len(src))
+	copy(out, src)
+	return out
+}
+
+// placeholderPromptAttachment 生成用于 dry-run 完整帧体积测算的保守占位附件描述。
+func placeholderPromptAttachment(name string) map[string]any {
+	return fileAttachmentMeta(attachmentRef{
+		Name: name,
+		Size: 9999999,
+		Path: "/data/s3files/users/000000000000/sessions/00000000-0000-0000-0000-000000000000/workspace/attached_files/" + name,
+		ID:   "00000000-0000-0000-0000-000000000000",
+	}, attachmentMimeType)
+}
+
+// prepareFrameWithinBudgetDetailed 在不超过上游 64 KB 帧限制的前提下，严格按消息边界保护当前轮意图：
+// 1) 先尝试零附件压缩工作区技能列表；
+// 2) 若有可外置的先前历史且完整当前轮能内联放入 64 KB 帧，仅将先前历史上传为 prompt-*.txt，当前轮逐字完整留在正文；
+// 3) 若当轮自身单独超限，则通过一次上传完整原文并明确正文为截断预览；
+// 4) 上传失败或无上传能力且无法无损装入时明确报错返回，绝不发出丢失本轮尾部的残缺请求。
+func prepareFrameWithinBudgetDetailed(
+	payload map[string]any,
+	messageID string,
+	rawGuidelines, toolProtocol, legacySystem, prompt, historyPrompt, currentTurn, latestUser string,
+	currentIsTool bool,
+	attachments []map[string]any,
+	failedImgs []string,
+	preserveEnvSummary bool,
+	workMode string,
+	attachFn func(name string, data []byte) (attachmentRef, error),
+) error {
+	buildProbePayload := func(atts []map[string]any, g, p string) map[string]any {
+		probe := make(map[string]any, len(payload)+1)
+		for k, v := range payload {
+			probe[k] = v
+		}
+		probe["text"] = renderTurnTextForMode(workMode, g, toolProtocol, legacySystem, p)
+		if len(atts) > 0 {
+			probe["attachments"] = atts
+		} else {
+			delete(probe, "attachments")
+		}
+		return probe
+	}
+	fitsWith := func(atts []map[string]any, g, p string) bool {
+		n, err := userMessageBytes(buildProbePayload(atts, g, p))
 		return err == nil && n <= maxUserMessageBytes
 	}
-	if fits() || attachFn == nil {
-		return
+	applyMain := func(atts []map[string]any, g, p string) {
+		payload["text"] = renderTurnTextForMode(workMode, g, toolProtocol, legacySystem, p)
+		if len(atts) > 0 {
+			payload["attachments"] = atts
+		} else {
+			delete(payload, "attachments")
+		}
 	}
 
+	curAtts := cloneAttachmentSlice(attachments)
 	curGuidelines := rawGuidelines
-	curPrompt := prompt
+	if fitsWith(curAtts, curGuidelines, prompt) {
+		return nil
+	}
 
-	// 第一步（零附件优先）：先尝试常规技能压缩与二档纯索引压缩，若能塞入 64KB 主帧则不上传任何文本附件。
+	// 第一步（零附件优先）：先尝试常规技能压缩与二档纯索引压缩，若能塞入 63 KB 主帧则不上传任何文本附件。
 	if curGuidelines != "" {
 		if compacted := compactSkillsSection(curGuidelines); len(compacted) < len(curGuidelines) {
 			curGuidelines = compacted
-			payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
+			applyMain(curAtts, curGuidelines, prompt)
+			if fitsWith(curAtts, curGuidelines, prompt) {
+				return nil
+			}
 		}
-	}
-	if fits() {
-		return
-	}
-	if rawGuidelines != "" {
 		if indexed := compactSkillsIndexOnly(rawGuidelines); len(indexed) < len(curGuidelines) {
 			curGuidelines = indexed
-			payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
+			applyMain(curAtts, curGuidelines, prompt)
+			if fitsWith(curAtts, curGuidelines, prompt) {
+				return nil
+			}
 		}
-	}
-	if fits() {
-		return
 	}
 
-	// 第二步：压缩技能后仍超限且对话历史/正文较长时，外置为 prompt-<id8>.txt 并在主帧内联最新提问预览。
-	if shouldAttachPrompt(len(curPrompt)) {
-		if att, err := attachFn(attachmentPromptName(messageID), []byte(curPrompt)); err == nil && att.Path != "" {
-			shortText := attachmentShortTextWithLatest(att.Name, latestUser)
-			if len(failedImgs) > 0 {
-				shortText += "\n\n[Note: failed to upload image attachment(s): " + strings.Join(failedImgs, "; ") + "]"
+	// 无附件上传能力（如 gateway / 无 TenantURL）：仅允许缩减工作区规范来挽救工具协议与完整输入；
+	// 仍放不下时明确返回 ErrUserMessageTooLarge，严禁截断本轮正文。
+	if attachFn == nil {
+		if curGuidelines != "" {
+			if curText, ok := payload["text"].(string); ok {
+				if bodyLen, bErr := userMessageBytes(payload); bErr == nil && bodyLen > maxUserMessageBytes {
+					if trimmed, changed := trimWorkspaceGuidelinesOnly(curText, bodyLen-maxUserMessageBytes); changed {
+						payload["text"] = trimmed
+						if n, nErr := userMessageBytes(payload); nErr == nil && n <= maxUserMessageBytes {
+							return nil
+						}
+					}
+				}
 			}
-			curPrompt = shortText
-			attachments = append(attachments, fileAttachmentMeta(att, attachmentMimeType))
-			payload["attachments"] = attachments
-			payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
 		}
-	}
-	if fits() {
-		return
+		return fmt.Errorf("%w: prompt cannot fit under the 64 KB frame limit without attachment upload", ErrUserMessageTooLarge)
 	}
 
-	// 第三步：规范自身仍超帧预算时：
-	// - document 模式严禁上传易引发模型防注入怀疑的 guidelines-*.txt，直接精简为内联摘要；
-	// - general / coding 模式上传完整原始规范为 guidelines-<id8>.txt，并内联环境摘要，确保 <client_tool_protocol> 100% 完整留在主帧。
-	if rawGuidelines != "" {
-		envSummary := ""
-		if preserveEnvSummary {
-			envSummary = extractEnvSummary(rawGuidelines)
-		}
-		if config.NormalizeWorkMode(workMode) == config.WorkModeDocument {
-			curGuidelines = compactGuidelinesInline(envSummary)
-			payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
-			if envSummary != "" && !fits() {
-				curGuidelines = compactGuidelinesInline("")
-				payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
-			}
-			return
-		}
-		if att, err := attachFn(attachmentGuidelinesName(messageID), []byte(rawGuidelines)); err == nil && att.Path != "" {
-			curGuidelines = attachmentGuidelinesNoteWithEnv(att.Name, envSummary)
-			attachments = append(attachments, fileAttachmentMeta(att, attachmentMimeType))
-			payload["attachments"] = attachments
-			payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
-			// 若极端情况下内联环境摘要导致超出帧预算，自动回退为不含摘要的短指引
-			if envSummary != "" && !fits() {
-				curGuidelines = attachmentGuidelinesNote(att.Name)
-				payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
-			}
-		}
+	envSummary := ""
+	if preserveEnvSummary && rawGuidelines != "" {
+		envSummary = extractEnvSummary(rawGuidelines)
 	}
+	isDocMode := config.NormalizeWorkMode(workMode) == config.WorkModeDocument
+
+	// shrinkGuidelinesOnDemand 在当前正文已确定的前提下，按模式对超限工作区规范做内联精简或真实外置上传。
+	shrinkGuidelinesOnDemand := func(atts []map[string]any, curG, bodyText string, dryRun bool) (string, []map[string]any, bool, error) {
+		if fitsWith(atts, curG, bodyText) {
+			return curG, atts, true, nil
+		}
+		if rawGuidelines == "" {
+			return curG, atts, false, nil
+		}
+		if isDocMode {
+			g1 := compactGuidelinesInline(envSummary)
+			if fitsWith(atts, g1, bodyText) {
+				return g1, atts, true, nil
+			}
+			g2 := compactGuidelinesInline("")
+			return g2, atts, fitsWith(atts, g2, bodyText), nil
+		}
+		var nextG string
+		nextAtts := cloneAttachmentSlice(atts)
+		if dryRun {
+			gName := attachmentGuidelinesName(messageID)
+			nextAtts = append(nextAtts, placeholderPromptAttachment(gName))
+			nextG = attachmentGuidelinesNoteWithEnv(gName, envSummary)
+			if fitsWith(nextAtts, nextG, bodyText) {
+				return nextG, nextAtts, true, nil
+			}
+			if envSummary != "" {
+				nextG = attachmentGuidelinesNote(gName)
+				if fitsWith(nextAtts, nextG, bodyText) {
+					return nextG, nextAtts, true, nil
+				}
+			}
+			return nextG, nextAtts, false, nil
+		}
+		att, gErr := attachFn(attachmentGuidelinesName(messageID), []byte(rawGuidelines))
+		if gErr != nil {
+			return curG, atts, false, gErr
+		}
+		if att.Path == "" {
+			return curG, atts, false, attachErr("attachment upload returned empty path for %s", att.Name)
+		}
+		nextAtts = append(nextAtts, fileAttachmentMeta(att, attachmentMimeType))
+		nextG = attachmentGuidelinesNoteWithEnv(att.Name, envSummary)
+		if fitsWith(nextAtts, nextG, bodyText) {
+			return nextG, nextAtts, true, nil
+		}
+		if envSummary != "" {
+			nextG = attachmentGuidelinesNote(att.Name)
+			if fitsWith(nextAtts, nextG, bodyText) {
+				return nextG, nextAtts, true, nil
+			}
+		}
+		return nextG, nextAtts, false, nil
+	}
+
+	failedNote := ""
+	if len(failedImgs) > 0 {
+		failedNote = "\n\n[Note: failed to upload image attachment(s): " + strings.Join(failedImgs, "; ") + "]"
+	}
+
+	fitOversizedCurrentPreview := func(atts []map[string]any, curG, attName, previewSource string) error {
+		nextG, nextAtts, ok, gErr := shrinkGuidelinesOnDemand(atts, curG, attachmentOversizedCurrentTurnPreview(attName, previewSource, currentIsTool, 0)+failedNote, false)
+		if gErr != nil {
+			return gErr
+		}
+		if !ok {
+			return fmt.Errorf("%w: frame metadata and tool protocol exceed 64 KB even after attachment upload", ErrUserMessageTooLarge)
+		}
+		for _, previewCap := range []int{4096, 2048, 1200, 600, 200, 0} {
+			candidate := attachmentOversizedCurrentTurnPreview(attName, previewSource, currentIsTool, previewCap) + failedNote
+			if fitsWith(nextAtts, nextG, candidate) {
+				applyMain(nextAtts, nextG, candidate)
+				return nil
+			}
+		}
+		return fmt.Errorf("%w: frame exceeds 64 KB even with zero-preview attachment note", ErrUserMessageTooLarge)
+	}
+
+	hasSplitHistory := strings.TrimSpace(historyPrompt) != "" && strings.TrimSpace(currentTurn) != ""
+	if !hasSplitHistory {
+		// 无先前历史（单轮超长对话 / 兼容老 12 参调用）：
+		// 优先尝试仅通过压缩/外置工作区规范把完整正文逐字保在主帧内；确系正文自己超限时才上传 prompt 附件。
+		if rawGuidelines != "" {
+			if _, _, dryOK, _ := shrinkGuidelinesOnDemand(curAtts, curGuidelines, prompt, true); dryOK {
+				nextG, nextAtts, ok, gErr := shrinkGuidelinesOnDemand(curAtts, curGuidelines, prompt, false)
+				if gErr != nil {
+					return gErr
+				}
+				if ok {
+					applyMain(nextAtts, nextG, prompt)
+					return nil
+				}
+			}
+		}
+		// 当轮自身单独超限：完整原文进附件，正文使用明确标注截断预览的安全说明。
+		att, pErr := attachFn(attachmentPromptName(messageID), []byte(prompt))
+		if pErr != nil {
+			return pErr
+		}
+		if att.Path == "" {
+			return attachErr("attachment upload returned empty path for %s", att.Name)
+		}
+		curAtts = append(curAtts, fileAttachmentMeta(att, attachmentMimeType))
+		previewSource := strings.TrimSpace(currentTurn)
+		if previewSource == "" {
+			previewSource = strings.TrimSpace(latestUser)
+		}
+		if previewSource == "" {
+			previewSource = prompt
+		}
+		return fitOversizedCurrentPreview(curAtts, curGuidelines, att.Name, previewSource)
+	}
+
+	// 有明确先前历史可外置：先用完整 JSON 序列化 dry-run 判断外置历史后当前轮能否逐字完整留在正文。
+	probePromptName := attachmentPromptName(messageID)
+	probeAtts := append(cloneAttachmentSlice(curAtts), placeholderPromptAttachment(probePromptName))
+	probeBody := attachmentHistoryWithCurrentTurn(probePromptName, currentTurn, currentIsTool) + failedNote
+	_, _, inlineFitsDry, _ := shrinkGuidelinesOnDemand(probeAtts, curGuidelines, probeBody, true)
+
+	if inlineFitsDry {
+		histAtt, hErr := attachFn(probePromptName, []byte(historyPrompt))
+		if hErr != nil {
+			return hErr
+		}
+		if histAtt.Path == "" {
+			return attachErr("attachment upload returned empty path for %s", histAtt.Name)
+		}
+		curAtts = append(curAtts, fileAttachmentMeta(histAtt, attachmentMimeType))
+		realBody := attachmentHistoryWithCurrentTurn(histAtt.Name, currentTurn, currentIsTool) + failedNote
+		if fitsWith(curAtts, curGuidelines, realBody) {
+			applyMain(curAtts, curGuidelines, realBody)
+			return nil
+		}
+		nextG, nextAtts, ok, gErr := shrinkGuidelinesOnDemand(curAtts, curGuidelines, realBody, false)
+		if gErr != nil {
+			return gErr
+		}
+		if ok && fitsWith(nextAtts, nextG, realBody) {
+			applyMain(nextAtts, nextG, realBody)
+			return nil
+		}
+		return fmt.Errorf("%w: current turn exceeds 64 KB after real attachment metadata serialization", ErrUserMessageTooLarge)
+	}
+
+	// 当轮自身单独超限（历史外置且规范最小化后仍放不下完整当前轮）：
+	// 一次上传包含历史与完整当前轮的全文以保全所有内容，正文仅发截断预览与读取附件提示。
+	fullAtt, fErr := attachFn(probePromptName, []byte(prompt))
+	if fErr != nil {
+		return fErr
+	}
+	if fullAtt.Path == "" {
+		return attachErr("attachment upload returned empty path for %s", fullAtt.Name)
+	}
+	curAtts = append(curAtts, fileAttachmentMeta(fullAtt, attachmentMimeType))
+	return fitOversizedCurrentPreview(curAtts, curGuidelines, fullAtt.Name, currentTurn)
 }
 
 // fitUserMessage keeps the user_message payload under the upstream limit.

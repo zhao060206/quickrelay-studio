@@ -30,6 +30,7 @@ type Server struct {
 	tokens   *APIKeyAuth
 	upstream *Upstream
 	sessions *conversationStore
+	outposts *outpostPool
 }
 
 func NewServer(cfg *config.Config, mgr *accounts.Manager) *Server {
@@ -44,20 +45,41 @@ func NewServer(cfg *config.Config, mgr *accounts.Manager) *Server {
 		tokens:   NewAPIKeyAuth(cfg.APIKeys),
 		upstream: NewUpstream(cfg),
 		sessions: newConversationStore(cfg.SessionTTL.Duration(), 256, db),
+		outposts: newOutpostPool(cfg.OutpostIdleTTL.Duration(), cfg.OutpostMaxSessions),
 	}
 }
 
-// DeleteConversation 同步清除指定会话的内存映射与持久化记录。
+// Close 在服务停机时优雅关闭并反注册全部挂起的虚拟 Outpost 设备。
+func (s *Server) Close(ctx context.Context) {
+	if s == nil || s.outposts == nil {
+		return
+	}
+	s.outposts.Shutdown(ctx)
+}
+
+// DeleteConversation 同步清除指定会话的内存映射、挂起 Outpost 与持久化记录。
 func (s *Server) DeleteConversation(ctx context.Context, key string) error {
-	if s == nil || s.sessions == nil {
+	if s == nil {
+		return nil
+	}
+	if s.outposts != nil {
+		s.outposts.InvalidateKey(key)
+	}
+	if s.sessions == nil {
 		return nil
 	}
 	return s.sessions.invalidateKey(ctx, key)
 }
 
-// ClearConversations 同步清空全部会话的内存映射与持久化记录。
+// ClearConversations 同步清空全部会话的内存映射、挂起 Outpost 与持久化记录。
 func (s *Server) ClearConversations(ctx context.Context) error {
-	if s == nil || s.sessions == nil {
+	if s == nil {
+		return nil
+	}
+	if s.outposts != nil {
+		s.outposts.InvalidateAll()
+	}
+	if s.sessions == nil {
 		return nil
 	}
 	return s.sessions.invalidateAll(ctx)
@@ -122,6 +144,7 @@ type preparedTurn struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	conv        *conversation
+	convKeyStr  string
 	convEpoch   uint64
 	convVersion uint64
 
@@ -133,23 +156,29 @@ type preparedTurn struct {
 	model          string
 	requestedModel string
 
-	allowedTools  map[string]bool
-	choiceMode    string
-	choiceName    string
-	parallelTools bool
-	bridgeActive  bool
+	allowedTools          map[string]bool
+	choiceMode            string
+	choiceName            string
+	parallelTools         bool
+	bridgeActive          bool
+	nativeOutpostActive   bool
+	nativeOutpostFallback bool
 	baseHash                string
-	fullGuide               string
-	fullBridgePrompt        string
-	fullPrompt              string
-	fullImages              []ImageAttachment
+	fullGuide         string
+	fullBridgePrompt  string
+	fullPrompt        string
+	fullHistory       string
+	fullCurrentTurn   string
+	fullCurrentIsTool bool
+	fullImages        []ImageAttachment
 	fullMessages            []Message
 	fullLoaded              bool
 	fallbackText            string
 	auxRequest              bool
 	suggestionMode          bool
 
-	in                     ChatInput
+	in                      ChatInput
+	chatAgentID             string
 	requestedThinkingEffort string
 	resume                 bool
 	startedAt   time.Time
@@ -428,11 +457,41 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		return nil, acqErr
 	}
 
+	effectiveAgentID := strings.TrimSpace(s.cfg.ChatAgentID)
+	explicitThreadID := strings.TrimSpace(r.Header.Get("X-Thread-Id"))
+	if isAux {
+		explicitThreadID = ""
+	}
+	// 显式 X-Thread-Id 跨 Agent 或归属未知拦截：禁止在切换 Agent 或旧库未记录绑定时悄悄续接或原样发出旧线程 ID。
+	if !isAux && explicitThreadID != "" {
+		if conv.threadID != "" && conv.threadID == explicitThreadID {
+			if !conv.matchesChatAgent(effectiveAgentID) {
+				s.sessions.release(conv)
+				cancel()
+				return nil, fmt.Errorf("%w: thread %q", ErrThreadAgentMismatch, explicitThreadID)
+			}
+		} else if found, bound, boundAgentID := s.sessions.lookupThreadBinding(ctx, explicitThreadID); found {
+			if !bound || strings.TrimSpace(boundAgentID) != effectiveAgentID {
+				s.sessions.release(conv)
+				cancel()
+				return nil, fmt.Errorf("%w: thread %q", ErrThreadAgentMismatch, explicitThreadID)
+			}
+		}
+	}
+	// 常规会话 Agent 边界校验：切换 Agent（默认<->自定义 / A<->B / 老库无绑定）时仅废弃该条本地复用映射，
+	// 强制以全新线程和完整历史、完整工具表重建，不删除 AWS 云端历史也不影响其他会话。
+	if s.cfg.SessionReuse && !isAux && conv.threadID != "" && !conv.matchesChatAgent(effectiveAgentID) {
+		log.Printf("chat %s resetting stale session thread=%q due to chat_agent_id boundary (bound=%t prev=%q cur=%q)",
+			idPrefix, conv.threadID, conv.chatAgentBound, conv.chatAgentID, effectiveAgentID)
+		s.sessions.reset(conv, convEpoch, convVer)
+	}
+
 	t := &preparedTurn{
 		server:                  s,
 		ctx:                     ctx,
 		cancel:                  cancel,
 		conv:                    conv,
+		convKeyStr:              convKey,
 		convEpoch:               convEpoch,
 		convVersion:             convVer,
 		id:                      idPrefix + strings.ReplaceAll(uuid(), "-", ""),
@@ -447,6 +506,7 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		parallelTools:           parallelTools,
 		bridgeActive:            bridgeActive,
 		baseHash:                baseHash,
+		chatAgentID:             effectiveAgentID,
 		fullGuide:               fullGuide,
 		fullBridgePrompt:        bridgePrompt,
 		fullMessages:            fullMessages,
@@ -463,18 +523,24 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 	}
 
 	promptText := ""
+	promptHistory := ""
+	promptCurrent := ""
+	promptCurrentIsTool := false
 	turnGuidelines := ""
 	var images []ImageAttachment
 	if s.cfg.SessionReuse && !isAux && conv.threadID != "" {
 		if delta, ok := conv.delta(req.Messages); ok {
 			deltaGuide := deltaDeveloperGuidelinesForMode(delta, workMode)
-			deltaPrompt, deltaImages, dErr := formatResumeDeltaWithImages(ctx, req.Messages, delta)
+			deltaFormatted, deltaImages, dErr := formatResumeDeltaSplitWithImages(ctx, req.Messages, delta)
 			if dErr != nil && errors.Is(dErr, ErrInvalidAttachment) {
 				t.Close()
 				return nil, dErr
 			}
-			if dErr == nil && (hasVisibleText(deltaPrompt) || len(deltaImages) > 0 || deltaGuide != "") {
-				promptText = deltaPrompt
+			if dErr == nil && (hasVisibleText(deltaFormatted.Full) || len(deltaImages) > 0 || deltaGuide != "") {
+				promptText = deltaFormatted.Full
+				promptHistory = deltaFormatted.History
+				promptCurrent = deltaFormatted.Current
+				promptCurrentIsTool = deltaFormatted.CurrentIsTool
 				images = deltaImages
 				turnGuidelines = deltaGuide
 				t.resume = true
@@ -487,6 +553,9 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 			return nil, fErr
 		}
 		promptText = t.fullPrompt
+		promptHistory = t.fullHistory
+		promptCurrent = t.fullCurrentTurn
+		promptCurrentIsTool = t.fullCurrentIsTool
 		images = t.fullImages
 		turnGuidelines = fullGuide
 	}
@@ -505,22 +574,22 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		}
 	}
 
-	threadID := strings.TrimSpace(r.Header.Get("X-Thread-Id"))
-	if isAux {
-		threadID = ""
-	}
+	threadID := explicitThreadID
 	t.in = ChatInput{
-		Prompt:         promptText,
-		LatestUserText: latestTurnPreview(req.Messages),
-		Images:         images,
-		Model:          model,
-		ThinkingEffort: thinkingEffort,
-		ThreadID:       threadID,
-		Title:          titleFor(lastUserText(req.Messages)),
-		Guidelines:     turnGuidelines,
-		ToolProtocol:   turnToolProtocol,
-		WorkMode:       workMode,
-		ChatAgentID:       s.cfg.ChatAgentID,
+		Prompt:            promptText,
+		HistoryPrompt:     promptHistory,
+		CurrentTurn:       promptCurrent,
+		CurrentTurnIsTool: promptCurrentIsTool,
+		LatestUserText:    latestTurnPreview(req.Messages),
+		Images:            images,
+		Model:             model,
+		ThinkingEffort:    thinkingEffort,
+		ThreadID:          threadID,
+		Title:             titleFor(lastUserText(req.Messages)),
+		Guidelines:        turnGuidelines,
+		ToolProtocol:      turnToolProtocol,
+		WorkMode:          workMode,
+		ChatAgentID:       effectiveAgentID,
 		CreateSession:     true,
 		DeleteSession:     (!s.cfg.SessionReuse && !s.cfg.KeepSessions) || isAux,
 		ClientToolsActive: bridgeActive,
@@ -567,15 +636,21 @@ func (t *preparedTurn) loadFull() error {
 			return err
 		}
 		t.fullPrompt = p
+		t.fullHistory = ""
+		t.fullCurrentTurn = p
+		t.fullCurrentIsTool = false
 		t.fullImages = nil
 		t.fullLoaded = true
 		return nil
 	}
-	p, imgs, err := formatPromptWithImages(t.ctx, msgs)
+	fp, imgs, err := formatPromptSplitWithImages(t.ctx, msgs)
 	if err != nil {
 		return err
 	}
-	t.fullPrompt = p
+	t.fullPrompt = fp.Full
+	t.fullHistory = fp.History
+	t.fullCurrentTurn = fp.Current
+	t.fullCurrentIsTool = fp.CurrentIsTool
 	t.fullImages = imgs
 	t.fullLoaded = true
 	return nil
@@ -594,6 +669,9 @@ func (t *preparedTurn) switchToFullTranscript() error {
 	t.in.Guidelines = t.fullGuide
 	t.in.ToolProtocol = t.fullBridgePrompt
 	t.in.Prompt = t.fullPrompt
+	t.in.HistoryPrompt = t.fullHistory
+	t.in.CurrentTurn = t.fullCurrentTurn
+	t.in.CurrentTurnIsTool = t.fullCurrentIsTool
 	t.in.Images = t.fullImages
 	return nil
 }
@@ -606,22 +684,58 @@ func (t *preparedTurn) resetConversation() error {
 func (t *preparedTurn) saveConversation(res ChatResult, outText string, outTools []ToolCall) {
 	if !t.auxRequest && t.server.cfg.SessionReuse && res.ThreadID != "" && t.usedAccount != nil {
 		asstHash := assistantOutputFingerprint(outText, outTools)
-		t.server.sessions.save(t.conv, t.convEpoch, t.convVersion, res.ThreadID, t.usedAccount.ID, t.baseHash, t.req.Messages, asstHash)
+		t.server.sessions.saveWithAgent(t.conv, t.convEpoch, t.convVersion, res.ThreadID, t.usedAccount.ID, t.baseHash, t.chatAgentID, t.req.Messages, asstHash)
 	}
+}
+
+func (t *preparedTurn) convKey() string {
+	if t == nil {
+		return ""
+	}
+	if t.convKeyStr != "" {
+		return t.convKeyStr
+	}
+	if t.conv != nil {
+		return t.conv.key
+	}
+	return ""
+}
+
+func (t *preparedTurn) shouldUseNativeOutpost(sess *Session) bool {
+	if t == nil || t.server == nil || t.server.outposts == nil || t.server.cfg == nil {
+		return false
+	}
+	mode := t.server.cfg.GetToolMode()
+	if mode == config.ToolModeTextBridge {
+		return false
+	}
+	if !t.bridgeActive || t.choiceMode == "none" || t.auxRequest || t.suggestionMode || t.nativeOutpostFallback {
+		return false
+	}
+	if len(t.in.Images) > 0 || sess == nil || isGatewayProvider(sess.Provider) || strings.TrimSpace(sess.TenantURL) == "" {
+		return false
+	}
+	return true
 }
 
 func (t *preparedTurn) responseOutput(result ChatResult) (string, []ToolCall) {
 	text := result.Text
 	var replies []ToolCallReply
 	if t.bridgeActive {
-		text, replies = parseClientToolCalls(text, t.allowedTools)
-		if len(replies) == 0 {
-			replies = nativeToolReplies(result.ToolCalls, t.allowedTools)
+		if t.nativeOutpostActive {
+			if len(result.ToolCalls) > 0 {
+				replies = nativeToolReplies(result.ToolCalls, t.allowedTools)
+			}
+		} else {
+			text, replies = parseClientToolCalls(text, t.allowedTools)
+			if len(replies) == 0 {
+				replies = nativeToolReplies(result.ToolCalls, t.allowedTools)
+			}
 		}
 	}
 	var uiCalls []ToolCallReply
 	text, uiCalls = cleanQuickOutput(text, t.allowedTools, func(tc ToolCallReply) bool {
-		return t.bridgeActive && len(replies) == 0 && (t.choiceMode != "function" || t.choiceName == "" || tc.Name == t.choiceName)
+		return t.bridgeActive && !t.nativeOutpostActive && len(replies) == 0 && (t.choiceMode != "function" || t.choiceName == "" || tc.Name == t.choiceName)
 	})
 	if len(uiCalls) > 0 && len(replies) == 0 {
 		replies = append(replies, uiCalls...)
@@ -750,7 +864,30 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamProgress func() (started
 		t.clearUpstreamWaiting()
 		attemptIn := t.in
 		attemptIn.OnDispatched = t.markUpstreamWaiting
-		res, err = t.server.upstream.Chat(t.ctx, sess, attemptIn, onEvent)
+		t.nativeOutpostActive = false
+		if t.shouldUseNativeOutpost(sess) {
+			t.nativeOutpostActive = true
+			res, err = t.server.outposts.RunTurn(t.ctx, t, sess, onEvent)
+			if err != nil && errors.Is(err, ErrOutpostUnsupported) && t.server.cfg.GetToolMode() == config.ToolModeAuto {
+				started := false
+				if streamProgress != nil {
+					started, _ = streamProgress()
+				}
+				if !started {
+					log.Printf("chat %s outpost unsupported (%v); falling back to text_bridge", t.id, err)
+					t.nativeOutpostFallback = true
+					t.nativeOutpostActive = false
+					if resetOutput != nil {
+						resetOutput()
+					}
+					attemptIn = t.in
+					attemptIn.OnDispatched = t.markUpstreamWaiting
+					res, err = t.server.upstream.Chat(t.ctx, sess, attemptIn, onEvent)
+				}
+			}
+		} else {
+			res, err = t.server.upstream.Chat(t.ctx, sess, attemptIn, onEvent)
+		}
 		t.clearUpstreamWaiting()
 		attemptDuration := time.Since(attemptStarted)
 		if err == nil {
@@ -803,7 +940,11 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamProgress func() (started
 				if toolSummary := formatToolNamesSummary(collectToolNames(t.req), 480); toolSummary != "" {
 					toolSummaryHint = fmt.Sprintf(" Available local tools: %s.", toolSummary)
 				}
-				t.in.Prompt += fmt.Sprintf("\n\n[IMPORTANT CORRECTION: Your previous attempt invoked a blocked remote cloud tool (%q) and was terminated. Remote cloud sandbox, web search, download, shell, and file-write tools are strictly disabled.%s Perform the required action on the user's local machine by emitting <client_tool_call> from <client_tool_protocol> right now, or answer in plain text without invoking remote tools.]", blockedName, toolSummaryHint)
+				correctionHint := fmt.Sprintf("\n\n[IMPORTANT CORRECTION: Your previous attempt invoked a blocked remote cloud tool (%q) and was terminated. Remote cloud sandbox, web search, download, shell, and file-write tools are strictly disabled.%s Perform the required action on the user's local machine by emitting <client_tool_call> from <client_tool_protocol> right now, or answer in plain text without invoking remote tools.]", blockedName, toolSummaryHint)
+				t.in.Prompt += correctionHint
+				if strings.TrimSpace(t.in.CurrentTurn) != "" {
+					t.in.CurrentTurn += correctionHint
+				}
 				t.preferredAccount = acct.ID
 				forceCorrection = true
 				log.Printf("chat %s auto-correcting blocked remote tool %q in fresh thread", t.id, blockedName)
@@ -1243,7 +1384,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	quickFilter := newQuickOutputFilter(turn.allowedTools, func(tc ToolCallReply) bool {
-		return turn.bridgeActive && emittedToolIdx == 0 && bridgeStream.acceptCall(tc)
+		return !turn.nativeOutpostActive && turn.bridgeActive && emittedToolIdx == 0 && bridgeStream.acceptCall(tc)
 	})
 	emitFilteredText := func(raw string) {
 		cleanText, calls := quickFilter.Feed(raw)
@@ -1270,7 +1411,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		switch ev.Type {
 		case "thinking":
 			if ev.Text != "" {
-				if _, outputStarted := streamProgress(); turn.bridgeActive && !outputStarted {
+				if _, outputStarted := streamProgress(); !turn.nativeOutpostActive && turn.bridgeActive && !outputStarted {
 					if flushed, shouldFlush := thinkBuf.Add(ev.Text, thinkingPrestreamMaxBytes, thinkingPrestreamHold); shouldFlush {
 						writeChunk(map[string]any{"reasoning_content": flushed}, nil)
 					}
@@ -1283,7 +1424,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if ev.Text == "" {
 				return nil
 			}
-			if !turn.bridgeActive {
+			if !turn.bridgeActive || turn.nativeOutpostActive {
 				emitFilteredText(ev.Text)
 				return nil
 			}
@@ -1296,6 +1437,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			}
 			if ts := bridgeStream.PeekPendingStart(); ts != nil {
 				emitToolStart(*ts)
+			}
+		case "tool_call":
+			if turn.nativeOutpostActive && ev.ToolCall != nil {
+				emitToolReply(ToolCallReply{
+					ID:        ev.ToolCall.ID,
+					Name:      ev.ToolCall.Name,
+					Arguments: ev.ToolCall.Arguments,
+				})
 			}
 		}
 		return getClientWriteErr()
@@ -1344,12 +1493,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	finish := "stop"
 	if turn.bridgeActive {
-		remText, remCalls := bridgeStream.Flush()
-		if remText != "" {
-			emitFilteredText(remText)
-		}
-		for _, tc := range remCalls {
-			emitToolReply(tc)
+		if !turn.nativeOutpostActive {
+			remText, remCalls := bridgeStream.Flush()
+			if remText != "" {
+				emitFilteredText(remText)
+			}
+			for _, tc := range remCalls {
+				emitToolReply(tc)
+			}
 		}
 		fText, fCalls := quickFilter.Flush()
 		if fText != "" {

@@ -36,6 +36,7 @@ var (
 
 	reACPRoute         = regexp.MustCompile(`[ \t]*\[ACP_ROUTE:[^\]]*\]`)
 	reNotchStyle       = regexp.MustCompile(`[ \t]*\[NOTCH_REPLY_STYLE:[^\]]*\]`)
+	reQuickRoleMarker  = regexp.MustCompile(`(?m)^[ \t]*\[(?:assistant|main)\][ \t]*(?:\r?\n|$)`)
 	reDecisionResponse = regexp.MustCompile(`(?is)</?decision_response>`)
 	reOrphanCloseTags  = regexp.MustCompile(`(?is)[ \t]*</(?:sources|decisions|decision|option|artifact)>`)
 )
@@ -317,6 +318,7 @@ func stripQuickInlineSegment(s string) string {
 	s = stripBareQuickCitations(s)
 	s = reACPRoute.ReplaceAllString(s, "")
 	s = reNotchStyle.ReplaceAllString(s, "")
+	s = reQuickRoleMarker.ReplaceAllString(s, "")
 	s = reDecisionResponse.ReplaceAllString(s, "")
 	s = reOrphanCloseTags.ReplaceAllString(s, "")
 	return s

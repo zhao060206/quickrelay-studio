@@ -136,8 +136,8 @@ func runServer(args []string) int {
 
 	log.Printf("quickrelay-studio listening on %s (config=%s db=%s accounts=%d auth=%v)",
 		listenAddr, cfg.Path, cfg.Database, count, len(cfg.APIKeys) > 0)
-	log.Printf("models=%s default_model=%s request_timeout=%s refresh_before=%s max_attempts=%d keep_sessions=%v session_reuse=%v session_ttl=%s",
-		strings.Join(cfg.Models, ","), cfg.DefaultModel, cfg.RequestTimeout.Duration(),
+	log.Printf("models=%s default_model=%s tool_mode=%s request_timeout=%s refresh_before=%s max_attempts=%d keep_sessions=%v session_reuse=%v session_ttl=%s",
+		strings.Join(cfg.Models, ","), cfg.DefaultModel, cfg.GetToolMode(), cfg.RequestTimeout.Duration(),
 		cfg.RefreshBefore.Duration(), cfg.MaxAttempts, cfg.KeepSessions, cfg.SessionReuse, cfg.SessionTTL.Duration())
 	if count == 0 {
 		log.Printf("no accounts stored; run `quickrelay login` to add one")
@@ -157,9 +157,10 @@ func runServer(args []string) int {
 
 	<-stop.Done()
 	log.Printf("shutting down")
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	_ = server.Shutdown(shutdownCtx)
+	proxySrv.Close(shutdownCtx)
 	select {
 	case err := <-listenErr:
 		log.Printf("listen: %v", err)

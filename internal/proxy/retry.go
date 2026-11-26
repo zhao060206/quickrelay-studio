@@ -21,6 +21,7 @@ var (
 	ErrEmptyResponse            = errors.New("upstream returned no visible text or tool calls")
 	ErrInvalidAttachment        = errors.New("invalid attachment")
 	ErrRemoteSandboxToolBlocked = errors.New("remote cloud sandbox tool blocked")
+	ErrThreadAgentMismatch      = errors.New("explicit X-Thread-Id conflicts with current chat_agent_id or has unknown agent ownership; start a new conversation with a fresh X-Thread-Id")
 )
 
 // RemoteToolBlockedError 表示模型在启用客户端工具桥接时越权调用了远端云端沙箱/搜索/执行工具并被实时阻断。
@@ -74,7 +75,7 @@ const (
 )
 
 func retryActionFor(err error) retryAction {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, ErrUserMessageTooLarge) || errors.Is(err, ErrInvalidAttachment) || errors.Is(err, ErrRemoteSandboxToolBlocked) {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, ErrUserMessageTooLarge) || errors.Is(err, ErrInvalidAttachment) || errors.Is(err, ErrRemoteSandboxToolBlocked) || errors.Is(err, ErrThreadAgentMismatch) {
 		return retryStop
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
@@ -242,7 +243,7 @@ func isRateLimitTemporary(err error) bool {
 }
 
 func invalidChatRequest(err error) bool {
-	if errors.Is(err, ErrUserMessageTooLarge) || errors.Is(err, ErrInvalidAttachment) {
+	if errors.Is(err, ErrUserMessageTooLarge) || errors.Is(err, ErrInvalidAttachment) || errors.Is(err, ErrThreadAgentMismatch) {
 		return true
 	}
 	var upstreamErr *UpstreamError
@@ -262,6 +263,8 @@ func invalidChatRequest(err error) bool {
 
 func chatErrorStatus(err error) (int, string) {
 	switch {
+	case errors.Is(err, ErrThreadAgentMismatch):
+		return http.StatusConflict, "thread_agent_mismatch"
 	case errors.Is(err, ErrRemoteSandboxToolBlocked):
 		return http.StatusBadGateway, "remote_sandbox_tool_blocked"
 	case errors.Is(err, accounts.ErrAllAccountsCoolingDown):

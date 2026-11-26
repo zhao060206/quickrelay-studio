@@ -28,6 +28,8 @@ type conversation struct {
 	threadID          string
 	accountID         int64
 	baseHash          string
+	chatAgentID       string
+	chatAgentBound    bool
 	msgHashes         []string
 	lastAssistantHash string
 	lastUsed          atomic.Int64
@@ -181,8 +183,19 @@ func (c *conversation) clearInMemory() {
 	c.threadID = ""
 	c.accountID = 0
 	c.baseHash = ""
+	c.chatAgentID = ""
+	c.chatAgentBound = false
 	c.msgHashes = nil
 	c.lastAssistantHash = ""
+}
+
+// matchesChatAgent 校验该本地会话映射是否显式绑定且归属于当前有效 ChatAgentID。
+// 未记录绑定的老版本记录（chatAgentBound == false）返回 false，触发一次性安全重建。
+func (c *conversation) matchesChatAgent(effectiveAgentID string) bool {
+	if c == nil || !c.chatAgentBound {
+		return false
+	}
+	return strings.TrimSpace(c.chatAgentID) == strings.TrimSpace(effectiveAgentID)
 }
 
 type conversationStore struct {
@@ -375,6 +388,8 @@ func (s *conversationStore) loadFromDB(c *conversation) {
 	c.threadID = rec.ThreadID
 	c.accountID = rec.AccountID
 	c.baseHash = rec.BaseHash
+	c.chatAgentID = strings.TrimSpace(rec.ChatAgentID)
+	c.chatAgentBound = rec.ChatAgentBound
 	c.msgHashes = rec.MessageHashes
 	c.lastAssistantHash = rec.LastAssistantHash
 	if rec.LastUsed > 0 {
@@ -382,12 +397,58 @@ func (s *conversationStore) loadFromDB(c *conversation) {
 	}
 }
 
+// lookupThreadBinding 检查指定 thread_id 在内存或持久化存储中的 Agent 归属情况，用于拦截跨 Agent 的显式 X-Thread-Id 复用。
+func (s *conversationStore) lookupThreadBinding(ctx context.Context, threadID string) (found bool, bound bool, agentID string) {
+	threadID = strings.TrimSpace(threadID)
+	if s == nil || threadID == "" {
+		return false, false, ""
+	}
+	s.mu.Lock()
+	var latestUsed int64 = -1
+	for _, c := range s.entries {
+		if c.threadID != threadID {
+			continue
+		}
+		used := c.lastUsed.Load()
+		if !found || used >= latestUsed {
+			found = true
+			latestUsed = used
+			bound = c.chatAgentBound
+			agentID = strings.TrimSpace(c.chatAgentID)
+		}
+	}
+	s.mu.Unlock()
+	if found {
+		return true, bound, agentID
+	}
+	if s.store == nil {
+		return false, false, ""
+	}
+	dbCtx, cancel := context.WithTimeout(ctx, dbPersistTimeout)
+	defer cancel()
+	rec, err := s.store.GetConversationByThreadID(dbCtx, threadID)
+	if err != nil {
+		log.Printf("conversation lookup thread=%s failed: %v", threadID, err)
+		return false, false, ""
+	}
+	if rec == nil || rec.ThreadID == "" {
+		return false, false, ""
+	}
+	return true, rec.ChatAgentBound, strings.TrimSpace(rec.ChatAgentID)
+}
+
 // save 在与失效操作共用的短临界区内校验会话版本并同步写回内存与 SQLite，防止已被清理的旧映射写回复活。
 func (s *conversationStore) save(c *conversation, snapEpoch, snapVer uint64, threadID string, accountID int64, baseHash string, msgs []Message, lastAssistantHash string) {
+	s.saveWithAgent(c, snapEpoch, snapVer, threadID, accountID, baseHash, "", msgs, lastAssistantHash)
+}
+
+// saveWithAgent 在保存会话映射与消息指纹的同时记录创建并拥有该线程的显式 ChatAgentID 归属。
+func (s *conversationStore) saveWithAgent(c *conversation, snapEpoch, snapVer uint64, threadID string, accountID int64, baseHash, chatAgentID string, msgs []Message, lastAssistantHash string) {
 	if s == nil || c == nil || threadID == "" {
 		return
 	}
 	hashes := nonLeadingMessageFingerprints(msgs)
+	normalizedAgentID := strings.TrimSpace(chatAgentID)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -397,6 +458,8 @@ func (s *conversationStore) save(c *conversation, snapEpoch, snapVer uint64, thr
 	c.threadID = threadID
 	c.accountID = accountID
 	c.baseHash = baseHash
+	c.chatAgentID = normalizedAgentID
+	c.chatAgentBound = true
 	c.msgHashes = hashes
 	c.lastAssistantHash = lastAssistantHash
 	c.loaded = true
@@ -414,6 +477,8 @@ func (s *conversationStore) save(c *conversation, snapEpoch, snapVer uint64, thr
 		ThreadID:          threadID,
 		AccountID:         accountID,
 		BaseHash:          baseHash,
+		ChatAgentID:       normalizedAgentID,
+		ChatAgentBound:    true,
 		MessageHashes:     hashes,
 		LastAssistantHash: lastAssistantHash,
 		LastUsed:          nowUnix,

@@ -16,11 +16,44 @@ import (
 	"quickrelay-studio/internal/version"
 )
 
-// modelAliasMu 与 workModeMu 分别保护运行时动态更新的映射与工作场景模式，避免放进 Config 结构体触发按值拷贝锁告警。
+// modelAliasMu、workModeMu 与 toolModeMu 分别保护运行时动态更新的映射、工作场景模式与工具模式，
+// 避免把互斥锁放进 Config 结构体触发按值拷贝锁告警。
 var (
 	modelAliasMu sync.RWMutex
 	workModeMu   sync.RWMutex
+	toolModeMu   sync.RWMutex
 )
+
+const (
+	// ToolModeAuto 为默认自适应工具模式（AIDP + 有效 TenantURL + 无多模态附件时优先走虚拟 Outpost 原生工具，不支持时无缝回退文本桥）。
+	ToolModeAuto = "auto"
+	// ToolModeNativeOutpost 强制优先使用虚拟 Outpost 原生工具，不因 putOutpost 失败自动回退文本桥。
+	ToolModeNativeOutpost = "native_outpost"
+	// ToolModeTextBridge 强制使用经典文本工具协议桥接。
+	ToolModeTextBridge = "text_bridge"
+)
+
+// NormalizeToolMode 规范化工具执行模式；未知或空值返回默认 auto。
+func NormalizeToolMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case ToolModeNativeOutpost:
+		return ToolModeNativeOutpost
+	case ToolModeTextBridge:
+		return ToolModeTextBridge
+	default:
+		return ToolModeAuto
+	}
+}
+
+// ValidateToolMode 校验 tool_mode 配置值是否合法（允许空串代表默认 auto）。
+func ValidateToolMode(raw string) error {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", ToolModeAuto, ToolModeNativeOutpost, ToolModeTextBridge:
+		return nil
+	default:
+		return fmt.Errorf("tool_mode must be auto, native_outpost or text_bridge")
+	}
+}
 
 const (
 	// WorkModeGeneral 为默认综合模式（代码与通用文档兼顾，措辞中立）。
@@ -179,10 +212,13 @@ type Config struct {
 	Locale           string   `json:"locale"`
 	ThinkingEffort   string   `json:"thinking_effort"`
 	ChatAgentID      string   `json:"chat_agent_id"`
-	KeepSessions     bool     `json:"keep_sessions"`
-	SessionReuse     bool     `json:"session_reuse"`
-	SessionTTL       Duration `json:"session_ttl"`
-	OAuth            OAuth      `json:"oauth"`
+	KeepSessions       bool              `json:"keep_sessions"`
+	SessionReuse       bool              `json:"session_reuse"`
+	SessionTTL         Duration          `json:"session_ttl"`
+	ToolMode           string            `json:"tool_mode,omitempty"`
+	OutpostIdleTTL     Duration          `json:"outpost_idle_ttl,omitempty"`
+	OutpostMaxSessions int               `json:"outpost_max_sessions,omitempty"`
+	OAuth              OAuth             `json:"oauth"`
 	WebUI            WebUI      `json:"webui"`
 	Usage            Usage      `json:"usage"`
 	WorkMode         string     `json:"work_mode,omitempty"`
@@ -213,9 +249,12 @@ func Default() Config {
 		Timezone:       "Asia/Singapore",
 		Locale:         "zh-CN",
 		ThinkingEffort: "",
-		KeepSessions:   false,
-		SessionReuse:   true,
-		SessionTTL:     Duration(24 * time.Hour),
+		KeepSessions:       false,
+		SessionReuse:       true,
+		SessionTTL:         Duration(24 * time.Hour),
+		ToolMode:           ToolModeAuto,
+		OutpostIdleTTL:     Duration(10 * time.Minute),
+		OutpostMaxSessions: 16,
 		OAuth: OAuth{
 			Provider:     "social",
 			BuildStage:   "prod",
@@ -287,10 +326,32 @@ func (c *Config) FileValues() Config {
 	value := *c
 	value.ModelAliases = c.GetModelAliases()
 	value.WorkMode = c.GetWorkMode()
+	value.ToolMode = c.GetToolMode()
 	if c.originalDatabase != "" && c.Database == c.resolvedDatabase {
 		value.Database = c.originalDatabase
 	}
 	return value
+}
+
+// GetToolMode 线程安全地读取当前生效的工具执行模式。
+func (c *Config) GetToolMode() string {
+	if c == nil {
+		return ToolModeAuto
+	}
+	toolModeMu.RLock()
+	defer toolModeMu.RUnlock()
+	return NormalizeToolMode(c.ToolMode)
+}
+
+// SetToolMode 线程安全地更新运行时工具执行模式，立即对后续请求生效。
+func (c *Config) SetToolMode(mode string) {
+	if c == nil {
+		return
+	}
+	norm := NormalizeToolMode(mode)
+	toolModeMu.Lock()
+	defer toolModeMu.Unlock()
+	c.ToolMode = norm
 }
 
 // GetWorkMode 线程安全地读取当前生效的工作场景模式。
@@ -508,6 +569,17 @@ func applyDefaults(c *Config) {
 	} else {
 		c.WorkMode = NormalizeWorkMode(c.WorkMode)
 	}
+	if strings.TrimSpace(c.ToolMode) == "" {
+		c.ToolMode = d.ToolMode
+	} else {
+		c.ToolMode = NormalizeToolMode(c.ToolMode)
+	}
+	if c.OutpostIdleTTL <= 0 {
+		c.OutpostIdleTTL = d.OutpostIdleTTL
+	}
+	if c.OutpostMaxSessions <= 0 {
+		c.OutpostMaxSessions = d.OutpostMaxSessions
+	}
 	if len(c.ModelAliases) > 0 {
 		c.SetModelAliases(c.ModelAliases)
 	}
@@ -532,6 +604,12 @@ func (c *Config) Validate() error {
 	if c.Usage.MaxAttempts < 1 || c.Usage.MaxAttempts > 5 {
 		return fmt.Errorf("usage.max_attempts must be between 1 and 5")
 	}
+	if c.OutpostIdleTTL < Duration(time.Minute) || c.OutpostIdleTTL > Duration(30*time.Minute) {
+		return fmt.Errorf("outpost_idle_ttl must be between 1m and 30m")
+	}
+	if c.OutpostMaxSessions < 1 || c.OutpostMaxSessions > 128 {
+		return fmt.Errorf("outpost_max_sessions must be between 1 and 128")
+	}
 	switch strings.ToLower(c.OAuth.Provider) {
 	case "social", "enterprise", "gateway", "social_gateway":
 	default:
@@ -546,6 +624,9 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := ValidateWorkMode(c.WorkMode); err != nil {
+		return err
+	}
+	if err := ValidateToolMode(c.ToolMode); err != nil {
 		return err
 	}
 	return nil

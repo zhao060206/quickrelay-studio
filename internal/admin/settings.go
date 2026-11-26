@@ -30,10 +30,13 @@ type settings struct {
 	Locale           string          `json:"locale"`
 	ThinkingEffort   string          `json:"thinking_effort"`
 	ChatAgentID      string          `json:"chat_agent_id"`
-	KeepSessions     bool            `json:"keep_sessions"`
-	SessionReuse     bool            `json:"session_reuse"`
-	SessionTTL       config.Duration `json:"session_ttl"`
-	OAuth            config.OAuth      `json:"oauth"`
+	KeepSessions       bool              `json:"keep_sessions"`
+	SessionReuse       bool              `json:"session_reuse"`
+	SessionTTL         config.Duration   `json:"session_ttl"`
+	ToolMode           string            `json:"tool_mode"`
+	OutpostIdleTTL     config.Duration   `json:"outpost_idle_ttl"`
+	OutpostMaxSessions int               `json:"outpost_max_sessions"`
+	OAuth              config.OAuth      `json:"oauth"`
 	WebUI            config.WebUI      `json:"webui"`
 	Usage            config.Usage      `json:"usage"`
 	WorkMode         string            `json:"work_mode"`
@@ -42,13 +45,23 @@ type settings struct {
 }
 
 func settingsFromConfig(cfg config.Config) settings {
+	idleTTL := cfg.OutpostIdleTTL
+	if idleTTL <= 0 {
+		idleTTL = config.Duration(10 * time.Minute)
+	}
+	maxSess := cfg.OutpostMaxSessions
+	if maxSess <= 0 {
+		maxSess = 16
+	}
 	return settings{
 		Addr: cfg.Addr, Database: cfg.Database, Models: cfg.Models, DefaultModel: cfg.DefaultModel,
 		RequestTimeout: cfg.RequestTimeout, MaxThinkingTimeout: cfg.MaxThinkingTimeout, RefreshBefore: cfg.RefreshBefore, MaxAttempts: cfg.MaxAttempts,
 		AppVersion: cfg.AppVersion, Surface: cfg.Surface, OutpostID: cfg.OutpostID,
 		WorkingSessionID: cfg.WorkingSessionID, Timezone: cfg.Timezone, Locale: cfg.Locale,
 		ThinkingEffort: cfg.ThinkingEffort, ChatAgentID: cfg.ChatAgentID, KeepSessions: cfg.KeepSessions,
-		SessionReuse: cfg.SessionReuse, SessionTTL: cfg.SessionTTL, OAuth: cfg.OAuth, WebUI: cfg.WebUI, Usage: cfg.Usage,
+		SessionReuse: cfg.SessionReuse, SessionTTL: cfg.SessionTTL,
+		ToolMode: config.NormalizeToolMode(cfg.ToolMode), OutpostIdleTTL: idleTTL, OutpostMaxSessions: maxSess,
+		OAuth: cfg.OAuth, WebUI: cfg.WebUI, Usage: cfg.Usage,
 		WorkMode: config.NormalizeWorkMode(cfg.WorkMode), Guardrails: cfg.Guardrails, Updater: cfg.Updater,
 	}
 }
@@ -60,6 +73,14 @@ func (value settings) config(keys []string, path string) config.Config {
 		if value.RequestTimeout > maxThink {
 			maxThink = value.RequestTimeout
 		}
+	}
+	idleTTL := value.OutpostIdleTTL
+	if idleTTL <= 0 {
+		idleTTL = config.Duration(10 * time.Minute)
+	}
+	maxSess := value.OutpostMaxSessions
+	if maxSess <= 0 {
+		maxSess = 16
 	}
 	updaterCfg := value.Updater
 	if strings.TrimSpace(updaterCfg.Repo) == "" {
@@ -92,7 +113,9 @@ func (value settings) config(keys []string, path string) config.Config {
 		AppVersion: value.AppVersion, Surface: value.Surface, OutpostID: value.OutpostID,
 		WorkingSessionID: value.WorkingSessionID, Timezone: value.Timezone, Locale: value.Locale,
 		ThinkingEffort: value.ThinkingEffort, ChatAgentID: value.ChatAgentID, KeepSessions: value.KeepSessions,
-		SessionReuse: value.SessionReuse, SessionTTL: value.SessionTTL, OAuth: value.OAuth, WebUI: value.WebUI, Usage: value.Usage,
+		SessionReuse: value.SessionReuse, SessionTTL: value.SessionTTL,
+		ToolMode: config.NormalizeToolMode(value.ToolMode), OutpostIdleTTL: idleTTL, OutpostMaxSessions: maxSess,
+		OAuth: value.OAuth, WebUI: value.WebUI, Usage: value.Usage,
 		WorkMode: config.NormalizeWorkMode(value.WorkMode), Guardrails: guardrailsCfg, Updater: updaterCfg, Path: path,
 	}
 }
@@ -150,6 +173,15 @@ func (value settings) validate() error {
 	}
 	if err := config.ValidateWorkMode(value.WorkMode); err != nil {
 		return err
+	}
+	if err := config.ValidateToolMode(value.ToolMode); err != nil {
+		return err
+	}
+	if value.OutpostIdleTTL != 0 && (value.OutpostIdleTTL < config.Duration(time.Minute) || value.OutpostIdleTTL > config.Duration(30*time.Minute)) {
+		return fmt.Errorf("outpost_idle_ttl must be between 1m and 30m")
+	}
+	if value.OutpostMaxSessions != 0 && (value.OutpostMaxSessions < 1 || value.OutpostMaxSessions > 128) {
+		return fmt.Errorf("outpost_max_sessions must be between 1 and 128")
 	}
 	return nil
 }
@@ -225,9 +257,45 @@ func (s *Server) handleConfigSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cfg.SetWorkMode(candidate.WorkMode)
+	s.cfg.SetToolMode(candidate.ToolMode)
 	s.saved = candidate
 	s.restartNeeded = true
 	s.writeSettingsLocked(w)
+}
+
+// handleToolModeSet 热切换工具执行模式并立即持久化到 config.json，无需重启网关。
+func (s *Server) handleToolModeSet(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		ToolMode string `json:"tool_mode"`
+	}
+	if !decodeJSON(w, r, &input, 16<<10) {
+		return
+	}
+	if err := config.ValidateToolMode(input.ToolMode); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_tool_mode", err.Error())
+		return
+	}
+	mode := config.NormalizeToolMode(input.ToolMode)
+
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	candidate := s.saved
+	candidate.Path = s.cfg.Path
+	candidate.SetModelAliases(s.saved.GetModelAliases())
+	candidate.ToolMode = mode
+	if strings.TrimSpace(candidate.Path) != "" {
+		if err := candidate.Save(); err != nil {
+			writeError(w, http.StatusInternalServerError, "config_save_failed", "Could not persist tool_mode to config.json")
+			return
+		}
+	}
+	s.cfg.SetToolMode(mode)
+	s.saved = candidate
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tool_mode":           mode,
+		"applied_immediately": true,
+	})
 }
 
 // handleWorkModeSet 热切换工作场景模式并立即持久化到 config.json，无需重启网关。

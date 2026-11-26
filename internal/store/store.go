@@ -187,10 +187,13 @@ CREATE TABLE IF NOT EXISTS conversations (
 	thread_id TEXT NOT NULL,
 	account_id INTEGER NOT NULL DEFAULT 0,
 	base_hash TEXT NOT NULL DEFAULT '',
+	chat_agent_id TEXT NOT NULL DEFAULT '',
+	chat_agent_bound INTEGER NOT NULL DEFAULT 0,
 	message_hashes TEXT NOT NULL DEFAULT '[]',
 	last_used INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_conversations_last_used ON conversations(last_used);
+CREATE INDEX IF NOT EXISTS idx_conversations_thread_id ON conversations(thread_id);
 CREATE TABLE IF NOT EXISTS request_logs (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	request_id TEXT NOT NULL,
@@ -238,20 +241,27 @@ func (s *Store) ensureConversationColumns() error {
 		return err
 	}
 	hasLastAssistantHash := false
+	hasChatAgentID := false
+	hasChatAgentBound := false
 	for rows.Next() {
 		var (
-			cid        int
-			name, typ  string
-			notnull    int
-			dflt       sql.NullString
-			pk         int
+			cid       int
+			name, typ string
+			notnull   int
+			dflt      sql.NullString
+			pk        int
 		)
 		if scanErr := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); scanErr != nil {
 			rows.Close()
 			return scanErr
 		}
-		if strings.EqualFold(strings.TrimSpace(name), "last_assistant_hash") {
+		switch strings.ToLower(strings.TrimSpace(name)) {
+		case "last_assistant_hash":
 			hasLastAssistantHash = true
+		case "chat_agent_id":
+			hasChatAgentID = true
+		case "chat_agent_bound":
+			hasChatAgentBound = true
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -261,6 +271,16 @@ func (s *Store) ensureConversationColumns() error {
 	rows.Close()
 	if !hasLastAssistantHash {
 		if _, err := s.db.Exec(`ALTER TABLE conversations ADD COLUMN last_assistant_hash TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if !hasChatAgentID {
+		if _, err := s.db.Exec(`ALTER TABLE conversations ADD COLUMN chat_agent_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if !hasChatAgentBound {
+		if _, err := s.db.Exec(`ALTER TABLE conversations ADD COLUMN chat_agent_bound INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return err
 		}
 	}

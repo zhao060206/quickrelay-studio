@@ -1102,23 +1102,42 @@ func planFullTranscriptAttachments(ctx context.Context, msgs []Message, currentT
 	return plan, nil
 }
 
+// formattedPrompt 保存单轮对话的完整格式化文本，以及严格按消息边界拆分的先前历史与当前轮输入。
+type formattedPrompt struct {
+	Full          string
+	History       string
+	Current       string
+	CurrentIsTool bool
+}
+
 // formatPromptWithImages 在格式化提示词的同时解码并去重所有可上传的图片及文档附件。
 // 当消息跨越多轮历史且需要全量重放时，优先严格校验当前轮全部附件，并将剩余配额按从近到远分配给历史附件，
 // 超额的更早历史附件以诚实省略标记渲染，绝不虚标为已附上。
 func formatPromptWithImages(ctx context.Context, msgs []Message) (string, []ImageAttachment, error) {
-	collector := newImageCollector()
-	if currentTurnStart := findCurrentTurnStart(msgs); currentTurnStart > 0 {
-		plan, err := planFullTranscriptAttachments(ctx, msgs, currentTurnStart)
-		if err != nil {
-			return "", nil, err
-		}
-		collector.plan = plan
-	}
-	prompt, err := formatPromptCore(ctx, msgs, msgs, collector, false, false)
+	fp, imgs, err := formatPromptSplitWithImages(ctx, msgs)
 	if err != nil {
 		return "", nil, err
 	}
-	return prompt, collector.images(), nil
+	return fp.Full, imgs, nil
+}
+
+// formatPromptSplitWithImages 在完成图片/文档附件规划的同时，按消息数组下标精确拆分先前历史与当前轮，
+// 确保相同文本同时出现在历史、代码和提问中时也绝不误切。
+func formatPromptSplitWithImages(ctx context.Context, msgs []Message) (formattedPrompt, []ImageAttachment, error) {
+	collector := newImageCollector()
+	currentTurnStart := findCurrentTurnStart(msgs)
+	if currentTurnStart > 0 {
+		plan, err := planFullTranscriptAttachments(ctx, msgs, currentTurnStart)
+		if err != nil {
+			return formattedPrompt{}, nil, err
+		}
+		collector.plan = plan
+	}
+	fp, err := formatPromptCoreSplit(ctx, msgs, msgs, collector, currentTurnStart, false, false)
+	if err != nil {
+		return formattedPrompt{}, nil, err
+	}
+	return fp, collector.images(), nil
 }
 
 // formatResumeDeltaWithImages 专用于同一 thread_id 续聊的增量切片格式化：
@@ -1126,12 +1145,37 @@ func formatPromptWithImages(ctx context.Context, msgs []Message) (string, []Imag
 // 则跳过该重复 assistant 正文与万字工具 JSON，并在 tool result 上附带精简目标摘要（file_path/command 等），
 // 消除每轮无意义双倍回传导致的附件上传耗时与 KV Cache 写入膨胀。
 func formatResumeDeltaWithImages(ctx context.Context, allMsgs []Message, delta []Message) (string, []ImageAttachment, error) {
-	collector := newImageCollector()
-	prompt, err := formatPromptCore(ctx, allMsgs, delta, collector, true, true)
+	fp, imgs, err := formatResumeDeltaSplitWithImages(ctx, allMsgs, delta)
 	if err != nil {
 		return "", nil, err
 	}
-	return prompt, collector.images(), nil
+	return fp.Full, imgs, nil
+}
+
+// formatResumeDeltaSplitWithImages 在续聊增量场景下提取并按消息边界拆分（当跳过前导 assistant 后仍存在更早轮次时才拆分）。
+func formatResumeDeltaSplitWithImages(ctx context.Context, allMsgs []Message, delta []Message) (formattedPrompt, []ImageAttachment, error) {
+	collector := newImageCollector()
+	firstNonSys := -1
+	for i, m := range delta {
+		role := strings.ToLower(strings.TrimSpace(m.Role))
+		if role == "system" || role == "developer" {
+			continue
+		}
+		firstNonSys = i
+		break
+	}
+	splitIdx := 0
+	if curStart := findCurrentTurnStart(delta); curStart > 0 {
+		// 仅当最后一条 assistant 并非首条即将被跳过的前导 assistant 时，增量里才真正包含更早历史。
+		if firstNonSys >= 0 && curStart-1 > firstNonSys {
+			splitIdx = curStart
+		}
+	}
+	fp, err := formatPromptCoreSplit(ctx, allMsgs, delta, collector, splitIdx, true, true)
+	if err != nil {
+		return formattedPrompt{}, nil, err
+	}
+	return fp, collector.images(), nil
 }
 
 var toolTargetKeys = []string{"file_path", "path", "target_file", "filename", "command", "cmd", "pattern", "query", "url", "uri", "dir", "directory"}
@@ -1174,8 +1218,16 @@ func compactToolCallTarget(args string) string {
 // prompts pass through unchanged. Tool calls and tool results are rendered
 // explicitly so the upstream agent can follow a client-side tool loop.
 func formatPromptCore(ctx context.Context, allMsgs []Message, msgs []Message, collector *imageCollector, skipLeadingAssistant bool, includeToolTarget bool) (string, error) {
+	fp, err := formatPromptCoreSplit(ctx, allMsgs, msgs, collector, 0, skipLeadingAssistant, includeToolTarget)
+	if err != nil {
+		return "", err
+	}
+	return fp.Full, nil
+}
+
+func formatPromptCoreSplit(ctx context.Context, allMsgs []Message, msgs []Message, collector *imageCollector, splitIdx int, skipLeadingAssistant bool, includeToolTarget bool) (formattedPrompt, error) {
 	if len(msgs) == 0 {
-		return "", fmt.Errorf("messages must not be empty")
+		return formattedPrompt{}, fmt.Errorf("messages must not be empty")
 	}
 
 	refMsgs := allMsgs
@@ -1228,7 +1280,28 @@ func formatPromptCore(ctx context.Context, allMsgs []Message, msgs []Message, co
 	singleUser := false
 	singleUserText := ""
 	nonSystemCount := 0
+	allTools := true
+
+	curSingleUser := false
+	curSingleUserText := ""
+	curNonSystemCount := 0
+	curAllTools := true
+
 	blocks := make([]string, 0, len(msgs))
+	var historyBlocks []string
+	var currentBlocks []string
+
+	appendSegment := func(isCurrent bool, seg string) {
+		blocks = append(blocks, seg)
+		if splitIdx > 0 {
+			if isCurrent {
+				currentBlocks = append(currentBlocks, seg)
+			} else {
+				historyBlocks = append(historyBlocks, seg)
+			}
+		}
+	}
+
 	for i, m := range msgs {
 		role := strings.ToLower(strings.TrimSpace(m.Role))
 		if role == "" {
@@ -1240,23 +1313,42 @@ func formatPromptCore(ctx context.Context, allMsgs []Message, msgs []Message, co
 		if i == skipAssistantIdx {
 			continue
 		}
+		isCurrent := splitIdx <= 0 || i >= splitIdx
+
 		nonSystemCount++
+		if role != "tool" && role != "function" {
+			allTools = false
+		}
+		if isCurrent {
+			curNonSystemCount++
+			if role != "tool" && role != "function" {
+				curAllTools = false
+			}
+		}
+
 		content, cErr := contentTextWithCollectorAt(ctx, m.Content, collector, i)
 		if cErr != nil {
-			return "", cErr
+			return formattedPrompt{}, cErr
 		}
 		if role == "user" {
 			singleUser = true
 			singleUserText = content
+			if isCurrent {
+				curSingleUser = true
+				curSingleUserText = content
+			}
 		} else {
 			singleUser = false
+			if isCurrent {
+				curSingleUser = false
+			}
 		}
 		hasContent := strings.TrimSpace(content) != ""
 
 		switch role {
 		case "assistant":
 			if hasContent {
-				blocks = append(blocks, "Assistant: "+content)
+				appendSegment(isCurrent, "Assistant: "+content)
 			}
 			for _, tc := range m.ToolCalls {
 				id := strings.TrimSpace(tc.ID)
@@ -1271,7 +1363,7 @@ func formatPromptCore(ctx context.Context, allMsgs []Message, msgs []Message, co
 				if args == "" {
 					args = "{}"
 				}
-				blocks = append(blocks, fmt.Sprintf("Assistant tool call (id=%s, name=%s): %s", id, name, args))
+				appendSegment(isCurrent, fmt.Sprintf("Assistant tool call (id=%s, name=%s): %s", id, name, args))
 			}
 			if m.FunctionCall != nil {
 				name := strings.TrimSpace(m.FunctionCall.Name)
@@ -1282,7 +1374,7 @@ func formatPromptCore(ctx context.Context, allMsgs []Message, msgs []Message, co
 				if args == "" {
 					args = "{}"
 				}
-				blocks = append(blocks, fmt.Sprintf("Assistant function call (name=%s): %s", name, args))
+				appendSegment(isCurrent, fmt.Sprintf("Assistant function call (name=%s): %s", name, args))
 			}
 			if !hasContent && len(m.ToolCalls) == 0 && m.FunctionCall == nil {
 				continue
@@ -1312,7 +1404,7 @@ func formatPromptCore(ctx context.Context, allMsgs []Message, msgs []Message, co
 			if !hasContent {
 				content = "(empty)"
 			}
-			blocks = append(blocks, label+": "+content)
+			appendSegment(isCurrent, label+": "+content)
 		case "function":
 			label := "Function result"
 			if name := strings.TrimSpace(m.Name); name != "" {
@@ -1321,28 +1413,51 @@ func formatPromptCore(ctx context.Context, allMsgs []Message, msgs []Message, co
 			if !hasContent {
 				content = "(empty)"
 			}
-			blocks = append(blocks, label+": "+content)
+			appendSegment(isCurrent, label+": "+content)
 		case "user":
 			if hasContent {
-				blocks = append(blocks, "User: "+content)
+				appendSegment(isCurrent, "User: "+content)
 			}
 		default:
 			if hasContent {
-				blocks = append(blocks, roleLabel(role)+": "+content)
+				appendSegment(isCurrent, roleLabel(role)+": "+content)
 			}
 		}
 	}
 
 	if len(blocks) == 0 {
-		return "", fmt.Errorf("messages contain no text or tool calls")
+		return formattedPrompt{}, fmt.Errorf("messages contain no text or tool calls")
 	}
+	fullText := ""
 	if nonSystemCount == 1 && singleUser {
 		if strings.TrimSpace(singleUserText) == "" {
-			return "", fmt.Errorf("user message contains no text")
+			return formattedPrompt{}, fmt.Errorf("user message contains no text")
 		}
-		return singleUserText, nil
+		fullText = singleUserText
+	} else {
+		fullText = strings.Join(blocks, "\n\n")
 	}
-	return strings.Join(blocks, "\n\n"), nil
+
+	if splitIdx > 0 && len(historyBlocks) > 0 && len(currentBlocks) > 0 {
+		curText := ""
+		if curNonSystemCount == 1 && curSingleUser {
+			curText = curSingleUserText
+		} else {
+			curText = strings.Join(currentBlocks, "\n\n")
+		}
+		return formattedPrompt{
+			Full:          fullText,
+			History:       strings.Join(historyBlocks, "\n\n"),
+			Current:       curText,
+			CurrentIsTool: curAllTools && curNonSystemCount > 0,
+		}, nil
+	}
+
+	return formattedPrompt{
+		Full:          fullText,
+		Current:       fullText,
+		CurrentIsTool: allTools && nonSystemCount > 0,
+	}, nil
 }
 
 var (
