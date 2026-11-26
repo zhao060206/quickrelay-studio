@@ -186,6 +186,9 @@ tbody tr:last-child td { border-bottom: none; }
 .flow-footer { display: flex; justify-content: space-between; gap: 10px; margin-top: 22px; padding-top: 15px; border-top: 1px solid var(--border); }
 .stack { display: grid; gap: 20px; }
 .code-input { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12px; tab-size: 2; }
+.drop-zone { display: grid; gap: 6px; padding: 20px 16px; margin-bottom: 16px; border: 1.5px dashed var(--border); border-radius: 10px; background: var(--panel-alt); text-align: center; cursor: pointer; transition: border-color .15s ease, background-color .15s ease; }
+.drop-zone:hover, .drop-zone.dragover { border-color: var(--primary); background: var(--panel); }
+#import-accounts-panel .notice { margin-top: 15px; font-size: 12px; }
 #config-form .notice { margin-bottom: 18px; font-size: 12px; }
 #config-form .panel > .muted { margin-bottom: 18px; font-size: 12px; }
 .checkbox-label { display: flex; align-items: flex-start; gap: 10px; margin: 15px 0 0; font-size: 12px; font-weight: 400; cursor: pointer; }

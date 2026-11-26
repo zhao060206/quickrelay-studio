@@ -23,6 +23,118 @@ import (
 	"quickrelay-studio/internal/store"
 )
 
+func TestStreamRemoteToolCorrectionAfterKeepalive(t *testing.T) {
+	prevInterval, prevPrestart := sseKeepaliveInterval, maxThinkingPrestart
+	sseKeepaliveInterval, maxThinkingPrestart = 12*time.Millisecond, 24*time.Millisecond
+	t.Cleanup(func() {
+		sseKeepaliveInterval, maxThinkingPrestart = prevInterval, prevPrestart
+	})
+
+	for _, protocol := range []struct {
+		path      string
+		keepalive string
+		start     string
+		end       string
+	}{
+		{"/v1/messages", "event: ping", "event: message_start", "event: message_stop"},
+		{"/v1/chat/completions", ": keepalive", `"delta":{"role":"assistant"}`, "data: [DONE]"},
+	} {
+		t.Run(protocol.path, func(t *testing.T) {
+			var attempts atomic.Int32
+			var correctionPrompt atomic.Bool
+			sendBlockedTool := make(chan struct{})
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(sendBlockedTool) }) }
+			upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := upgrader.Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				writeEvent := func(eventType string, payload map[string]any) {
+					_ = conn.WriteMessage(websocket.BinaryMessage, encodeMockAIDPServerEvent(map[string]any{"type": eventType, "payload": payload}))
+				}
+				for {
+					_, raw, err := conn.ReadMessage()
+					if err != nil {
+						return
+					}
+					messageType, payload, ok := decodeClientFrame(raw)
+					if !ok || messageType != "user_message" {
+						continue
+					}
+					if attempts.Add(1) == 1 {
+						writeEvent("thinking_delta", map[string]any{"delta": "discarded first attempt"})
+						<-sendBlockedTool
+						writeEvent("tool_start", map[string]any{"tool_id": "remote-py", "tool_name": "run_python", "arguments": map[string]any{"code": "print(1)"}})
+						continue
+					}
+					prompt, _ := payload["text"].(string)
+					correctionPrompt.Store(strings.Contains(prompt, "IMPORTANT CORRECTION") && strings.Contains(prompt, "run_python"))
+					writeEvent("thinking_delta", map[string]any{"delta": "corrected attempt"})
+					writeEvent("text_delta", map[string]any{"delta": `<client_tool_call>{"name":"Bash","arguments":{"command":"python --version"}}</client_tool_call>`})
+					writeEvent("message_complete", map[string]any{"continuation_expected": false})
+					writeEvent("turn_completed", map[string]any{})
+				}
+			}))
+			defer upstream.Close()
+			defer release()
+			proxy, client := setupMockProxyHTTPServer(t, upstream)
+			body := map[string]any{
+				"model":    "smart",
+				"stream":   true,
+				"messages": []map[string]any{{"role": "user", "content": "Check the local Python version"}},
+			}
+			schema := map[string]any{"type": "object"}
+			if protocol.path == "/v1/messages" {
+				body["max_tokens"] = 512
+				body["output_config"] = map[string]any{"effort": "max"}
+				body["tools"] = []map[string]any{{"name": "Bash", "input_schema": schema}}
+			} else {
+				body["reasoning_effort"] = "xhigh"
+				body["tools"] = []map[string]any{{"type": "function", "function": map[string]any{"name": "Bash", "parameters": schema}}}
+			}
+			encoded, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response, err := client.Post(proxy.URL+protocol.path, "application/json", bytes.NewReader(encoded))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("expected SSE response, got HTTP %d", response.StatusCode)
+			}
+			var stream strings.Builder
+			var sawKeepalive bool
+			scanner := bufio.NewScanner(response.Body)
+			for scanner.Scan() {
+				line := scanner.Text()
+				stream.WriteString(line + "\n")
+				if line == protocol.keepalive {
+					sawKeepalive = true
+					release()
+				}
+			}
+			if err := scanner.Err(); err != nil {
+				t.Fatal(err)
+			}
+			output := stream.String()
+			if !sawKeepalive || attempts.Load() != 2 || !correctionPrompt.Load() {
+				t.Fatalf("expected one correction after a keepalive, attempts=%d:\n%s", attempts.Load(), output)
+			}
+			if strings.Count(output, protocol.start) != 1 || !strings.Contains(output, protocol.end) || !strings.Contains(output, `"name":"Bash"`) || !strings.Contains(output, "corrected attempt") {
+				t.Fatalf("expected a single, completed SSE message with the corrected output:\n%s", output)
+			}
+			if strings.Contains(output, "discarded first attempt") || strings.Contains(output, "remote cloud sandbox tool blocked") {
+				t.Fatalf("rejected attempt leaked into the stream:\n%s", output)
+			}
+		})
+	}
+}
+
 // TestToolDefinitionsCompaction_PreservesSchemaAndSavesSpace 验证大工具表自动触发无损语义瘦身，
 // 在大幅压缩体积的同时保留全部工具名、参数键、enum 与 required 约束，并保证小工具表与原始请求不被篡改。
 func TestToolDefinitionsCompaction_PreservesSchemaAndSavesSpace(t *testing.T) {

@@ -243,7 +243,18 @@ const translations = {
   creditsNotReported: ["Credits not reported", "未上报积分"],
   creditsCoverage: ["Reported for {reported} / {calls} calls", "{reported} / {calls} 次调用上报"],
   partialCredits: ["Partial credit coverage", "积分覆盖不完整"],
-  creditAmount: ["{amount} {unit}", "{amount} {unit}"]
+  creditAmount: ["{amount} {unit}", "{amount} {unit}"],
+  importAccounts: ["Import accounts from JSON", "通过 JSON 批量导入账号"],
+  importAccountsHint: ["Drop one or more .json files or paste account JSON below. Supports single objects, arrays, and {accounts:[...]} wrappers.", "拖拽一个或多个 .json 文件到下方自动上传，或直接粘贴 JSON（支持单账号对象、数组及 {accounts:[...]} 包装格式）。"],
+  dropJsonTitle: ["Drop .json files here to upload automatically", "将 .json 文件拖到此处，松手后自动上传"],
+  dropJsonSub: ["Click to choose one or more .json files (snake_case & camelCase fields supported)", "或点击选择单个/多个 .json 文件（兼容下划线与驼峰字段）"],
+  importJsonLabel: ["Account JSON", "账号 JSON 内容"],
+  importAutoRefresh: ["Refresh tokens automatically after import", "导入后自动刷新 Token"],
+  clear: ["Clear", "清空"],
+  importNow: ["Import JSON", "立即导入"],
+  importInvalidJson: ["Invalid JSON content or file.", "JSON 格式无效或文件内容无法解析。"],
+  importEmpty: ["No account entries found in the JSON payload.", "JSON 中未找到任何账号条目。"],
+  importDone: ["Import complete: {total} total · {imported} added · {updated} updated · {failed} failed.", "导入完成：共 {total} 个 · 新增 {imported} · 更新 {updated} · 失败 {failed}。"]
 };
 const apiErrorTranslations = {
   invalid_credentials: "invalidCredentials",
@@ -260,7 +271,8 @@ const apiErrorTranslations = {
   usage_unavailable: "usageUnavailable",
   usage_unauthorized: "usageUnauthorized",
   usage_failed: "usageFailed",
-  usage_busy: "usageBusy"
+  usage_busy: "usageBusy",
+  invalid_import: "importEmpty"
 };
 let language = readPreference("language") === "zh-CN" ? "zh-CN" : "en";
 const translationParameters = new WeakMap();
@@ -418,6 +430,11 @@ function clearSession() {
   elements["config-json"].value = "";
   elements["replacement-api-keys"].value = "";
   elements["clear-api-keys"].checked = false;
+  if (elements["import-json-input"]) elements["import-json-input"].value = "";
+  if (elements["import-result"]) {
+    elements["import-result"].hidden = true;
+    setRawText(elements["import-result"], "");
+  }
   elements["replacement-api-keys"].disabled = false;
   elements["oauth-callback"].value = "";
   elements["oauth-region"].value = "";
@@ -1146,6 +1163,145 @@ elements["clear-playground"].addEventListener("click", () => {
   setRawText(elements["playground-output"], "");
   if (!state.playgroundController) setTranslation(elements["playground-state"], "noRequest");
 });
+
+function unwrapImportEntries(parsed) {
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && typeof parsed === "object") {
+    for (const key of ["accounts", "items", "data"]) {
+      if (Array.isArray(parsed[key])) return parsed[key];
+    }
+    return [parsed];
+  }
+  throw localizedError("importInvalidJson");
+}
+
+function showImportResult(data) {
+  const el = elements["import-result"];
+  if (!el) return;
+  if (!data) {
+    el.hidden = true;
+    setRawText(el, "");
+    return;
+  }
+  const summary = translate("importDone", {
+    total: Number(data.total || 0),
+    imported: Number(data.imported || 0),
+    updated: Number(data.updated || 0),
+    failed: Number(data.failed || 0)
+  });
+  const errors = (data.results || []).filter(item => item.status === "failed" || item.refresh_error).map(item => `${item.email || `#${Number(item.index || 0) + 1}`}: ${item.error || item.refresh_error}`);
+  setRawText(el, errors.length ? `${summary} (${errors.join("; ")})` : summary);
+  el.className = `notice${Number(data.failed || 0) > 0 && Number(data.imported || 0) + Number(data.updated || 0) === 0 ? " error" : Number(data.failed || 0) > 0 ? " warning" : " success"}`;
+  el.hidden = false;
+}
+
+async function uploadImportPayload(payload) {
+  const generation = state.generation;
+  const btn = elements["import-json-submit"];
+  if (btn) btn.disabled = true;
+  try {
+    const data = await requestJSON("/api/accounts/import", { method: "POST", body: payload });
+    if (!state.authenticated || generation !== state.generation) return;
+    showImportResult(data);
+    await Promise.all([loadAccounts(), loadStatus()]);
+    if (state.authenticated && generation === state.generation) {
+      showMessage("importDone", Number(data.failed || 0) > 0 ? "warning" : "success", {
+        total: Number(data.total || 0),
+        imported: Number(data.imported || 0),
+        updated: Number(data.updated || 0),
+        failed: Number(data.failed || 0)
+      });
+    }
+  } catch (error) {
+    if (state.authenticated && generation === state.generation) reportError(error);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function importJsonFiles(fileList) {
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+  const merged = [];
+  let autoRefresh = Boolean(elements["import-auto-refresh"]?.checked);
+  try {
+    for (const file of files) {
+      const parsed = JSON.parse(await file.text());
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && (parsed.auto_refresh || parsed.autoRefresh)) {
+        autoRefresh = true;
+      }
+      merged.push(...unwrapImportEntries(parsed));
+    }
+    if (!merged.length) {
+      showMessage("importEmpty", "error");
+      return;
+    }
+    const payload = { accounts: merged, auto_refresh: autoRefresh };
+    elements["import-json-input"].value = JSON.stringify(merged.length === 1 ? merged[0] : payload, null, 2);
+    await uploadImportPayload(payload);
+  } catch {
+    showMessage("importInvalidJson", "error");
+  }
+}
+
+if (elements["import-drop-zone"] && elements["import-file-input"]) {
+  window.addEventListener("dragover", event => event.preventDefault());
+  window.addEventListener("drop", event => event.preventDefault());
+  const zone = elements["import-drop-zone"];
+  const fileInput = elements["import-file-input"];
+  zone.addEventListener("click", () => {
+    fileInput.value = "";
+    fileInput.click();
+  });
+  fileInput.addEventListener("change", () => {
+    if (fileInput.files?.length) importJsonFiles(fileInput.files);
+  });
+  zone.addEventListener("dragenter", event => {
+    event.preventDefault();
+    event.stopPropagation();
+    zone.classList.add("dragover");
+  });
+  zone.addEventListener("dragover", event => {
+    event.preventDefault();
+    event.stopPropagation();
+    zone.classList.add("dragover");
+  });
+  zone.addEventListener("dragleave", event => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!zone.contains(event.relatedTarget)) zone.classList.remove("dragover");
+  });
+  zone.addEventListener("drop", event => {
+    event.preventDefault();
+    event.stopPropagation();
+    zone.classList.remove("dragover");
+    if (event.dataTransfer?.files?.length) importJsonFiles(event.dataTransfer.files);
+  });
+  elements["import-json-clear"]?.addEventListener("click", () => {
+    elements["import-json-input"].value = "";
+    fileInput.value = "";
+    showImportResult(null);
+  });
+  elements["import-json-submit"]?.addEventListener("click", async () => {
+    const raw = elements["import-json-input"].value.trim();
+    if (!raw) {
+      showMessage("importEmpty", "error");
+      return;
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      const entries = unwrapImportEntries(parsed);
+      if (!entries.length) {
+        showMessage("importEmpty", "error");
+        return;
+      }
+      const autoRefresh = Boolean(elements["import-auto-refresh"]?.checked) || Boolean(parsed && typeof parsed === "object" && !Array.isArray(parsed) && (parsed.auto_refresh || parsed.autoRefresh));
+      await uploadImportPayload({ accounts: entries, auto_refresh: autoRefresh });
+    } catch {
+      showMessage("importInvalidJson", "error");
+    }
+  });
+}
 
 const savedTheme = readPreference("theme");
 setTheme(savedTheme === "dark" || (savedTheme !== "light" && Boolean(initialDark)));

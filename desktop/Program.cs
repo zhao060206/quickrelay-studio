@@ -825,7 +825,7 @@ namespace QuickRelayStudioDesktop
 
         private void InitializeFormWindow()
         {
-            this.Text = "QuickRelay Studio 2.4.8";
+            this.Text = "QuickRelay Studio 2.4.9";
             this.AutoScaleMode = AutoScaleMode.None;
             this.WindowState = FormWindowState.Normal;
             this.StartPosition = FormStartPosition.CenterScreen;
@@ -1161,6 +1161,10 @@ namespace QuickRelayStudioDesktop
             if (!IsInternalNavigationUri(e.Uri))
             {
                 e.Cancel = true;
+                if (!string.IsNullOrEmpty(e.Uri) && e.Uri.StartsWith("file://", StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
                 OpenInDefaultBrowser(e.Uri);
             }
         }
@@ -1314,6 +1318,10 @@ namespace QuickRelayStudioDesktop
 
                 case "deleteAccount":
                     await DeleteAccountAndPushAsync(GetDictLong(msg, "id"));
+                    break;
+
+                case "importAccountsJson":
+                    await HandleImportAccountsJsonAsync(reqId, GetDictString(msg, "payloadJson"));
                     break;
 
                 case "getAnalytics":
@@ -2796,6 +2804,21 @@ namespace QuickRelayStudioDesktop
             catch (Exception ex)
             {
                 PushToastToWeb("error", "删除失败: " + ex.Message);
+            }
+        }
+
+        private async Task HandleImportAccountsJsonAsync(string reqId, string payloadJson)
+        {
+            try
+            {
+                string body = string.IsNullOrWhiteSpace(payloadJson) ? "{}" : payloadJson;
+                string raw = await _apiClient.PostRawJsonAsync("/api/accounts/import", body);
+                await RefreshAccountsAndPushAsync();
+                SendApiResponse(reqId, true, raw, string.Empty);
+            }
+            catch (Exception ex)
+            {
+                SendApiResponse(reqId, false, "null", ex.Message);
             }
         }
 

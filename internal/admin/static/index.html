@@ -129,6 +129,22 @@
                 <div class="flow-footer"><button id="check-login" class="button subtle" type="button" data-i18n="updateSignIn">Update sign-in status</button><button id="cancel-login" class="button danger subtle" type="button" data-i18n="cancelSignIn">Cancel this sign-in</button></div>
               </div>
             </article>
+            <article class="panel" id="import-accounts-panel">
+              <div class="panel-heading"><div><h3 data-i18n="importAccounts">Import accounts from JSON</h3><p class="muted" data-i18n="importAccountsHint">Drop one or more .json files or paste account JSON below. Supports single objects, arrays, and {accounts:[...]} wrappers.</p></div></div>
+              <input id="import-file-input" type="file" accept=".json,application/json" multiple hidden>
+              <div id="import-drop-zone" class="drop-zone" tabindex="0">
+                <strong data-i18n="dropJsonTitle">Drop .json files here to upload automatically</strong>
+                <span class="muted" data-i18n="dropJsonSub">Click to choose one or more .json files (snake_case &amp; camelCase fields supported)</span>
+              </div>
+              <label for="import-json-input" data-i18n="importJsonLabel">Account JSON</label>
+              <textarea id="import-json-input" class="code-input" rows="5" autocomplete="off" spellcheck="false"></textarea>
+              <label class="checkbox-label" for="import-auto-refresh"><input id="import-auto-refresh" type="checkbox"><span data-i18n="importAutoRefresh">Refresh tokens automatically after import</span></label>
+              <div class="flow-footer">
+                <button id="import-json-clear" class="button subtle" type="button" data-i18n="clear">Clear</button>
+                <button id="import-json-submit" class="button primary" type="button" data-i18n="importNow">Import JSON</button>
+              </div>
+              <p id="import-result" class="notice" role="status" hidden></p>
+            </article>
           </section>
 
           <section id="page-config" class="page" data-i18n-aria-label="settings" aria-label="Settings" hidden>

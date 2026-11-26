@@ -564,6 +564,31 @@
   }
   .agent-subtab { display: none; flex-direction: column; gap: 16px; }
   .agent-subtab.active { display: flex; }
+
+  .drop-zone {
+    margin-top: 10px;
+    border: 1.5px dashed var(--border-strong);
+    border-radius: 10px;
+    background: var(--bg-deep);
+    padding: 20px 16px;
+    text-align: center;
+    cursor: pointer;
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+    transition: border-color 140ms var(--ease), background-color 140ms var(--ease);
+  }
+  .drop-zone:hover { border-color: var(--accent); background: var(--bg-raised); }
+  .drop-zone.dragover {
+    border-color: var(--accent);
+    background: rgba(59, 130, 246, 0.10);
+  }
+  .drop-zone-title { font-size: 13px; font-weight: 500; color: var(--text-primary); }
+  .drop-zone-sub { font-size: 11.5px; color: var(--text-muted); }
+  .import-summary {
+    margin-top: 10px; padding: 10px 12px; border-radius: 8px;
+    background: var(--bg-deep); border: 1px solid var(--border-hair);
+    font-size: 12px; color: var(--text-secondary);
+    display: flex; flex-direction: column; gap: 6px;
+  }
 </style>
 </head>
 <body>
@@ -575,7 +600,7 @@
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
       </div>
       <span class="brand-name">QuickRelay</span>
-      <span class="brand-meta" id="brandVersion">2.4.8</span>
+      <span class="brand-meta" id="brandVersion">2.4.9</span>
     </div>
 
     <nav class="nav-group" id="navMenu">
@@ -1040,6 +1065,7 @@
             </div>
             <div class="head-actions">
               <button class="btn btn-primary" id="btnToggleAddAccount">新增账号</button>
+              <button class="btn" id="btnToggleImportJson">JSON 导入</button>
               <button class="btn" id="btnSyncAllUsage">同步全部配额</button>
               <button class="btn" id="btnRefreshAllTokens">刷新全部 Token</button>
             </div>
@@ -1048,38 +1074,72 @@
           <!-- 可折叠的新增账号面板（默认收起，首屏优先呈现配额与余额） -->
           <div class="card" id="addAccountPanel" style="display:none;">
             <div class="card-head">
-              <h2 class="card-title">添加 AWS Quick 账号授权</h2>
-              <span class="keycap" id="loginStatusBadge">空闲</span>
-            </div>
-            <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
-              <select class="select" id="loginProvider">
-                <option value="social">AWS Builder ID (个人)</option>
-                <option value="enterprise">企业 IAM Identity Center</option>
-              </select>
-              <input class="input" id="loginRegion" value="us-east-1" placeholder="区域" style="width:140px;" />
-              <button class="btn btn-primary" id="btnStartAutoLogin">浏览器自动登录</button>
-              <button class="btn" id="btnStartManualLogin">生成手动登录链接</button>
-              <button class="btn btn-danger" id="btnCancelLogin" style="display:none;">取消登录</button>
-            </div>
-
-            <div id="autoLoginHint" style="display:none;margin-top:12px;padding:12px;background:var(--bg-deep);border:1px solid var(--border-hair);border-radius:8px;">
-              <div id="autoLoginMsg" style="font-size:12.5px;color:var(--accent-ink);"></div>
-            </div>
-
-            <div id="manualLoginBox" style="display:none;margin-top:12px;padding:14px;background:var(--bg-deep);border:1px solid var(--border-hair);border-radius:8px;flex-direction:column;gap:10px;">
-              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
-                <span style="font-size:12px;color:var(--text-secondary);">第 1 步：打开授权链接登录 AWS，完成后复制浏览器地址栏 URL</span>
-                <div style="display:flex;gap:8px;">
-                  <button class="btn btn-sm" id="btnOpenManualUrl">打开链接</button>
-                  <button class="btn btn-sm" id="btnCopyManualUrl">复制链接</button>
+              <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                <h2 class="card-title">添加 / 导入 AWS Quick 账号</h2>
+                <div class="seg-group" id="addAccountModeTabs">
+                  <button class="seg-btn active" data-acc-mode="oauth">OAuth 授权登录</button>
+                  <button class="seg-btn" data-acc-mode="json">JSON 批量导入</button>
                 </div>
               </div>
-              <input class="input mono" id="manualAuthUrl" readonly />
-              <div style="font-size:12px;color:var(--text-secondary);">第 2 步：粘贴跳转后的完整回调 URL 并提交</div>
-              <div style="display:flex;gap:8px;">
-                <input class="input mono" id="manualCallbackUrl" placeholder="http://localhost:18080/callback?..." style="flex:1;" />
-                <button class="btn btn-primary" id="btnSubmitManualLogin">提交回调</button>
+              <span class="keycap" id="loginStatusBadge">空闲</span>
+            </div>
+
+            <div id="addAccountOAuthPane">
+              <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+                <select class="select" id="loginProvider">
+                  <option value="social">AWS Builder ID (个人)</option>
+                  <option value="enterprise">企业 IAM Identity Center</option>
+                </select>
+                <input class="input" id="loginRegion" value="us-east-1" placeholder="区域" style="width:140px;" />
+                <button class="btn btn-primary" id="btnStartAutoLogin">浏览器自动登录</button>
+                <button class="btn" id="btnStartManualLogin">生成手动登录链接</button>
+                <button class="btn btn-danger" id="btnCancelLogin" style="display:none;">取消登录</button>
               </div>
+
+              <div id="autoLoginHint" style="display:none;margin-top:12px;padding:12px;background:var(--bg-deep);border:1px solid var(--border-hair);border-radius:8px;">
+                <div id="autoLoginMsg" style="font-size:12.5px;color:var(--accent-ink);"></div>
+              </div>
+
+              <div id="manualLoginBox" style="display:none;margin-top:12px;padding:14px;background:var(--bg-deep);border:1px solid var(--border-hair);border-radius:8px;flex-direction:column;gap:10px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <span style="font-size:12px;color:var(--text-secondary);">第 1 步：打开授权链接登录 AWS，完成后复制浏览器地址栏 URL</span>
+                  <div style="display:flex;gap:8px;">
+                    <button class="btn btn-sm" id="btnOpenManualUrl">打开链接</button>
+                    <button class="btn btn-sm" id="btnCopyManualUrl">复制链接</button>
+                  </div>
+                </div>
+                <input class="input mono" id="manualAuthUrl" readonly />
+                <div style="font-size:12px;color:var(--text-secondary);">第 2 步：粘贴跳转后的完整回调 URL 并提交</div>
+                <div style="display:flex;gap:8px;">
+                  <input class="input mono" id="manualCallbackUrl" placeholder="http://localhost:18080/callback?..." style="flex:1;" />
+                  <button class="btn btn-primary" id="btnSubmitManualLogin">提交回调</button>
+                </div>
+              </div>
+            </div>
+
+            <div id="addAccountJsonPane" style="display:none;">
+              <input type="file" id="jsonImportFileInput" accept=".json,application/json" multiple style="display:none;" />
+              <div class="drop-zone" id="jsonImportDropZone" tabindex="0">
+                <div class="drop-zone-title">将账号 .json 文件拖到此处，松手后自动解析并上传</div>
+                <div class="drop-zone-sub">支持单个或多个 .json 文件（兼容单对象、数组或 {&quot;accounts&quot;:[...]} 格式；自动识别驼峰与下划线字段）</div>
+                <div style="margin-top:4px;">
+                  <button class="btn btn-sm" type="button" id="btnPickJsonFiles">选择 JSON 文件</button>
+                </div>
+              </div>
+              <div style="margin-top:10px;">
+                <textarea class="input mono" id="jsonImportTextarea" rows="6" spellcheck="false" placeholder='也可直接在此粘贴 JSON 内容（如 [{"email":"...","refresh_token":"...","client_id":"...","client_secret":"..."}]）' style="width:100%;resize:vertical;padding:10px;"></textarea>
+              </div>
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:10px;">
+                <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary);cursor:pointer;">
+                  <input type="checkbox" id="jsonImportAutoRefresh" />
+                  <span>导入后自动尝试刷新 Token</span>
+                </label>
+                <div style="display:flex;gap:8px;">
+                  <button class="btn btn-sm" type="button" id="btnClearImportJson">清空</button>
+                  <button class="btn btn-primary btn-sm" type="button" id="btnSubmitImportJson">立即导入</button>
+                </div>
+              </div>
+              <div class="import-summary" id="jsonImportResult" style="display:none;"></div>
             </div>
           </div>
 
@@ -1507,7 +1567,7 @@
     <div class="modal-body" id="updateModalBody">
       <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;background:var(--bg-deep);border:1px solid var(--border-hair);border-radius:10px;padding:12px 14px;">
         <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;">
-          <span style="font-size:12.5px;color:var(--text-secondary);">当前版本：<strong class="mono" id="updCurVer" style="color:var(--text-primary);">2.4.8</strong></span>
+          <span style="font-size:12.5px;color:var(--text-secondary);">当前版本：<strong class="mono" id="updCurVer" style="color:var(--text-primary);">2.4.9</strong></span>
           <span style="font-size:12.5px;color:var(--text-secondary);">最新版本：<strong class="mono" id="updLatestVer" style="color:var(--accent-ink);">--</strong></span>
           <span class="keycap" id="updSourceTag" style="display:none;">--</span>
         </div>
@@ -2816,9 +2876,199 @@
     }));
   }
 
+  function switchAddAccountMode(mode) {
+    const isJson = mode === "json";
+    $("addAccountOAuthPane").style.display = isJson ? "none" : "block";
+    $("addAccountJsonPane").style.display = isJson ? "block" : "none";
+    $("addAccountModeTabs").querySelectorAll(".seg-btn").forEach((b) => {
+      b.classList.toggle("active", b.getAttribute("data-acc-mode") === (isJson ? "json" : "oauth"));
+    });
+  }
+
   $("btnToggleAddAccount").addEventListener("click", () => {
     const p = $("addAccountPanel");
-    p.style.display = p.style.display === "none" ? "block" : "none";
+    if (p.style.display === "none") {
+      p.style.display = "block";
+      switchAddAccountMode("oauth");
+    } else if ($("addAccountJsonPane").style.display !== "none") {
+      switchAddAccountMode("oauth");
+    } else {
+      p.style.display = "none";
+    }
+  });
+  $("btnToggleImportJson").addEventListener("click", () => {
+    const p = $("addAccountPanel");
+    if (p.style.display === "none") {
+      p.style.display = "block";
+      switchAddAccountMode("json");
+    } else if ($("addAccountJsonPane").style.display === "none") {
+      switchAddAccountMode("json");
+    } else {
+      p.style.display = "none";
+    }
+  });
+  $("addAccountModeTabs").addEventListener("click", (e) => {
+    const btn = e.target.closest(".seg-btn");
+    if (!btn) return;
+    switchAddAccountMode(btn.getAttribute("data-acc-mode"));
+  });
+
+  function extractAccountsFromParsedJson(parsed) {
+    if (Array.isArray(parsed)) return parsed;
+    if (parsed && typeof parsed === "object") {
+      for (const k of ["accounts", "items", "data"]) {
+        if (Array.isArray(parsed[k])) return parsed[k];
+      }
+      return [parsed];
+    }
+    throw new Error("JSON 根结构必须是对象或数组");
+  }
+
+  function renderJsonImportResult(res) {
+    const box = $("jsonImportResult");
+    if (!box) return;
+    if (!res || typeof res !== "object") {
+      box.style.display = "none";
+      box.innerHTML = "";
+      return;
+    }
+    const items = Array.isArray(res.results) ? res.results : [];
+    const detailsHtml = items.filter((it) => it.status === "failed" || it.refresh_error).map((it) => {
+      const label = escapeHtml(it.email || ("#" + (Number(it.index || 0) + 1)));
+      const msg = escapeHtml(it.error || it.refresh_error || "");
+      return `<div class="mono" style="color:var(--neg);font-size:11.5px;">• ${label}: ${msg}</div>`;
+    }).join("");
+    box.innerHTML = `
+      <div>导入完成：共 <strong>${Number(res.total || 0)}</strong> 个 · 新增 <strong style="color:var(--pos);">${Number(res.imported || 0)}</strong> · 更新 <strong style="color:var(--accent-ink);">${Number(res.updated || 0)}</strong> · 失败 <strong style="color:${Number(res.failed || 0) > 0 ? "var(--neg)" : "var(--text-muted)"};">${Number(res.failed || 0)}</strong></div>
+      ${detailsHtml}
+    `;
+    box.style.display = "flex";
+  }
+
+  async function submitImportPayloadObject(payloadObj) {
+    if (state.status.serviceState !== "running") {
+      showToast("error", "服务未运行，请先启动本地网关");
+      return;
+    }
+    const btn = $("btnSubmitImportJson");
+    btn.disabled = true;
+    try {
+      const res = await callHostApi("importAccountsJson", { payloadJson: JSON.stringify(payloadObj) }, 60000);
+      renderJsonImportResult(res);
+      loadServerStatus();
+      const okCount = Number(res.imported || 0) + Number(res.updated || 0);
+      const failCount = Number(res.failed || 0);
+      if (okCount > 0 && failCount === 0) {
+        showToast("success", `成功导入 ${res.imported || 0} 个、更新 ${res.updated || 0} 个账号`);
+      } else if (okCount > 0) {
+        showToast("info", `部分导入成功：新增 ${res.imported || 0}、更新 ${res.updated || 0}、失败 ${failCount}`);
+      } else {
+        showToast("error", `导入失败（${failCount} 条错误）`);
+      }
+    } catch (err) {
+      showToast("error", "导入失败: " + err.message);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function handleJsonFilesImport(fileList) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    const merged = [];
+    let autoRefresh = !!($("jsonImportAutoRefresh") && $("jsonImportAutoRefresh").checked);
+    try {
+      for (const file of files) {
+        const text = await file.text();
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && (parsed.auto_refresh || parsed.autoRefresh)) {
+          autoRefresh = true;
+        }
+        const arr = extractAccountsFromParsedJson(parsed);
+        merged.push(...arr);
+      }
+      if (!merged.length) {
+        showToast("error", "所选 JSON 文件中未包含账号数据");
+        return;
+      }
+      const payload = { accounts: merged, auto_refresh: autoRefresh };
+      $("jsonImportTextarea").value = JSON.stringify(merged.length === 1 ? merged[0] : payload, null, 2);
+      await submitImportPayloadObject(payload);
+    } catch (err) {
+      showToast("error", "读取或解析 JSON 文件失败: " + err.message);
+    }
+  }
+
+  window.addEventListener("dragover", (e) => { e.preventDefault(); });
+  window.addEventListener("drop", (e) => { e.preventDefault(); });
+
+  const jsonDropZone = $("jsonImportDropZone");
+  const jsonFileInput = $("jsonImportFileInput");
+  $("btnPickJsonFiles").addEventListener("click", (e) => {
+    e.stopPropagation();
+    jsonFileInput.value = "";
+    jsonFileInput.click();
+  });
+  jsonDropZone.addEventListener("click", () => {
+    jsonFileInput.value = "";
+    jsonFileInput.click();
+  });
+  jsonFileInput.addEventListener("change", () => {
+    if (jsonFileInput.files && jsonFileInput.files.length) {
+      handleJsonFilesImport(jsonFileInput.files);
+    }
+  });
+  jsonDropZone.addEventListener("dragenter", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    jsonDropZone.classList.add("dragover");
+  });
+  jsonDropZone.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    jsonDropZone.classList.add("dragover");
+  });
+  jsonDropZone.addEventListener("dragleave", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!jsonDropZone.contains(e.relatedTarget)) {
+      jsonDropZone.classList.remove("dragover");
+    }
+  });
+  jsonDropZone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    jsonDropZone.classList.remove("dragover");
+    const files = e.dataTransfer && e.dataTransfer.files;
+    if (files && files.length) {
+      handleJsonFilesImport(files);
+    }
+  });
+
+  $("btnClearImportJson").addEventListener("click", () => {
+    $("jsonImportTextarea").value = "";
+    $("jsonImportFileInput").value = "";
+    renderJsonImportResult(null);
+  });
+  $("btnSubmitImportJson").addEventListener("click", async () => {
+    const raw = $("jsonImportTextarea").value.trim();
+    if (!raw) {
+      showToast("error", "请拖入 JSON 文件或粘贴账号 JSON 内容");
+      return;
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      const arr = extractAccountsFromParsedJson(parsed);
+      if (!arr.length) {
+        showToast("error", "JSON 中未包含任何账号对象");
+        return;
+      }
+      const autoRefresh = !!($("jsonImportAutoRefresh") && $("jsonImportAutoRefresh").checked) ||
+        !!(parsed && typeof parsed === "object" && !Array.isArray(parsed) && (parsed.auto_refresh || parsed.autoRefresh));
+      await submitImportPayloadObject({ accounts: arr, auto_refresh: autoRefresh });
+    } catch (err) {
+      showToast("error", "JSON 格式无效: " + err.message);
+    }
   });
   $("accFilterQuota").addEventListener("change", (e) => { state.accFilterQuota = e.target.value || "all"; renderAccounts(); });
   $("accSortBy").addEventListener("change", (e) => { state.accSortBy = e.target.value || "default"; renderAccounts(); });
@@ -3363,8 +3613,8 @@
   function renderUpdateCheckResult(res) {
     if (!res) return;
     state.updateCheckResult = res;
-    $("updCurVer").textContent = "v" + (res.current_version || "2.4.8");
-    $("brandVersion").textContent = res.current_version || "2.4.8";
+    $("updCurVer").textContent = "v" + (res.current_version || "2.4.9");
+    $("brandVersion").textContent = res.current_version || "2.4.9";
     $("updLatestVer").textContent = res.latest_version ? ("v" + res.latest_version) : "--";
 
     const srcTag = $("updSourceTag");

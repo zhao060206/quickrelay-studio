@@ -89,6 +89,7 @@ func NewServer(cfg *config.Config, st *store.Store, mgr *accounts.Manager, addrO
 	server.routes.HandleFunc("POST /api/auth/logout", server.handleLogout)
 	server.routes.HandleFunc("GET /api/status", server.handleStatus)
 	server.routes.HandleFunc("GET /api/accounts", server.handleAccounts)
+	server.routes.HandleFunc("POST /api/accounts/import", server.handleAccountsImport)
 	server.routes.HandleFunc("PATCH /api/accounts/{id}", server.handleAccountUpdate)
 	server.routes.HandleFunc("DELETE /api/accounts/{id}", server.handleAccountDelete)
 	server.routes.HandleFunc("POST /api/accounts/{id}/refresh", server.handleAccountRefresh)

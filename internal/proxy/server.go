@@ -709,7 +709,7 @@ func (t *preparedTurn) selectAccount() (*store.Account, *Session, error) {
 	}
 }
 
-func (t *preparedTurn) runChat(onEvent EventFunc, streamStarted func() bool, resetOutput func()) (ChatResult, error) {
+func (t *preparedTurn) runChat(onEvent EventFunc, streamProgress func() (started, hasOutput bool), resetOutput func()) (ChatResult, error) {
 	var res ChatResult
 	var lastErr error
 	forceCorrection := false
@@ -774,18 +774,21 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamStarted func() bool, res
 			return res, nil
 		}
 		lastErr = err
-		if !invalidChatRequest(err) && !errors.Is(err, ErrRemoteSandboxToolBlocked) && t.ctx.Err() == nil {
+		blockedRemoteTool := errors.Is(err, ErrRemoteSandboxToolBlocked)
+		if !invalidChatRequest(err) && !blockedRemoteTool && t.ctx.Err() == nil {
 			t.server.accounts.ReportFailure(t.ctx, acct.ID, err)
 		}
 		log.Printf("chat %s attempt=%d/%d account=%s failed error=%v", t.id, t.attempts, t.maxAttempts, accountLogLabel(acct), err)
-		if streamStarted != nil && streamStarted() {
-			log.Printf("chat %s stream already started; not retrying", t.id)
-			return res, err
+		if streamProgress != nil {
+			if started, hasOutput := streamProgress(); started && (!blockedRemoteTool || hasOutput) {
+				log.Printf("chat %s stream already started; not retrying", t.id)
+				return res, err
+			}
 		}
 		if t.ctx.Err() != nil {
 			return res, t.ctx.Err()
 		}
-		if errors.Is(err, ErrRemoteSandboxToolBlocked) {
+		if blockedRemoteTool {
 			if !t.remoteToolCorrected {
 				t.remoteToolCorrected = true
 				blockedName := "remote_tool"
@@ -1035,6 +1038,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	var writeMu sync.Mutex
 	started := false
+	hasOutput := false
 	var lastWriteAt time.Time
 	var clientWriteErr error
 	noteWriteErrLocked := func(wErr error) bool {
@@ -1092,9 +1096,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		ensureStartedLocked()
 		writeRawLocked(payload)
 	}
-	isStarted := func() bool {
+	streamProgress := func() (bool, bool) {
 		writeMu.Lock()
 		defer writeMu.Unlock()
+		return started, hasOutput
+	}
+	isStarted := func() bool {
+		started, _ := streamProgress()
 		return started
 	}
 	lastWrite := func() time.Time {
@@ -1115,7 +1123,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		lastWriteAt = time.Now()
 	}
 	writeChunk := func(delta map[string]any, finishReason *string) {
-		writePayload(map[string]any{
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		ensureStartedLocked()
+		hasOutput = true
+		writeRawLocked(map[string]any{
 			"id":      turn.id,
 			"object":  "chat.completion.chunk",
 			"created": turn.created,
@@ -1134,7 +1146,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	prestartSSE := func() {
-		flushPendingThinking()
 		writeMu.Lock()
 		defer writeMu.Unlock()
 		ensureStartedLocked()
@@ -1259,7 +1270,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		switch ev.Type {
 		case "thinking":
 			if ev.Text != "" {
-				if turn.bridgeActive && !isStarted() {
+				if _, outputStarted := streamProgress(); turn.bridgeActive && !outputStarted {
 					if flushed, shouldFlush := thinkBuf.Add(ev.Text, thinkingPrestreamMaxBytes, thinkingPrestreamHold); shouldFlush {
 						writeChunk(map[string]any{"reasoning_content": flushed}, nil)
 					}
@@ -1288,7 +1299,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		return getClientWriteErr()
-	}, isStarted, func() {
+	}, streamProgress, func() {
 		sawVisibleText = false
 		pendingText.Reset()
 		thinkBuf.Reset()

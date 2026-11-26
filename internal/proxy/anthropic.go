@@ -641,6 +641,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	var writeMu sync.Mutex
 	started := false
+	hasOutput := false
 	var lastWriteAt time.Time
 	var clientWriteErr error
 	noteWriteErrLocked := func(wErr error) bool {
@@ -681,6 +682,9 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	writeEvent := func(event string, payload any) {
 		writeMu.Lock()
 		defer writeMu.Unlock()
+		if event == "content_block_start" {
+			hasOutput = true
+		}
 		writeEventLocked(event, payload)
 	}
 	ensureStarted := func() {
@@ -706,9 +710,13 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			},
 		})
 	}
-	isStarted := func() bool {
+	streamProgress := func() (bool, bool) {
 		writeMu.Lock()
 		defer writeMu.Unlock()
+		return started, hasOutput
+	}
+	isStarted := func() bool {
+		started, _ := streamProgress()
 		return started
 	}
 	lastWrite := func() time.Time {
@@ -792,7 +800,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		if chunk == "" {
 			return
 		}
-		if turn.bridgeActive && !isStarted() {
+		if _, outputStarted := streamProgress(); turn.bridgeActive && !outputStarted {
 			if flushed, shouldFlush := thinkBuf.Add(chunk, thinkingPrestreamMaxBytes, thinkingPrestreamHold); shouldFlush {
 				emitThinkingNow(flushed)
 			}
@@ -943,16 +951,12 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	prestartAnthropic := func() {
-		flushPendingThinking()
-		ensureStarted()
-	}
 	stopHB := startSSEHeartbeat(
 		turn.ctx,
 		turn.needsThinkingHeartbeat(),
 		isStarted,
 		turn.upstreamWaitingSince,
-		prestartAnthropic,
+		ensureStarted,
 		sendAnthropicPing,
 		lastWrite,
 	)
@@ -982,7 +986,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			}
 		}
 		return getClientWriteErr()
-	}, isStarted, func() {
+	}, streamProgress, func() {
 		sawVisibleText = false
 		pendingText.Reset()
 		thinkBuf.Reset()
