@@ -1,15 +1,15 @@
 {
-  "version": "2.4.3",
-  "tag": "v2.4.3",
-  "published_at": "2026-11-26T00:50:30Z",
-  "release_notes": "QuickRelay Studio v2.4.3 更新内容：\n1. 会话正确性加固与并发淘汰修复：\n   - 新增上一轮助手最终对外输出指纹校验（含规范化工具调用参数 JSON），彻底防止无显式会话 ID 时同开场白多窗口续聊误串线程，不匹配或旧记录安全回退以完整历史新建；\n   - OpenAI 与 Anthropic 的流式及非流式路径统一在输出清洗、工具解析及流尾 Flush 完成后提交最终输出指纹，取消或失败不再提交半截记录；\n   - 管理控制台单删/全清会话改为内存缓存与 SQLite 双端同步失效，阻断在途旧请求把已清理映射写回复活；\n   - 容量淘汰严格限定仅淘汰空闲会话，且同会话串行排队支持 context 取消/超时立即退出。\n2. 附件完整性严格校验：\n   - 单轮最多 16 个有效图片/二进制文档附件（纯文本文档内联不占配额），超限、损坏、不支持格式/来源或上传及 DLP 失败均直接返回明确错误，绝不静默丢弃或向模型派发残缺生成请求。\n3. 明确限流跨请求账号冷却：\n   - 识别上游 429 / Throttling 限流及 Retry-After 头并记录进程内跨请求冷却（默认 45s，上限 5m），后续新请求自动避开冷却账号并用完整历史重建接手；\n   - 全部账号均处冷却时停止重拨，直接返回 429 与 Retry-After 头并保留既有会话映射；普通网络超时绝不触发冷却。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.3",
+  "version": "2.4.4",
+  "tag": "v2.4.4",
+  "published_at": "2026-11-26T01:24:45Z",
+  "release_notes": "QuickRelay Studio v2.4.4 更新内容：\n1. 修复多轮长对话升级或切号全量重放时误报 400 invalid attachment（超过 16 附件上限）的问题：\n   - 明确区分「当前最新一轮提交的附件」与「更早历史轮次累计的旧截图/旧文档」：单轮请求、增量续聊及全量重放中的当前最新输入段仍 100% 严格校验完整性与 16 附件上限，损坏或单轮超限依然明确返回 400 且不派发残缺请求；\n   - 多轮全量重放时优先全额保留当前轮全部附件，并将剩余配额按从近到远分配给历史附件；超出配额或已失效的更早历史附件绝不虚标为 [attached ...]，而是诚实标注省略（[earlier image/document omitted] / [earlier image/document unavailable]），彻底避免旧长对话升级后首次全量重建或限流切号重建被锁死；\n   - 历史与当前轮中的 text/* 纯文本文档继续内联保留，不占用 16 个上传配额。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.4",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.4.3-win-x64.zip",
-      "size": 8674719,
-      "sha256": "9308527fd7ee3d6579ca7637336139aebddbf0b2c3326f2846f226908cea9dd8",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.3/QuickRelay-Studio-v2.4.3-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.4.4-win-x64.zip",
+      "size": 8646815,
+      "sha256": "d139c3a8c60d6e7aba8207e17fa34d9d58e95d8682e74641f7170323c4165a19",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.4/QuickRelay-Studio-v2.4.4-win-x64.zip"
     }
   }
 }

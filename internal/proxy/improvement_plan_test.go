@@ -1052,3 +1052,374 @@ func TestImprovement_AccountRateLimitCooldownAndRecovery(t *testing.T) {
 		}
 	})
 }
+
+// TestImprovement_FullTranscriptHistoricalAttachmentBudget 验证多轮长对话全量重放时的附件配额分配与严格校验：
+// 1) 历史累计 20 张旧图 + 当前轮纯文本：保留最新 16 张，更早 4 张诚实标为 [earlier image omitted]，绝不虚标 [attached ...]；
+// 2) 历史累计 18 张旧图 + 1 份历史纯文本文档 + 当前轮 3 张新图：优先保当前轮全部 3 张 + 历史最近 13 张，纯文本文档内联不占配额；
+// 3) 历史累计 10 张旧图 + 当前轮新发 17 张新图：严格返回 ErrInvalidAttachment 并指明第 17 张；
+// 4) 历史累计 5 张旧图 + 当前轮 1 张损坏 Base64 图：严格返回 ErrInvalidAttachment；
+// 5) 历史含 1 张损坏旧图 + 当前轮正常提问：降级标为 [earlier image unavailable] 不锁死长会话；
+// 6) 端到端 HTTP 集成：老库无 last_assistant_hash 的 20 图长对话升级后首轮安全重建（上传 16 张），并补写指纹使第 2 轮命中增量复用。
+func TestImprovement_FullTranscriptHistoricalAttachmentBudget(t *testing.T) {
+	makePNGDataURI := func(tag byte) string {
+		return "data:image/png;base64," + base64.StdEncoding.EncodeToString(makeFakePNG(tag))
+	}
+	makeImageMsg := func(tag byte, note string) Message {
+		return Message{
+			Role: "user",
+			Content: []any{
+				map[string]any{"type": "text", "text": note},
+				map[string]any{"type": "image_url", "image_url": map[string]any{"url": makePNGDataURI(tag)}},
+			},
+		}
+	}
+
+	t.Run("20_historical_images_with_plain_followup_keeps_latest_16", func(t *testing.T) {
+		var msgs []Message
+		for i := 1; i <= 20; i++ {
+			msgs = append(msgs, makeImageMsg(byte(i), fmt.Sprintf("第%d张历史图：", i)))
+			msgs = append(msgs, Message{Role: "assistant", Content: fmt.Sprintf("收到第%d张图", i)})
+		}
+		msgs = append(msgs, Message{Role: "user", Content: "请总结刚才的全部结果"})
+
+		prompt, imgs, err := formatPromptWithImages(context.Background(), msgs)
+		if err != nil {
+			t.Fatalf("formatPromptWithImages failed: %v", err)
+		}
+		if len(imgs) != maxImagesPerTurn {
+			t.Fatalf("got %d uploaded images, want %d", len(imgs), maxImagesPerTurn)
+		}
+		// 应保留第 5~20 张，前 4 张诚实省略
+		if omitted := strings.Count(prompt, "[earlier image omitted]"); omitted != 4 {
+			t.Fatalf("expected 4 [earlier image omitted] markers, got %d in %q", omitted, prompt)
+		}
+		if attached := strings.Count(prompt, "[attached image: "); attached != maxImagesPerTurn {
+			t.Fatalf("expected %d [attached image: ...] markers, got %d", maxImagesPerTurn, attached)
+		}
+		for idx, att := range imgs {
+			wantTag := byte(idx + 5)
+			if !bytes.Equal(att.Data, makeFakePNG(wantTag)) {
+				t.Fatalf("img[%d] expected historical tag %d, got %v", idx, wantTag, att.Data)
+			}
+			marker := "[attached image: " + att.Name + "]"
+			if strings.Count(prompt, marker) != 1 {
+				t.Fatalf("expected prompt to contain %q once", marker)
+			}
+		}
+	})
+
+	t.Run("18_historical_plus_inline_text_doc_and_3_current_images", func(t *testing.T) {
+		var msgs []Message
+		for i := 1; i <= 18; i++ {
+			content := []any{
+				map[string]any{"type": "text", "text": fmt.Sprintf("旧图%d：", i)},
+				map[string]any{"type": "image_url", "image_url": map[string]any{"url": makePNGDataURI(byte(i))}},
+			}
+			if i == 3 {
+				content = append(content, map[string]any{
+					"type":  "document",
+					"title": "history-notes.txt",
+					"source": map[string]any{
+						"type":       "base64",
+						"media_type": "text/plain",
+						"data":       base64.StdEncoding.EncodeToString([]byte("重要历史文本笔记")),
+					},
+				})
+			}
+			msgs = append(msgs, Message{Role: "user", Content: content})
+			msgs = append(msgs, Message{Role: "assistant", Content: fmt.Sprintf("已阅旧图%d", i)})
+		}
+		msgs = append(msgs, Message{
+			Role: "user",
+			Content: []any{
+				map[string]any{"type": "text", "text": "对比这3张新图："},
+				map[string]any{"type": "image_url", "image_url": map[string]any{"url": makePNGDataURI(101)}},
+				map[string]any{"type": "image_url", "image_url": map[string]any{"url": makePNGDataURI(102)}},
+				map[string]any{"type": "image_url", "image_url": map[string]any{"url": makePNGDataURI(103)}},
+			},
+		})
+
+		prompt, imgs, err := formatPromptWithImages(context.Background(), msgs)
+		if err != nil {
+			t.Fatalf("formatPromptWithImages failed: %v", err)
+		}
+		if len(imgs) != maxImagesPerTurn {
+			t.Fatalf("got %d images, want %d", len(imgs), maxImagesPerTurn)
+		}
+		// 历史 18 张只能进 13 张（第 6~18 张），最早 5 张省略；纯文本文档应保留内联且不占配额
+		if omitted := strings.Count(prompt, "[earlier image omitted]"); omitted != 5 {
+			t.Fatalf("expected 5 [earlier image omitted] markers, got %d", omitted)
+		}
+		if !strings.Contains(prompt, "重要历史文本笔记") {
+			t.Fatalf("expected historical inline text document to be preserved without counting toward quota")
+		}
+		if attached := strings.Count(prompt, "[attached image: "); attached != maxImagesPerTurn {
+			t.Fatalf("expected %d [attached image: ...] markers, got %d", maxImagesPerTurn, attached)
+		}
+		// 最后 3 张必须是当前轮全部 3 张新图 (101, 102, 103)
+		for k := 0; k < 3; k++ {
+			got := imgs[13+k]
+			if !bytes.Equal(got.Data, makeFakePNG(byte(101+k))) {
+				t.Fatalf("current turn image #%d mismatch at slot %d", k+1, 13+k)
+			}
+			if !strings.Contains(prompt, "[attached image: "+got.Name+"]") {
+				t.Fatalf("missing current turn image ref %q", got.Name)
+			}
+		}
+	})
+
+	t.Run("10_historical_and_17_current_images_strictly_rejected", func(t *testing.T) {
+		var msgs []Message
+		for i := 1; i <= 10; i++ {
+			msgs = append(msgs, makeImageMsg(byte(i), fmt.Sprintf("历史%d", i)))
+			msgs = append(msgs, Message{Role: "assistant", Content: "ok"})
+		}
+		var curParts []any
+		curParts = append(curParts, map[string]any{"type": "text", "text": "本轮17张图"})
+		for i := 1; i <= 17; i++ {
+			curParts = append(curParts, map[string]any{
+				"type":      "input_image",
+				"image_url": makePNGDataURI(byte(150 + i)),
+			})
+		}
+		msgs = append(msgs, Message{Role: "user", Content: curParts})
+
+		_, _, err := formatPromptWithImages(context.Background(), msgs)
+		if !errors.Is(err, ErrInvalidAttachment) || !strings.Contains(err.Error(), "image #17") {
+			t.Fatalf("expected ErrInvalidAttachment naming image #17, got %v", err)
+		}
+	})
+
+	t.Run("5_historical_and_corrupted_current_image_rejected", func(t *testing.T) {
+		var msgs []Message
+		for i := 1; i <= 5; i++ {
+			msgs = append(msgs, makeImageMsg(byte(i), fmt.Sprintf("历史%d", i)))
+			msgs = append(msgs, Message{Role: "assistant", Content: "ok"})
+		}
+		msgs = append(msgs, Message{
+			Role: "user",
+			Content: []any{
+				map[string]any{"type": "input_image", "image_url": "data:image/png;base64,!!!bad-base64!!!"},
+			},
+		})
+		_, _, err := formatPromptWithImages(context.Background(), msgs)
+		if !errors.Is(err, ErrInvalidAttachment) {
+			t.Fatalf("expected ErrInvalidAttachment for corrupted current image, got %v", err)
+		}
+	})
+
+	t.Run("corrupted_historical_image_degrades_honestly_without_blocking", func(t *testing.T) {
+		msgs := []Message{
+			{
+				Role: "user",
+				Content: []any{
+					map[string]any{"type": "text", "text": "旧坏图："},
+					map[string]any{"type": "input_image", "image_url": "data:image/png;base64,!!!broken!!!"},
+				},
+			},
+			{Role: "assistant", Content: "当时分析完了"},
+			{Role: "user", Content: "继续当前问题"},
+		}
+		prompt, imgs, err := formatPromptWithImages(context.Background(), msgs)
+		if err != nil {
+			t.Fatalf("expected corrupted historical image not to block turn, got %v", err)
+		}
+		if len(imgs) != 0 {
+			t.Fatalf("expected 0 valid attachments, got %d", len(imgs))
+		}
+		if !strings.Contains(prompt, "[earlier image unavailable]") || strings.Contains(prompt, "[attached image:") {
+			t.Fatalf("expected honest [earlier image unavailable] without fake attached ref, got %q", prompt)
+		}
+	})
+
+	t.Run("e2e_legacy_db_20_images_upgrade_rebuild_then_resume", func(t *testing.T) {
+		var uploadedNames []string
+		var uploadMu sync.Mutex
+		tenantSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/integration/quick-work/upload-attachment":
+				name := r.URL.Query().Get("name")
+				uploadMu.Lock()
+				uploadedNames = append(uploadedNames, name)
+				n := len(uploadedNames)
+				uploadMu.Unlock()
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"attachmentId": fmt.Sprintf("att-%d", n),
+					"path":         fmt.Sprintf("/data/files/%s", name),
+				})
+			case "/integration/quick-work/attachment-dlp-status":
+				_ = json.NewEncoder(w).Encode(map[string]string{"dlpJobStatus": "COMPLETED", "policyAction": "ALLOW"})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer tenantSrv.Close()
+
+		type capFrame struct {
+			hasCreate bool
+			threadID  string
+			text      string
+			fileCount int
+		}
+		var frames []capFrame
+		var fMu sync.Mutex
+		var seq atomic.Int32
+		upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+		wsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			hasCreate := false
+			for {
+				_, raw, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				mType, payload, ok := decodeClientFrame(raw)
+				if !ok {
+					continue
+				}
+				switch mType {
+				case "session_create":
+					hasCreate = true
+				case "user_message":
+					tid, _ := payload["thread_id"].(string)
+					text, _ := payload["text"].(string)
+					atts, _ := payload["attachments"].([]any)
+					fMu.Lock()
+					frames = append(frames, capFrame{
+						hasCreate: hasCreate,
+						threadID:  tid,
+						text:      text,
+						fileCount: len(atts),
+					})
+					fMu.Unlock()
+					n := seq.Add(1)
+					writeEv := func(v any) {
+						_ = conn.WriteMessage(websocket.BinaryMessage, encodeMockAIDPServerEvent(v))
+					}
+					writeEv(map[string]any{"type": "message_start", "payload": map[string]any{"message_id": fmt.Sprintf("m%d", n)}})
+					writeEv(map[string]any{"type": "text_delta", "payload": map[string]any{"delta": fmt.Sprintf("重建答复-%d", n)}})
+					writeEv(map[string]any{"type": "message_complete", "payload": map[string]any{"continuation_expected": false}})
+					writeEv(map[string]any{"type": "turn_completed", "payload": map[string]any{}})
+				}
+			}
+		}))
+		defer wsSrv.Close()
+
+		// 构造含 20 张历史图的 Anthropic 对话
+		var rawMsgs []map[string]any
+		var proxyMsgs []Message
+		for i := 1; i <= 20; i++ {
+			b64 := base64.StdEncoding.EncodeToString(makeFakePNG(byte(i)))
+			rawMsgs = append(rawMsgs, map[string]any{
+				"role": "user",
+				"content": []map[string]any{
+					{"type": "text", "text": fmt.Sprintf("旧图#%d", i)},
+					{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": b64}},
+				},
+			})
+			rawMsgs = append(rawMsgs, map[string]any{
+				"role":    "assistant",
+				"content": fmt.Sprintf("旧答复#%d", i),
+			})
+			proxyMsgs = append(proxyMsgs, makeImageMsg(byte(i), fmt.Sprintf("旧图#%d", i)))
+			proxyMsgs = append(proxyMsgs, Message{Role: "assistant", Content: fmt.Sprintf("旧答复#%d", i)})
+		}
+
+		// 在 SQLite 中写入不含 last_assistant_hash 的 v2.4.2 旧记录（模拟刚升级 v2.4.3/v2.4.4）
+		dbPath := filepath.Join(t.TempDir(), "legacy_20img.db")
+		st, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		defer st.Close()
+		if err := st.Save(context.Background(), &store.Account{
+			Email: "img@example.com", Provider: "social",
+			TenantURL: tenantSrv.URL,
+			WSHost:    "ws://" + strings.TrimPrefix(wsSrv.URL, "http://"), WSPath: "/ws",
+			AccessToken: "jwt-img", ActorARN: "arn:aws:quick:us-east-1:img", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		}); err != nil {
+			t.Fatalf("st.Save: %v", err)
+		}
+		// 注意：传入仅含前 39 条（前 20 轮 user + 前 19 条 asst + 第 20 轮 user，不含最后一条 asst）且 last_assistant_hash 为空
+		legacyHashes := nonLeadingMessageFingerprints(proxyMsgs[:len(proxyMsgs)-1])
+		if err := st.UpsertConversation(context.Background(), &store.ConversationRecord{
+			Key:               "h:legacy-20img",
+			ThreadID:          "old-tid-v242",
+			AccountID:         1,
+			BaseHash:          "v2::",
+			MessageHashes:     legacyHashes,
+			LastAssistantHash: "",
+			LastUsed:          time.Now().Unix(),
+		}); err != nil {
+			t.Fatalf("UpsertConversation: %v", err)
+		}
+
+		cfg := config.Default()
+		cfg.SessionReuse = true
+		srv := NewServer(&cfg, accounts.New(st, &cfg))
+		httpSrv := httptest.NewServer(srv.Handler())
+		defer httpSrv.Close()
+		client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}}
+
+		postAnthropic := func(msgs []map[string]any) (int, string) {
+			b, _ := json.Marshal(map[string]any{
+				"model": "claude-opus-5", "max_tokens": 256, "stream": false, "messages": msgs,
+			})
+			req, _ := http.NewRequest(http.MethodPost, httpSrv.URL+"/v1/messages", bytes.NewReader(b))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Conversation-Id", "legacy-20img")
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("POST /v1/messages: %v", err)
+			}
+			defer resp.Body.Close()
+			raw, _ := io.ReadAll(resp.Body)
+			return resp.StatusCode, string(raw)
+		}
+
+		// 首轮：升级后接续老记录，强制全量重建 -> 不再报 400，而是成功新建线程并上传 16 张最新历史图
+		msgsRound1 := append(append([]map[string]any(nil), rawMsgs...), map[string]any{
+			"role": "user", "content": "升级后的第 1 次提问",
+		})
+		code1, body1 := postAnthropic(msgsRound1)
+		if code1 != http.StatusOK {
+			t.Fatalf("expected 200 OK on legacy 20-image rebuild, got %d: %s", code1, body1)
+		}
+
+		// 验证 DB 已补写 last_assistant_hash
+		rec, err := st.GetConversation(context.Background(), "h:legacy-20img")
+		if err != nil || rec == nil || rec.LastAssistantHash == "" || rec.ThreadID == "old-tid-v242" {
+			t.Fatalf("expected updated conversation with new threadID & last_assistant_hash, got %+v err=%v", rec, err)
+		}
+
+		// 第 2 轮：携带刚刚返回的 "重建答复-1" 续聊 -> 直接命中同一个新 thread_id 增量复用
+		msgsRound2 := append(append([]map[string]any(nil), msgsRound1...),
+			map[string]any{"role": "assistant", "content": "重建答复-1"},
+			map[string]any{"role": "user", "content": "续聊测试"},
+		)
+		code2, body2 := postAnthropic(msgsRound2)
+		if code2 != http.StatusOK {
+			t.Fatalf("expected 200 OK on round 2 resume, got %d: %s", code2, body2)
+		}
+
+		fMu.Lock()
+		defer fMu.Unlock()
+		if len(frames) != 2 {
+			t.Fatalf("expected 2 upstream frames, got %d", len(frames))
+		}
+		if !frames[0].hasCreate || frames[0].fileCount != maxImagesPerTurn {
+			t.Fatalf("round 1 expected session_create + 16 uploaded files, got create=%t files=%d", frames[0].hasCreate, frames[0].fileCount)
+		}
+		if strings.Count(frames[0].text, "[earlier image omitted]") != 4 {
+			t.Fatalf("round 1 expected 4 omitted markers, got %d", strings.Count(frames[0].text, "[earlier image omitted]"))
+		}
+		if frames[1].hasCreate || frames[1].threadID != frames[0].threadID || frames[1].fileCount != 0 {
+			t.Fatalf("round 2 expected incremental reuse on %q with 0 files, got create=%t tid=%q files=%d", frames[0].threadID, frames[1].hasCreate, frames[1].threadID, frames[1].fileCount)
+		}
+	})
+}

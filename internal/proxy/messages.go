@@ -196,6 +196,23 @@ type imageCollector struct {
 	byHash map[string]string // sha256 -> 已分配的文件名
 	order  []ImageAttachment
 	seen   int
+	plan   map[attachmentPartLoc]plannedPart
+}
+
+// attachmentPartLoc 定位消息列表中的单个多模态内容分片，用于多轮全量重放时的配额规划。
+type attachmentPartLoc struct {
+	msgIdx  int
+	partIdx int
+}
+
+// plannedPart 保存全量历史重放规划阶段对单个附件分片的处理结论。
+type plannedPart struct {
+	inlineText    string
+	hasAttachment bool
+	isDocument    bool
+	title         string
+	mimeType      string
+	data          []byte
 }
 
 func newImageCollector() *imageCollector {
@@ -576,10 +593,10 @@ func decodeDocumentBase64(declaredMIME, b64 string) (string, []byte, error) {
 	return mime, data, nil
 }
 
-func formatDocumentPart(p map[string]any, collector *imageCollector) (string, error) {
-	title, _ := p["title"].(string)
+func extractDocumentFields(p map[string]any) (title, rawURL, b64Data, b64MIME string) {
+	title, _ = p["title"].(string)
 	title = strings.TrimSpace(title)
-	rawURL, b64Data, b64MIME := extractImageSource(p)
+	rawURL, b64Data, b64MIME = extractImageSource(p)
 	if b64Data == "" {
 		if fileObj, ok := p["file"].(map[string]any); ok {
 			if title == "" {
@@ -592,23 +609,58 @@ func formatDocumentPart(p map[string]any, collector *imageCollector) (string, er
 			}
 		}
 	}
-	if collector == nil {
-		if title != "" {
-			return "[document: " + title + "]", nil
-		}
-		if rawURL != "" && !(len(rawURL) >= 5 && strings.EqualFold(rawURL[:5], "data:")) {
-			return "[document: " + rawURL + "]", nil
-		}
-		return "[document]", nil
+	return title, rawURL, b64Data, b64MIME
+}
+
+func isExplicitTextDocumentSource(rawURL, b64MIME string) bool {
+	if mime := normalizeImageMIME(b64MIME); strings.HasPrefix(mime, "text/") {
+		return true
 	}
+	if len(rawURL) >= 5 && strings.EqualFold(rawURL[:5], "data:") {
+		if comma := strings.IndexByte(rawURL, ','); comma > 5 {
+			meta := rawURL[5:comma]
+			if semi := strings.IndexByte(meta, ';'); semi >= 0 {
+				meta = meta[:semi]
+			}
+			return strings.HasPrefix(normalizeImageMIME(meta), "text/")
+		}
+	}
+	return false
+}
+
+func formatInlineTextDocument(title string, data []byte) string {
+	header := "<document>"
+	if title != "" {
+		header = fmt.Sprintf(`<document title="%s">`, strings.ReplaceAll(title, `"`, `'`))
+	}
+	return "\n" + header + "\n" + string(data) + "\n</document>\n"
+}
+
+func formatHistoricalOmittedDoc(title string) string {
+	if t := strings.TrimSpace(title); t != "" {
+		return "[earlier document omitted: " + t + "]"
+	}
+	return "[earlier document omitted]"
+}
+
+func formatHistoricalUnavailableDoc(title string) string {
+	if t := strings.TrimSpace(title); t != "" {
+		return "[earlier document unavailable: " + t + "]"
+	}
+	return "[earlier document unavailable]"
+}
+
+// resolveDocumentPart 校验并解码文档分片；若为纯文本文档则返回 inlineText，否则返回待上传的二进制负载。
+func resolveDocumentPart(p map[string]any, fallbackLabel string) (inlineText, title, mimeType string, data []byte, err error) {
+	title, rawURL, b64Data, b64MIME := extractDocumentFields(p)
 	docLabel := title
 	if docLabel == "" {
-		docLabel = fmt.Sprintf("document #%d", collector.seen+1)
+		docLabel = fallbackLabel
 	}
 	if b64Data == "" && len(rawURL) >= 5 && strings.EqualFold(rawURL[:5], "data:") {
 		comma := strings.IndexByte(rawURL, ',')
 		if comma <= 5 {
-			return "", fmt.Errorf("%w: malformed data uri for %s", ErrInvalidAttachment, docLabel)
+			return "", title, "", nil, fmt.Errorf("%w: malformed data uri for %s", ErrInvalidAttachment, docLabel)
 		}
 		meta := rawURL[5:comma]
 		parts := strings.Split(meta, ";")
@@ -623,41 +675,85 @@ func formatDocumentPart(p map[string]any, collector *imageCollector) (string, er
 			}
 		}
 		if !isB64 {
-			return "", fmt.Errorf("%w: data uri for %s missing base64 encoding", ErrInvalidAttachment, docLabel)
+			return "", title, "", nil, fmt.Errorf("%w: data uri for %s missing base64 encoding", ErrInvalidAttachment, docLabel)
 		}
 		b64Data = rawURL[comma+1:]
 	}
 	if b64Data != "" {
-		mime, data, err := decodeDocumentBase64(b64MIME, b64Data)
-		if err != nil {
-			return "", fmt.Errorf("%w: %s: %v", ErrInvalidAttachment, docLabel, err)
+		mime, decoded, decErr := decodeDocumentBase64(b64MIME, b64Data)
+		if decErr != nil {
+			return "", title, "", nil, fmt.Errorf("%w: %s: %v", ErrInvalidAttachment, docLabel, decErr)
 		}
 		if strings.HasPrefix(mime, "text/") {
-			header := "<document>"
-			if title != "" {
-				header = fmt.Sprintf(`<document title="%s">`, strings.ReplaceAll(title, `"`, `'`))
-			}
-			return "\n" + header + "\n" + string(data) + "\n</document>\n", nil
+			return formatInlineTextDocument(title, decoded), title, mime, nil, nil
 		}
-		name, addErr := collector.addDocument(title, mime, data)
-		if addErr != nil {
-			return "", addErr
-		}
-		return "[attached document: " + name + "]", nil
+		return "", title, mime, decoded, nil
 	}
 	if src, ok := p["source"].(map[string]any); ok {
 		if st, _ := src["type"].(string); strings.EqualFold(strings.TrimSpace(st), "base64") {
-			return "", fmt.Errorf("%w: empty base64 data for %s", ErrInvalidAttachment, docLabel)
+			return "", title, "", nil, fmt.Errorf("%w: empty base64 data for %s", ErrInvalidAttachment, docLabel)
 		}
 	}
 	if rawURL != "" {
-		return "", fmt.Errorf("%w: remote or unsupported document source for %s", ErrInvalidAttachment, docLabel)
+		return "", title, "", nil, fmt.Errorf("%w: remote or unsupported document source for %s", ErrInvalidAttachment, docLabel)
 	}
-	return "", fmt.Errorf("%w: missing readable data for %s", ErrInvalidAttachment, docLabel)
+	return "", title, "", nil, fmt.Errorf("%w: missing readable data for %s", ErrInvalidAttachment, docLabel)
+}
+
+// resolveImagePart 校验、解码或拉取单个图片分片并返回原始字节。
+func resolveImagePart(ctx context.Context, p map[string]any, imgLabel string) (string, []byte, error) {
+	rawURL, b64Data, b64MIME := extractImageSource(p)
+	if b64Data != "" {
+		mime, data, err := decodeImageBase64(b64MIME, b64Data)
+		if err != nil {
+			return "", nil, fmt.Errorf("%w: %s: %v", ErrInvalidAttachment, imgLabel, err)
+		}
+		return mime, data, nil
+	}
+	if len(rawURL) >= 5 && strings.EqualFold(rawURL[:5], "data:") {
+		mime, data, err := decodeImageDataURI(rawURL)
+		if err != nil {
+			return "", nil, fmt.Errorf("%w: %s: %v", ErrInvalidAttachment, imgLabel, err)
+		}
+		return mime, data, nil
+	}
+	if rawURL != "" {
+		mime, data, err := fetchRemoteImage(ctx, rawURL)
+		if err != nil {
+			return "", nil, fmt.Errorf("%w: %s (%s): %v", ErrInvalidAttachment, imgLabel, rawURL, err)
+		}
+		return mime, data, nil
+	}
+	return "", nil, fmt.Errorf("%w: missing image data for %s", ErrInvalidAttachment, imgLabel)
+}
+
+func formatDocumentPart(p map[string]any, collector *imageCollector) (string, error) {
+	title, rawURL, _, _ := extractDocumentFields(p)
+	if collector == nil {
+		if title != "" {
+			return "[document: " + title + "]", nil
+		}
+		if rawURL != "" && !(len(rawURL) >= 5 && strings.EqualFold(rawURL[:5], "data:")) {
+			return "[document: " + rawURL + "]", nil
+		}
+		return "[document]", nil
+	}
+	inlineText, parsedTitle, mime, data, err := resolveDocumentPart(p, fmt.Sprintf("document #%d", collector.seen+1))
+	if err != nil {
+		return "", err
+	}
+	if inlineText != "" {
+		return inlineText, nil
+	}
+	name, addErr := collector.addDocument(parsedTitle, mime, data)
+	if addErr != nil {
+		return "", addErr
+	}
+	return "[attached document: " + name + "]", nil
 }
 
 func formatImagePart(ctx context.Context, p map[string]any, collector *imageCollector) (string, error) {
-	rawURL, b64Data, b64MIME := extractImageSource(p)
+	rawURL, b64Data, _ := extractImageSource(p)
 	if collector == nil {
 		if b64Data != "" || (len(rawURL) >= 5 && strings.EqualFold(rawURL[:5], "data:")) {
 			return "[image]", nil
@@ -667,41 +763,15 @@ func formatImagePart(ctx context.Context, p map[string]any, collector *imageColl
 		}
 		return "[image]", nil
 	}
-	imgLabel := fmt.Sprintf("image #%d", collector.seen+1)
-	if b64Data != "" {
-		mime, data, err := decodeImageBase64(b64MIME, b64Data)
-		if err != nil {
-			return "", fmt.Errorf("%w: %s: %v", ErrInvalidAttachment, imgLabel, err)
-		}
-		name, addErr := collector.add(mime, data)
-		if addErr != nil {
-			return "", addErr
-		}
-		return "[attached image: " + name + "]", nil
+	mime, data, err := resolveImagePart(ctx, p, fmt.Sprintf("image #%d", collector.seen+1))
+	if err != nil {
+		return "", err
 	}
-	if len(rawURL) >= 5 && strings.EqualFold(rawURL[:5], "data:") {
-		mime, data, err := decodeImageDataURI(rawURL)
-		if err != nil {
-			return "", fmt.Errorf("%w: %s: %v", ErrInvalidAttachment, imgLabel, err)
-		}
-		name, addErr := collector.add(mime, data)
-		if addErr != nil {
-			return "", addErr
-		}
-		return "[attached image: " + name + "]", nil
+	name, addErr := collector.add(mime, data)
+	if addErr != nil {
+		return "", addErr
 	}
-	if rawURL != "" {
-		mime, data, err := fetchRemoteImage(ctx, rawURL)
-		if err != nil {
-			return "", fmt.Errorf("%w: %s (%s): %v", ErrInvalidAttachment, imgLabel, rawURL, err)
-		}
-		name, addErr := collector.add(mime, data)
-		if addErr != nil {
-			return "", addErr
-		}
-		return "[attached image: " + name + "]", nil
-	}
-	return "", fmt.Errorf("%w: missing image data for %s", ErrInvalidAttachment, imgLabel)
+	return "[attached image: " + name + "]", nil
 }
 
 // contentText 将 OpenAI 消息 content 字段快速压平为纯文本，不解码图片字节，供会话键与快速校验使用。
@@ -711,16 +781,42 @@ func contentText(v any) string {
 }
 
 func contentTextWithCollector(ctx context.Context, v any, collector *imageCollector) (string, error) {
+	return contentTextWithCollectorAt(ctx, v, collector, -1)
+}
+
+func contentTextWithCollectorAt(ctx context.Context, v any, collector *imageCollector, msgIdx int) (string, error) {
 	switch c := v.(type) {
 	case string:
 		return c, nil
 	case []any:
 		var b strings.Builder
-		for _, part := range c {
+		for partIdx, part := range c {
 			switch p := part.(type) {
 			case string:
 				b.WriteString(p)
 			case map[string]any:
+				if collector != nil && collector.plan != nil && msgIdx >= 0 {
+					if planned, ok := collector.plan[attachmentPartLoc{msgIdx: msgIdx, partIdx: partIdx}]; ok {
+						if !planned.hasAttachment {
+							b.WriteString(planned.inlineText)
+							continue
+						}
+						if planned.isDocument {
+							name, err := collector.addDocument(planned.title, planned.mimeType, planned.data)
+							if err != nil {
+								return "", err
+							}
+							b.WriteString("[attached document: " + name + "]")
+							continue
+						}
+						name, err := collector.add(planned.mimeType, planned.data)
+						if err != nil {
+							return "", err
+						}
+						b.WriteString("[attached image: " + name + "]")
+						continue
+					}
+				}
 				typ, _ := p["type"].(string)
 				switch typ {
 				case "text", "input_text", "output_text":
@@ -798,9 +894,226 @@ func formatPrompt(msgs []Message) (string, error) {
 	return formatPromptCore(context.Background(), msgs, msgs, nil, false, false)
 }
 
+// findCurrentTurnStart 从消息列表末尾向前定位最后一条 assistant 消息，返回其后的当前最新输入段起始下标。
+// 若历史中尚无 assistant 消息（即单轮请求），返回 0。
+func findCurrentTurnStart(msgs []Message) int {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if strings.EqualFold(strings.TrimSpace(msgs[i].Role), "assistant") {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// planFullTranscriptAttachments 为多轮全量历史重放执行两阶段附件配额规划：
+// 1) 正序严格校验当前最新输入段（currentTurnStart 之后）的全部附件，损坏或超限直接返回 ErrInvalidAttachment；
+// 2) 将剩余上传配额按从近到远（逆序）分配给更早历史轮次的附件；超出配额的旧附件诚实标记为已省略，绝不虚标为 [attached ...]。
+func planFullTranscriptAttachments(ctx context.Context, msgs []Message, currentTurnStart int) (map[attachmentPartLoc]plannedPart, error) {
+	plan := make(map[attachmentPartLoc]plannedPart)
+	selectedHashes := make(map[string]bool)
+	seen := 0
+
+	// 阶段 1：严格校验并全额保留当前最新一轮的附件
+	for i := currentTurnStart; i < len(msgs); i++ {
+		role := strings.ToLower(strings.TrimSpace(msgs[i].Role))
+		if role == "system" || role == "developer" {
+			continue
+		}
+		parts, ok := msgs[i].Content.([]any)
+		if !ok {
+			continue
+		}
+		for partIdx, part := range parts {
+			p, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			loc := attachmentPartLoc{msgIdx: i, partIdx: partIdx}
+			typ, _ := p["type"].(string)
+			switch typ {
+			case "image_url", "input_image", "image":
+				imgIdx := seen + 1
+				mime, data, err := resolveImagePart(ctx, p, fmt.Sprintf("image #%d", imgIdx))
+				if err != nil {
+					return nil, err
+				}
+				seen++
+				sum := sha256.Sum256(data)
+				hashHex := hex.EncodeToString(sum[:])
+				if !selectedHashes[hashHex] {
+					if len(selectedHashes) >= maxImagesPerTurn {
+						return nil, fmt.Errorf("%w: image #%d exceeds the limit of %d attachments per turn", ErrInvalidAttachment, seen, maxImagesPerTurn)
+					}
+					selectedHashes[hashHex] = true
+				}
+				plan[loc] = plannedPart{
+					hasAttachment: true,
+					mimeType:      mime,
+					data:          data,
+				}
+			case "document":
+				docIdx := seen + 1
+				inlineText, title, mime, data, err := resolveDocumentPart(p, fmt.Sprintf("document #%d", docIdx))
+				if err != nil {
+					return nil, err
+				}
+				if inlineText != "" {
+					plan[loc] = plannedPart{inlineText: inlineText}
+					continue
+				}
+				seen++
+				sum := sha256.Sum256(data)
+				hashHex := hex.EncodeToString(sum[:])
+				label := strings.TrimSpace(title)
+				if label == "" {
+					label = fmt.Sprintf("document #%d", seen)
+				}
+				if !selectedHashes[hashHex] {
+					if len(selectedHashes) >= maxImagesPerTurn {
+						return nil, fmt.Errorf("%w: %s exceeds the limit of %d attachments per turn", ErrInvalidAttachment, label, maxImagesPerTurn)
+					}
+					selectedHashes[hashHex] = true
+				}
+				plan[loc] = plannedPart{
+					hasAttachment: true,
+					isDocument:    true,
+					title:         title,
+					mimeType:      mime,
+					data:          data,
+				}
+			case "file":
+				_, hasFile := p["file"]
+				_, hasSrc := p["source"]
+				if !hasFile && !hasSrc {
+					return nil, fmt.Errorf("%w: unsupported file attachment missing data", ErrInvalidAttachment)
+				}
+				docIdx := seen + 1
+				inlineText, title, mime, data, err := resolveDocumentPart(p, fmt.Sprintf("document #%d", docIdx))
+				if err != nil {
+					return nil, err
+				}
+				if inlineText != "" {
+					plan[loc] = plannedPart{inlineText: inlineText}
+					continue
+				}
+				seen++
+				sum := sha256.Sum256(data)
+				hashHex := hex.EncodeToString(sum[:])
+				label := strings.TrimSpace(title)
+				if label == "" {
+					label = fmt.Sprintf("document #%d", seen)
+				}
+				if !selectedHashes[hashHex] {
+					if len(selectedHashes) >= maxImagesPerTurn {
+						return nil, fmt.Errorf("%w: %s exceeds the limit of %d attachments per turn", ErrInvalidAttachment, label, maxImagesPerTurn)
+					}
+					selectedHashes[hashHex] = true
+				}
+				plan[loc] = plannedPart{
+					hasAttachment: true,
+					isDocument:    true,
+					title:         title,
+					mimeType:      mime,
+					data:          data,
+				}
+			}
+		}
+	}
+
+	// 阶段 2：按从近到远逆序分配剩余配额给更早历史轮次的附件；超额或已失效的旧附件诚实标注省略，不阻断整条长会话。
+	for i := currentTurnStart - 1; i >= 0; i-- {
+		role := strings.ToLower(strings.TrimSpace(msgs[i].Role))
+		if role == "system" || role == "developer" {
+			continue
+		}
+		parts, ok := msgs[i].Content.([]any)
+		if !ok {
+			continue
+		}
+		for partIdx := len(parts) - 1; partIdx >= 0; partIdx-- {
+			p, ok := parts[partIdx].(map[string]any)
+			if !ok {
+				continue
+			}
+			loc := attachmentPartLoc{msgIdx: i, partIdx: partIdx}
+			typ, _ := p["type"].(string)
+			switch typ {
+			case "image_url", "input_image", "image":
+				if len(selectedHashes) >= maxImagesPerTurn {
+					plan[loc] = plannedPart{inlineText: "[earlier image omitted]"}
+					continue
+				}
+				mime, data, err := resolveImagePart(ctx, p, fmt.Sprintf("earlier image at msg#%d", i))
+				if err != nil {
+					log.Printf("skipping unavailable historical image at msg#%d part#%d: %v", i, partIdx, err)
+					plan[loc] = plannedPart{inlineText: "[earlier image unavailable]"}
+					continue
+				}
+				sum := sha256.Sum256(data)
+				hashHex := hex.EncodeToString(sum[:])
+				selectedHashes[hashHex] = true
+				plan[loc] = plannedPart{
+					hasAttachment: true,
+					mimeType:      mime,
+					data:          data,
+				}
+			case "document", "file":
+				if typ == "file" {
+					_, hasFile := p["file"]
+					_, hasSrc := p["source"]
+					if !hasFile && !hasSrc {
+						plan[loc] = plannedPart{inlineText: "[earlier file omitted]"}
+						continue
+					}
+				}
+				title, rawURL, _, b64MIME := extractDocumentFields(p)
+				if len(selectedHashes) >= maxImagesPerTurn && !isExplicitTextDocumentSource(rawURL, b64MIME) {
+					plan[loc] = plannedPart{inlineText: formatHistoricalOmittedDoc(title)}
+					continue
+				}
+				inlineText, parsedTitle, mime, data, err := resolveDocumentPart(p, fmt.Sprintf("earlier document at msg#%d", i))
+				if err != nil {
+					log.Printf("skipping unavailable historical document at msg#%d part#%d: %v", i, partIdx, err)
+					plan[loc] = plannedPart{inlineText: formatHistoricalUnavailableDoc(title)}
+					continue
+				}
+				if inlineText != "" {
+					plan[loc] = plannedPart{inlineText: inlineText}
+					continue
+				}
+				sum := sha256.Sum256(data)
+				hashHex := hex.EncodeToString(sum[:])
+				if !selectedHashes[hashHex] && len(selectedHashes) >= maxImagesPerTurn {
+					plan[loc] = plannedPart{inlineText: formatHistoricalOmittedDoc(parsedTitle)}
+					continue
+				}
+				selectedHashes[hashHex] = true
+				plan[loc] = plannedPart{
+					hasAttachment: true,
+					isDocument:    true,
+					title:         parsedTitle,
+					mimeType:      mime,
+					data:          data,
+				}
+			}
+		}
+	}
+
+	return plan, nil
+}
+
 // formatPromptWithImages 在格式化提示词的同时解码并去重所有可上传的图片及文档附件。
+// 当消息跨越多轮历史且需要全量重放时，优先严格校验当前轮全部附件，并将剩余配额按从近到远分配给历史附件，
+// 超额的更早历史附件以诚实省略标记渲染，绝不虚标为已附上。
 func formatPromptWithImages(ctx context.Context, msgs []Message) (string, []ImageAttachment, error) {
 	collector := newImageCollector()
+	if currentTurnStart := findCurrentTurnStart(msgs); currentTurnStart > 0 {
+		plan, err := planFullTranscriptAttachments(ctx, msgs, currentTurnStart)
+		if err != nil {
+			return "", nil, err
+		}
+		collector.plan = plan
+	}
 	prompt, err := formatPromptCore(ctx, msgs, msgs, collector, false, false)
 	if err != nil {
 		return "", nil, err
@@ -928,7 +1241,7 @@ func formatPromptCore(ctx context.Context, allMsgs []Message, msgs []Message, co
 			continue
 		}
 		nonSystemCount++
-		content, cErr := contentTextWithCollector(ctx, m.Content, collector)
+		content, cErr := contentTextWithCollectorAt(ctx, m.Content, collector, i)
 		if cErr != nil {
 			return "", cErr
 		}
