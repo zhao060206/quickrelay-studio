@@ -124,13 +124,33 @@ func isSuggestionModeRequest(req *ChatRequest) bool {
 	return false
 }
 
-// isAuxiliarySideRequest 识别客户端发起的旁路辅助请求（例如携带或未携带 tools 的建议输入、生成会话标题），
+// isTranscriptSideRequest 判断当前请求是否为无工具的 Claude Code / 桌面客户端后台 <transcript> 摘要请求，
+// 使其走独立一次性旁路会话并降为低思考档位，避免污染主会话及浪费高耗时思考额度。
+func isTranscriptSideRequest(req *ChatRequest) bool {
+	if req == nil || len(req.Tools) > 0 || len(req.Functions) > 0 {
+		return false
+	}
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		role := strings.ToLower(strings.TrimSpace(req.Messages[i].Role))
+		if role == "system" || role == "developer" {
+			continue
+		}
+		if role == "" || role == "user" {
+			trimmed := strings.ToLower(strings.TrimSpace(contentText(req.Messages[i].Content)))
+			return strings.HasPrefix(trimmed, "<transcript>")
+		}
+		return false
+	}
+	return false
+}
+
+// isAuxiliarySideRequest 识别客户端发起的旁路辅助请求（例如携带或未携带 tools 的建议输入、生成会话标题或后台 <transcript> 摘要），
 // 使其使用独立一次性会话键与不写库隔离，防止覆盖或污染主编程/文档会话缓存。
 func isAuxiliarySideRequest(req *ChatRequest, prompt string) bool {
 	if req == nil {
 		return false
 	}
-	if isSuggestionModeRequest(req) {
+	if isSuggestionModeRequest(req) || isTranscriptSideRequest(req) {
 		return true
 	}
 	if len(req.Tools) > 0 || len(req.Functions) > 0 {
@@ -359,7 +379,10 @@ var (
 		"subprocess", "os.system", "pip install", "npm ", "npx ", "git ", ">> ", " > ", "tee ",
 	}
 	readonlyRemoteCodeMarkers = []string{
-		".txt", ".pdf", ".png", ".jpg", "open(", "read", "listdir", "glob", "pathlib", "os.walk", "cat ", "head ", "tail ",
+		".txt", ".pdf", ".png", ".jpg", ".md", ".json", ".csv", ".webp", ".gif", ".jpeg",
+		"s3files", "open(", "read", "listdir", "glob", "pathlib", "os.walk",
+		"os.getcwd", "os.path", "os.stat", "linecache", "readlines", "splitlines", "json.load",
+		"cat ", "head ", "tail ", "ls ", "sed ", "awk ", "wc ", "grep ", "rg ",
 	}
 	windowsDrivePathRe = regexp.MustCompile(`(?:^|[^a-z0-9])[a-z]:[\\/]`)
 )
@@ -397,6 +420,17 @@ func argsLookLikeReadonlyAttachmentScript(args string) bool {
 		}
 	}
 	return false
+}
+
+// hasSubstantiveToolArgs 判断工具参数是否已包含实质内容，排除上游在 tool_start/占位帧中发送的空对象 "{}" 或 null。
+func hasSubstantiveToolArgs(args string) bool {
+	trimmed := strings.TrimSpace(args)
+	switch trimmed {
+	case "", "{}", "null", "[]", `""`:
+		return false
+	default:
+		return true
+	}
 }
 
 // argsTargetUserLocalPath 检测远端只读工具参数是否试图探测用户的本地盘符或客户端会话目录。
@@ -445,7 +479,7 @@ func classifyRemoteSandboxTool(name, args string, argsFinal, hasUploadedAttachme
 			if scriptReadCount >= 2 {
 				return true, "remote_read_limit_exceeded", false
 			}
-			if argsFinal && !argsLookLikeReadonlyAttachmentScript(args) {
+			if argsFinal && hasSubstantiveToolArgs(args) && !argsLookLikeReadonlyAttachmentScript(args) {
 				return true, "forbidden_remote_tool", false
 			}
 			return false, "", true

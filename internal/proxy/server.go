@@ -20,7 +20,7 @@ import (
 
 var (
 	sseKeepaliveInterval = 15 * time.Second
-	maxThinkingPrestart  = 20 * time.Second
+	maxThinkingPrestart  = 45 * time.Second
 )
 
 type Server struct {
@@ -214,6 +214,57 @@ func (s *Server) turnTimeoutFor(thinkingEffort string) time.Duration {
 	return base
 }
 
+var (
+	thinkingPrestreamHold     = 40 * time.Second
+	thinkingPrestreamMaxBytes = 8192
+)
+
+// prestreamThinkingBuf 在启用客户端工具桥接且 SSE 尚未发出响应头前暂存思考增量，
+// 防止模型先思考后误调 AWS 云端工具时因流已开始而无法自动纠偏重发。
+type prestreamThinkingBuf struct {
+	mu    sync.Mutex
+	buf   strings.Builder
+	since time.Time
+}
+
+func (b *prestreamThinkingBuf) Add(chunk string, maxBytes int, maxHold time.Duration) (string, bool) {
+	if chunk == "" {
+		return "", false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.buf.Len() == 0 {
+		b.since = time.Now()
+	}
+	b.buf.WriteString(chunk)
+	if (maxBytes > 0 && b.buf.Len() >= maxBytes) || maxHold <= 0 || time.Since(b.since) >= maxHold {
+		out := b.buf.String()
+		b.buf.Reset()
+		b.since = time.Time{}
+		return out, true
+	}
+	return "", false
+}
+
+func (b *prestreamThinkingBuf) Drain() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.buf.Len() == 0 {
+		return ""
+	}
+	out := b.buf.String()
+	b.buf.Reset()
+	b.since = time.Time{}
+	return out
+}
+
+func (b *prestreamThinkingBuf) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
+	b.since = time.Time{}
+}
+
 func startSSEHeartbeat(
 	ctx context.Context,
 	isMaxThinking bool,
@@ -229,7 +280,7 @@ func startSSEHeartbeat(
 	}
 	prestartDelay := maxThinkingPrestart
 	if prestartDelay <= 0 {
-		prestartDelay = 20 * time.Second
+		prestartDelay = 45 * time.Second
 	}
 	tickInterval := interval
 	if isMaxThinking && prestartDelay < tickInterval {
@@ -339,10 +390,17 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 	rawThinkingEffort := resolveThinkingEffort(req, s.cfg.ThinkingEffort)
 	thinkingEffort := rawThinkingEffort
 	isCompact := !isSuggestion && isCompactionRequest(req, prompt)
+	isTranscript := !isSuggestion && isTranscriptSideRequest(req)
 	explicitOff := isExplicitThinkingOff(req)
 	if isSuggestion {
 		if !explicitOff && thinkingEffort != "" && thinkingEffort != "low" {
 			log.Printf("chat %s thinking_guard reason=suggestion_mode_downgrade effort=%q->%q",
+				idPrefix, thinkingEffort, "low")
+			thinkingEffort = "low"
+		}
+	} else if isTranscript {
+		if !explicitOff && thinkingEffort != "" && thinkingEffort != "low" {
+			log.Printf("chat %s thinking_guard reason=transcript_side_downgrade effort=%q->%q",
 				idPrefix, thinkingEffort, "low")
 			thinkingEffort = "low"
 		}
@@ -433,16 +491,16 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		turnGuidelines = fullGuide
 	}
 
-	// 续聊工具表瘦身：同一 thread_id 内只要工具指纹未变且未到 24 轮周期重锚点，
-	// 仅发 ~90 Token 极简提醒，消除每轮重复灌入 ~20,000 Token 工具 Schema 的黑洞。
+	// 续聊工具表瘦身：同一 thread_id 内只要工具指纹未变且未到 16 轮周期重锚点，
+	// 仅发 ~90 Token 极简提醒（附无引号本地工具名清单），消除每轮重复灌入 ~20,000 Token 的黑洞。
 	turnToolProtocol := bridgePrompt
 	toolCompact := false
 	if t.resume && bridgeActive && toolHash != "" {
 		_, prevToolHash := splitBaseHash(conv.baseHash)
 		turnCount := len(nonLeadingMessages(req.Messages)) / 2
-		needPeriodicAnchor := turnCount > 0 && turnCount%24 == 0
+		needPeriodicAnchor := turnCount > 0 && turnCount%16 == 0
 		if prevToolHash == toolHash && !needPeriodicAnchor {
-			turnToolProtocol = buildResumeToolReminder(choiceMode, choiceName, parallelTools)
+			turnToolProtocol = buildResumeToolReminder(choiceMode, choiceName, parallelTools, collectToolNames(req)...)
 			toolCompact = true
 		}
 	}
@@ -738,7 +796,11 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamStarted func() bool, res
 				if swErr := t.switchToFullTranscript(); swErr != nil {
 					return res, swErr
 				}
-				t.in.Prompt += fmt.Sprintf("\n\n[IMPORTANT CORRECTION: Your previous attempt invoked a blocked remote cloud tool (%q) and was terminated. Remote cloud sandbox, web search, download, shell, and file-write tools are strictly disabled. Perform the required action on the user's local machine by emitting <client_tool_call> from <client_tool_protocol> right now, or answer in plain text without invoking remote tools.]", blockedName)
+				toolSummaryHint := ""
+				if toolSummary := formatToolNamesSummary(collectToolNames(t.req), 480); toolSummary != "" {
+					toolSummaryHint = fmt.Sprintf(" Available local tools: %s.", toolSummary)
+				}
+				t.in.Prompt += fmt.Sprintf("\n\n[IMPORTANT CORRECTION: Your previous attempt invoked a blocked remote cloud tool (%q) and was terminated. Remote cloud sandbox, web search, download, shell, and file-write tools are strictly disabled.%s Perform the required action on the user's local machine by emitting <client_tool_call> from <client_tool_protocol> right now, or answer in plain text without invoking remote tools.]", blockedName, toolSummaryHint)
 				t.preferredAccount = acct.ID
 				forceCorrection = true
 				log.Printf("chat %s auto-correcting blocked remote tool %q in fresh thread", t.id, blockedName)
@@ -1040,11 +1102,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		defer writeMu.Unlock()
 		return lastWriteAt
 	}
-	prestartSSE := func() {
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		ensureStartedLocked()
-	}
 	sendKeepalive := func() {
 		writeMu.Lock()
 		defer writeMu.Unlock()
@@ -1069,6 +1126,18 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				"finish_reason": finishReason,
 			}},
 		})
+	}
+	var thinkBuf prestreamThinkingBuf
+	flushPendingThinking := func() {
+		if pending := thinkBuf.Drain(); pending != "" {
+			writeChunk(map[string]any{"reasoning_content": pending}, nil)
+		}
+	}
+	prestartSSE := func() {
+		flushPendingThinking()
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		ensureStartedLocked()
 	}
 	writeStreamError := func(message string) {
 		writePayload(map[string]any{"error": map[string]any{
@@ -1102,6 +1171,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			pendingText.Reset()
 			sawVisibleText = true
 		}
+		flushPendingThinking()
 		writeChunk(map[string]any{"content": chunk}, nil)
 		if getClientWriteErr() == nil {
 			finalOutText.WriteString(chunk)
@@ -1114,6 +1184,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if _, exists := startedTools[ts.ID]; exists {
 			return
 		}
+		flushPendingThinking()
 		idx := emittedToolIdx
 		emittedToolIdx++
 		startedTools[ts.ID] = idx
@@ -1128,6 +1199,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}}}, nil)
 	}
 	emitToolReply := func(tc ToolCallReply) {
+		flushPendingThinking()
 		if idx, ok := startedTools[tc.ID]; ok {
 			delete(startedTools, tc.ID)
 			writeChunk(map[string]any{"tool_calls": []map[string]any{{
@@ -1187,7 +1259,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		switch ev.Type {
 		case "thinking":
 			if ev.Text != "" {
-				writeChunk(map[string]any{"reasoning_content": ev.Text}, nil)
+				if turn.bridgeActive && !isStarted() {
+					if flushed, shouldFlush := thinkBuf.Add(ev.Text, thinkingPrestreamMaxBytes, thinkingPrestreamHold); shouldFlush {
+						writeChunk(map[string]any{"reasoning_content": flushed}, nil)
+					}
+				} else {
+					flushPendingThinking()
+					writeChunk(map[string]any{"reasoning_content": ev.Text}, nil)
+				}
 			}
 		case "text":
 			if ev.Text == "" {
@@ -1212,6 +1291,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}, isStarted, func() {
 		sawVisibleText = false
 		pendingText.Reset()
+		thinkBuf.Reset()
 		finalOutText.Reset()
 		finalOutTools = nil
 		emittedToolIdx = 0
@@ -1299,6 +1379,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	flushPendingThinking()
 	if getClientWriteErr() == nil && turn.ctx.Err() == nil {
 		turn.saveConversation(res, finalOutText.String(), finalOutTools)
 	} else {

@@ -517,7 +517,18 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 		if tc == nil || len(raw) == 0 {
 			return
 		}
-		rawArgs[tc.ID] = rawArgumentText(raw)
+		rawText := rawArgumentText(raw)
+		if !hasSubstantiveToolArgs(rawText) {
+			if hasSubstantiveToolArgs(rawArgs[tc.ID]) {
+				return
+			}
+			if rawArgs[tc.ID] == "" {
+				rawArgs[tc.ID] = rawText
+			}
+			tc.Arguments = normalizeArguments(raw)
+			return
+		}
+		rawArgs[tc.ID] = rawText
 		argsPartial[tc.ID] = false
 		tc.Arguments = normalizeArguments(raw)
 	}
@@ -941,7 +952,7 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 			}
 			tc := getTool(id, p.ToolName)
 			setToolArgs(tc, p.Arguments)
-			argsFinal := env.Type != "tool_start" || len(p.Arguments) > 0
+			argsFinal := env.Type != "tool_start" || hasSubstantiveToolArgs(rawArgs[tc.ID])
 			if bErr := checkNativeTool(tc, argsFinal); bErr != nil {
 				res, _ := finish()
 				return res, bErr
@@ -1272,8 +1283,8 @@ func renderTurnTextForMode(workMode, guidelines, toolProtocol, legacySystem, pro
 }
 
 // prepareFrameWithinBudget 在不超过上游 64 KB 帧限制的前提下尽量保留完整上下文，并严格优先保护 <client_tool_protocol>：
-// 1) 长对话正文优先上传为 prompt-<id8>.txt；
-// 2) 若仍超限则先压缩 <app-context> 中的冗长技能列表；
+// 1) 优先压缩 <app-context> 中的冗长技能列表（常规 -> 纯索引），尽量零附件塞入单帧以防诱发云端沙箱工具；
+// 2) 若仍超限且正文较长，再将对话正文外置为 prompt-<id8>.txt；
 // 3) 仍超限则将完整原始工作区规范上传为 guidelines-<id8>.txt，主帧内仅保留短指引 + 完整工具协议（document 模式下跳过外置，直接精简内联以防风控）。
 func prepareFrameWithinBudget(
 	payload map[string]any,
@@ -1319,24 +1330,7 @@ func prepareFrameWithinBudgetWithMode(
 	curGuidelines := rawGuidelines
 	curPrompt := prompt
 
-	// 第一步：对话历史/正文较长时优先外置为 prompt-<id8>.txt，同时主帧内联最新提问预览。
-	if shouldAttachPrompt(len(curPrompt)) {
-		if att, err := attachFn(attachmentPromptName(messageID), []byte(curPrompt)); err == nil && att.Path != "" {
-			shortText := attachmentShortTextWithLatest(att.Name, latestUser)
-			if len(failedImgs) > 0 {
-				shortText += "\n\n[Note: failed to upload image attachment(s): " + strings.Join(failedImgs, "; ") + "]"
-			}
-			curPrompt = shortText
-			attachments = append(attachments, fileAttachmentMeta(att, attachmentMimeType))
-			payload["attachments"] = attachments
-			payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
-		}
-	}
-	if fits() {
-		return
-	}
-
-	// 第二步：依次尝试常规技能压缩与二档纯索引压缩，尽量单帧塞入而不触发规范外置附件。
+	// 第一步（零附件优先）：先尝试常规技能压缩与二档纯索引压缩，若能塞入 64KB 主帧则不上传任何文本附件。
 	if curGuidelines != "" {
 		if compacted := compactSkillsSection(curGuidelines); len(compacted) < len(curGuidelines) {
 			curGuidelines = compacted
@@ -1349,6 +1343,23 @@ func prepareFrameWithinBudgetWithMode(
 	if rawGuidelines != "" {
 		if indexed := compactSkillsIndexOnly(rawGuidelines); len(indexed) < len(curGuidelines) {
 			curGuidelines = indexed
+			payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
+		}
+	}
+	if fits() {
+		return
+	}
+
+	// 第二步：压缩技能后仍超限且对话历史/正文较长时，外置为 prompt-<id8>.txt 并在主帧内联最新提问预览。
+	if shouldAttachPrompt(len(curPrompt)) {
+		if att, err := attachFn(attachmentPromptName(messageID), []byte(curPrompt)); err == nil && att.Path != "" {
+			shortText := attachmentShortTextWithLatest(att.Name, latestUser)
+			if len(failedImgs) > 0 {
+				shortText += "\n\n[Note: failed to upload image attachment(s): " + strings.Join(failedImgs, "; ") + "]"
+			}
+			curPrompt = shortText
+			attachments = append(attachments, fileAttachmentMeta(att, attachmentMimeType))
+			payload["attachments"] = attachments
 			payload["text"] = renderTurnTextForMode(workMode, curGuidelines, toolProtocol, legacySystem, curPrompt)
 		}
 	}

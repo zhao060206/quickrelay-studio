@@ -1,15 +1,15 @@
 {
-  "version": "2.4.7",
-  "tag": "v2.4.7",
-  "published_at": "2026-11-26T03:58:25Z",
-  "release_notes": "QuickRelay Studio v2.4.7 更新内容：\n1. 升级「防云端沙箱越权空转」为四级参数意图审计，彻底消除误杀循环：\n   - 精准识别 AWS Quick 官方容器查看外置上传大附件（prompt-*.txt / guidelines-*.txt / 图片与文档）所需的只读工具：放行 ripgrep / fdfind / read_file 等只读工具（有附件最多 6 次、续聊最多 2 次）及纯只读切片型 run_python（有附件最多 2 次），彻底终结重建上传附件时的 ripgrep / run_python 误杀死循环；\n   - 始终对 web_search / download / write_file / quick_space、流式 tool_progress 中途出现的联网/下载/写文件/媒体渲染/子进程动作、以及探测用户本机盘符（如 E:\\... / /sessions/...）的路径保持 0 容忍立即拦截；\n   - 新增单次 45 秒与单轮累计 90 秒原生工具硬超时强制断开机制，防止任何读工具循环挂起；优化拦截报错信息并保留开流前无损自动纠偏切回 <client_tool_call>。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.7",
+  "version": "2.4.8",
+  "tag": "v2.4.8",
+  "published_at": "2026-11-26T05:32:00Z",
+  "release_notes": "QuickRelay Studio v2.4.8 更新内容：\n1. Claude Code 稳定性深度加固与框架层减负：\n   - 新增工具定义分级无损语义瘦身（>16KB / >26KB 自动剥离冗长 <example> 与冗余元字段，完整保留工具名、参数键、required 与 enum 约束）及零附件优先 64KB 帧预算重排，显著减少触发云端沙箱的概率；\n   - 续聊工具极简提醒与拦截纠偏指令均附带无引号本地工具名清单，完整工具协议周期重锚缩短至 16 轮；\n2. 思考开流前缓冲窗与空参 tool_start 误杀修复：\n   - 启用客户端工具桥接时，SSE 尚未开流前的思考增量先缓冲 40s / 8192 字节（首包预热延迟同步调至 45s），消除模型深思后误调远端工具因流已开启无法纠偏的问题；\n   - 修复上游 tool_start(run_python) 携带空对象 \"{}\" / null 占位帧被误判为完整参数而提前误杀只读切片的问题，并补充 os.getcwd / os.path 等安全只读词表；\n3. 修复流式多段 text block 会话指纹漂移，并自动隔离降档无工具 <transcript> 后台摘要请求。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.8",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.4.7-win-x64.zip",
-      "size": 8659790,
-      "sha256": "d79182749e7e3fc29853b6605e3d782d3d9f01fdf66cc8668d5cb04e375d752b",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.7/QuickRelay-Studio-v2.4.7-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.4.8-win-x64.zip",
+      "size": 8697368,
+      "sha256": "e803d7a39d9b38e7b9aabfb457bc70a52796a73b1a2fe2ea382ecd1b23fb3648",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.8/QuickRelay-Studio-v2.4.8-win-x64.zip"
     }
   }
 }

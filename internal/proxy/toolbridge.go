@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"quickrelay-studio/internal/config"
 )
@@ -97,18 +98,162 @@ func forwardToolDefinitions(req *ChatRequest) string {
 	return forwardToolDefinitionsForMode(req, config.WorkModeGeneral)
 }
 
+const (
+	toolDefsCompactThresholdBytes    = 16 * 1024
+	toolDefsAggressiveThresholdBytes = 26 * 1024
+)
+
+var (
+	reToolExampleBlocks = regexp.MustCompile(`(?is)<(?:examples?|usage)>\s*.*?\s*</(?:examples?|usage)>`)
+	reToolCodeFence     = regexp.MustCompile("(?s)```.*?```")
+)
+
+// collectToolNames 按调用方声明顺序返回去重后的工具名称列表。
+func collectToolNames(req *ChatRequest) []string {
+	if req == nil {
+		return nil
+	}
+	defs := collectToolDefinitions(req.Tools, req.Functions)
+	if len(defs) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(defs))
+	for _, d := range defs {
+		names = append(names, d.Name)
+	}
+	return names
+}
+
+// formatToolNamesSummary 生成无引号的逗号分隔工具名摘要，超过字节上限时按工具边界截断并附带剩余数量。
+func formatToolNamesSummary(names []string, maxBytes int) string {
+	if len(names) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	included := 0
+	for i, name := range names {
+		sep := ""
+		if included > 0 {
+			sep = ", "
+		}
+		if maxBytes > 0 && b.Len() > 0 {
+			remaining := len(names) - i
+			suffix := fmt.Sprintf(" (+%d more)", remaining)
+			if b.Len()+len(sep)+len(name)+len(suffix) > maxBytes {
+				b.WriteString(suffix)
+				return b.String()
+			}
+		}
+		b.WriteString(sep)
+		b.WriteString(name)
+		included++
+	}
+	return b.String()
+}
+
+// compactToolDescription 移除工具说明中的长示例与代码块并按 UTF-8 rune 上限精简，保留核心用途语义。
+func compactToolDescription(raw string, maxRunes int) string {
+	cleaned := reToolExampleBlocks.ReplaceAllString(raw, " ")
+	cleaned = reToolCodeFence.ReplaceAllString(cleaned, " ")
+	cleaned = strings.Join(strings.Fields(cleaned), " ")
+	if cleaned == "" || maxRunes <= 0 {
+		return cleaned
+	}
+	if utf8.RuneCountInString(cleaned) <= maxRunes {
+		return cleaned
+	}
+	for _, sep := range []string{"。", ". "} {
+		if idx := strings.Index(cleaned, sep); idx > 0 {
+			firstSentence := strings.TrimSpace(cleaned[:idx+len(sep)])
+			if n := utf8.RuneCountInString(firstSentence); n >= 16 && n <= maxRunes {
+				return firstSentence
+			}
+			break
+		}
+	}
+	runes := []rune(cleaned)
+	if maxRunes <= 3 {
+		return string(runes[:maxRunes])
+	}
+	return strings.TrimSpace(string(runes[:maxRunes-3])) + "..."
+}
+
+// compactToolSchema 深拷贝 JSON Schema，仅剥离冗余元字段并精简说明文本，完整保留参数键名、required 与枚举约束。
+func compactToolSchema(v any, maxParamDescRunes int) any {
+	switch x := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, val := range x {
+			if k == "$schema" || k == "title" {
+				continue
+			}
+			if k == "additionalProperties" {
+				if b, ok := val.(bool); ok && !b {
+					continue
+				}
+			}
+			if k == "description" {
+				if s, ok := val.(string); ok {
+					short := compactToolDescription(s, maxParamDescRunes)
+					if short == "" {
+						continue
+					}
+					out[k] = short
+					continue
+				}
+			}
+			out[k] = compactToolSchema(val, maxParamDescRunes)
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i, item := range x {
+			out[i] = compactToolSchema(item, maxParamDescRunes)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// compactToolDefinitions 返回对工具说明与参数 Schema 精简后的全新切片，不修改调用方原始结构体与 map。
+func compactToolDefinitions(defs []toolDefinition, maxToolDescRunes, maxParamDescRunes int) []toolDefinition {
+	out := make([]toolDefinition, len(defs))
+	for i, d := range defs {
+		out[i] = toolDefinition{
+			Name:        d.Name,
+			Description: compactToolDescription(d.Description, maxToolDescRunes),
+			Parameters:  compactToolSchema(d.Parameters, maxParamDescRunes),
+		}
+	}
+	return out
+}
+
 func forwardToolDefinitionsForMode(req *ChatRequest, workMode string) string {
 	defs := collectToolDefinitions(req.Tools, req.Functions)
 	if len(defs) == 0 {
 		return ""
 	}
-	payload := map[string]any{"tools": defs}
-	if req.ToolChoice != nil {
-		payload["tool_choice"] = req.ToolChoice
+	marshalDefs := func(list []toolDefinition) ([]byte, error) {
+		payload := map[string]any{"tools": list}
+		if req.ToolChoice != nil {
+			payload["tool_choice"] = req.ToolChoice
+		}
+		return json.Marshal(payload)
 	}
-	body, err := json.Marshal(payload)
+	body, err := marshalDefs(defs)
 	if err != nil {
 		return ""
+	}
+	if len(body) > toolDefsCompactThresholdBytes {
+		if compacted, cErr := marshalDefs(compactToolDefinitions(defs, 160, 80)); cErr == nil && len(compacted) < len(body) {
+			body = compacted
+		}
+	}
+	if len(body) > toolDefsAggressiveThresholdBytes {
+		if compacted, cErr := marshalDefs(compactToolDefinitions(defs, 72, 32)); cErr == nil && len(compacted) < len(body) {
+			body = compacted
+		}
 	}
 	prefix := "Workspace actions available via the user's local client:\n"
 	if config.NormalizeWorkMode(workMode) == config.WorkModeDocument {
@@ -204,11 +349,16 @@ func toolProtocolFingerprint(req *ChatRequest, mode, name string, parallel bool)
 }
 
 // buildResumeToolReminder 为复用已有 thread_id 且工具定义未变的续聊轮次生成极简协议提醒，
-// 避免每轮重复注入约 20,000 Token 的工具 JSON 定义导致 KV Cache 与上下文额度迅速耗尽。
-func buildResumeToolReminder(mode, name string, parallel bool) string {
+// 附带无引号的本地工具名清单以防止长对话中身份与工具名遗忘，同时避免每轮重发 ~20,000 Token 的完整 JSON Schema。
+func buildResumeToolReminder(mode, name string, parallel bool, toolNames ...string) string {
 	var b strings.Builder
 	b.WriteString("<client_tool_protocol>\n")
 	b.WriteString("Continue using the client tool definitions and schemas already established earlier in this session.\n")
+	if summary := formatToolNamesSummary(toolNames, 480); summary != "" {
+		b.WriteString("- Active local tools: ")
+		b.WriteString(summary)
+		b.WriteString(" (invoke ONLY these via <client_tool_call>).\n")
+	}
 	b.WriteString(`Format: emit <client_tool_call>{"name":"TOOL_NAME","arguments":{...}}</client_tool_call> with no code fences, or answer normally in plain text if no action is needed.`)
 	if parallel {
 		b.WriteString("\n- Multiple independent actions may be emitted sequentially in one turn.")

@@ -1,4 +1,4 @@
-# QuickRelay Studio v2.4.7
+# QuickRelay Studio v2.4.8
 
 **QuickRelay Studio** 是一款基于 Go 与 WebView2 桌面端打造的独立双协议 AI 反代网关与账号池管理控制台。支持将多个 AWS Quick 账号聚合为标准的 **OpenAI** 与 **Anthropic Messages** API，免改造直连 **Claude Code**、**Codex CLI** 及各类开源 SDK，并内置完整的请求明细统计与 1M 上下文持久化会话追踪。
 
@@ -20,9 +20,11 @@
      - 流式 `<client_tool_call>` 刚吐出工具名即实时闭合 `thinking`/`text` 并早启 `tool_use` / `tool_calls` 块，消除大工具参数写入期间长时间零帧输出导致的 180 秒假死断流；
      - 当请求携带 `max` / `xhigh` 思考强度时，自动将单轮总超时由常规 `request_timeout`（默认 `15m`）拉长至 `max_thinking_timeout`（默认 `30m`），上游 WebSocket 静默读超时由 `2m` 扩至 `5m`；
      - `high`/`max`/附件请求仅在 WebSocket 握手建连成功并已发送 `user_message` 进入等待模型响应阶段后，超过 `20s` 才触发首包 SSE 预热（`event: ping` / `: keepalive`），并将拨号握手超时收敛为 `12s`，彻底解除拨号与预热同在 `20s` 撞车导致的流式自动重试锁死（v2.4.2 修复）；
-   - **Claude Code 专属优化**：
-     - 直连 `/v1/messages` 免除额外适配开销；
-     - `claude-haiku-*` 轻量模型自动分流至 `fast`，其余 `sonnet`/`opus` 走 `smart`；
+   - **Claude Code 专属优化与稳定性深度加固（v2.4.8 重磅升级）**：
+     - 直连 `/v1/messages` 免除额外适配开销；`claude-haiku-*` 轻量模型自动分流至 `fast`，其余 `sonnet`/`opus` 走 `smart`；
+     - **大工具表分级无损语义瘦身与零附件优先帧重排（v2.4.8 新增）**：工具 JSON 超过 `16 KB / 26 KB` 时自动剥离 `<example>` / `<usage>` 与冗余元字段，完整保留工具名、参数键、`required` 与 `enum` 约束；`64 KB` 帧预算优先压缩技能列表以尽量零附件入帧，显著减少触发 AWS 云端沙箱的概率；
+     - **思考开流前缓冲窗与纠偏重锚强化（v2.4.8 新增）**：启用客户端工具桥接且 SSE 未开流前暂存 `thinking_delta`（缓冲窗 `40s` / `8192` 字节，首包预热延迟 `45s`），消除模型深思后误调远端工具因流已启动无法纠偏的问题；拦截纠偏提示与续聊极简提醒同步携带无引号可用本地工具名清单，完整工具表重锚周期缩短至 `16` 轮；
+     - **修复空参 `tool_start` 误杀只读 `run_python` 与 `<transcript>` 旁路隔离（v2.4.8 新增）**：带上传附件时放行仅含 `{}` / `null` 占位的 `tool_start` 等待真实代码审计（并补充 `os.getcwd` / `os.path` 等安全只读词）；同步修复流式多段 `text` block 回传时的会话指纹漂移，并隔离降档无工具 `<transcript>` 后台摘要请求；
      - 当请求携带 `AskUserQuestion` 工具时，自动将模型输出的 `<decision>` / `<decisions>` 交互标签转为标准原生 `tool_use` 卡片选项；
      - **全量 AWS Quick 私有标签静默清洗（v2.4.1 增强）**：在流式与非流式输出中自动清除 `<sources>` 来源引用块、`[@xxxxxx, @yyyyyy]` 多引用角标、`kg://`/`qw-file://`/`qw-tool://`/`mention://` 私有死链、`<artifact>` 工件占位及内部路由控制标记（同时 100% 保护代码块与行内反引号）。
 

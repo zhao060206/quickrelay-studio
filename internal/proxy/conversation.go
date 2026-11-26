@@ -91,10 +91,11 @@ func canonicalToolArgs(raw string) string {
 // assistantOutputFingerprint 基于最终对外输出的可见文本与结构化工具调用（按顺序）生成确定性 SHA-256 指纹，
 // 不依赖思考文本或界面字段，也不持久化原始回复正文。
 func assistantOutputFingerprint(text string, toolCalls []ToolCall) string {
+	normText := strings.TrimSpace(strings.ReplaceAll(text, "\r\n", "\n"))
 	h := sha256.New()
 	h.Write([]byte("asst:v1"))
 	h.Write([]byte{0})
-	h.Write([]byte(strings.TrimSpace(text)))
+	h.Write([]byte(normText))
 	for _, tc := range toolCalls {
 		h.Write([]byte{0})
 		h.Write([]byte(strings.TrimSpace(tc.ID)))

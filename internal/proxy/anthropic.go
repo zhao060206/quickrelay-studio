@@ -754,7 +754,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		openType = ""
 		openIdx = -1
 	}
-	emitThinking := func(chunk string) {
+	emitThinkingNow := func(chunk string) {
 		if chunk == "" {
 			return
 		}
@@ -782,10 +782,29 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			},
 		})
 	}
+	var thinkBuf prestreamThinkingBuf
+	flushPendingThinking := func() {
+		if pending := thinkBuf.Drain(); pending != "" {
+			emitThinkingNow(pending)
+		}
+	}
+	emitThinking := func(chunk string) {
+		if chunk == "" {
+			return
+		}
+		if turn.bridgeActive && !isStarted() {
+			if flushed, shouldFlush := thinkBuf.Add(chunk, thinkingPrestreamMaxBytes, thinkingPrestreamHold); shouldFlush {
+				emitThinkingNow(flushed)
+			}
+			return
+		}
+		flushPendingThinking()
+		emitThinkingNow(chunk)
+	}
 
 	sawVisibleText := false
 	var pendingText strings.Builder
-	var finalOutText strings.Builder
+	var finalOutTextBlocks []string
 	var finalOutTools []ToolCall
 	emittedTools := 0
 
@@ -802,6 +821,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			pendingText.Reset()
 			sawVisibleText = true
 		}
+		flushPendingThinking()
 		ensureStarted()
 		if openType != "text" {
 			closeOpenBlock()
@@ -816,6 +836,9 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 					"text": "",
 				},
 			})
+			finalOutTextBlocks = append(finalOutTextBlocks, "")
+		} else if len(finalOutTextBlocks) == 0 {
+			finalOutTextBlocks = append(finalOutTextBlocks, "")
 		}
 		writeEvent("content_block_delta", map[string]any{
 			"type":  "content_block_delta",
@@ -826,7 +849,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			},
 		})
 		if getClientWriteErr() == nil {
-			finalOutText.WriteString(chunk)
+			finalOutTextBlocks[len(finalOutTextBlocks)-1] += chunk
 		}
 	}
 	emitToolStart := func(ts ToolCallStart) {
@@ -836,6 +859,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		if _, exists := startedToolIdx[ts.ID]; exists {
 			return
 		}
+		flushPendingThinking()
 		ensureStarted()
 		closeOpenBlock()
 		idx := nextBlockIdx
@@ -853,6 +877,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		})
 	}
 	emitToolReply := func(tc ToolCallReply) {
+		flushPendingThinking()
 		idx, alreadyStarted := startedToolIdx[tc.ID]
 		if alreadyStarted {
 			delete(startedToolIdx, tc.ID)
@@ -918,12 +943,16 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	prestartAnthropic := func() {
+		flushPendingThinking()
+		ensureStarted()
+	}
 	stopHB := startSSEHeartbeat(
 		turn.ctx,
 		turn.needsThinkingHeartbeat(),
 		isStarted,
 		turn.upstreamWaitingSince,
-		ensureStarted,
+		prestartAnthropic,
 		sendAnthropicPing,
 		lastWrite,
 	)
@@ -956,7 +985,8 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	}, isStarted, func() {
 		sawVisibleText = false
 		pendingText.Reset()
-		finalOutText.Reset()
+		thinkBuf.Reset()
+		finalOutTextBlocks = nil
 		finalOutTools = nil
 		emittedTools = 0
 		nextBlockIdx = 0
@@ -1050,10 +1080,11 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	flushPendingThinking()
 	ensureStarted()
 	closeOpenBlock()
 	if getClientWriteErr() == nil && turn.ctx.Err() == nil {
-		turn.saveConversation(res, finalOutText.String(), finalOutTools)
+		turn.saveConversation(res, strings.Join(finalOutTextBlocks, "\n"), finalOutTools)
 	} else {
 		errOut := getClientWriteErr()
 		if errOut == nil {
