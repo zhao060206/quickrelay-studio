@@ -1423,3 +1423,226 @@ func TestImprovement_FullTranscriptHistoricalAttachmentBudget(t *testing.T) {
 		}
 	})
 }
+
+// TestImprovement_SuggestionModeWithToolsDoesNotPolluteMainThread 复现线上事故 #1041 -> #1042 -> #1043：
+// 验证 Claude Code 携带全量 tools 与主历史发送的后台 [SUGGESTION MODE: ...] 请求（即使带 X-Conversation-Id、且分别经历中途取消与正常完成）
+// 绝对不会注入或覆盖主对话云端 thread_id，且会执行无工具协议、low 思考与历史窗口瘦身；随后用户的真实回复仍精准命中原主线程增量复用。
+func TestImprovement_SuggestionModeWithToolsDoesNotPolluteMainThread(t *testing.T) {
+	type wsTurn struct {
+		hasCreate      bool
+		hasDelete      bool
+		threadID       string
+		text           string
+		thinkingEffort string
+	}
+	var turns []wsTurn
+	var mu sync.Mutex
+	var seq atomic.Int32
+	var holdNext atomic.Bool
+	sugStarted := make(chan struct{}, 4)
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	wsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var idx int
+		hasCreate := false
+		for {
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			mType, payload, ok := decodeClientFrame(raw)
+			if !ok {
+				continue
+			}
+			switch mType {
+			case "session_create":
+				hasCreate = true
+			case "session_delete":
+				mu.Lock()
+				if idx > 0 && idx <= len(turns) {
+					turns[idx-1].hasDelete = true
+				}
+				mu.Unlock()
+			case "user_message":
+				tid, _ := payload["thread_id"].(string)
+				text, _ := payload["text"].(string)
+				eff, _ := payload["thinking_effort"].(string)
+				mu.Lock()
+				turns = append(turns, wsTurn{
+					hasCreate:      hasCreate,
+					threadID:       tid,
+					text:           text,
+					thinkingEffort: eff,
+				})
+				idx = len(turns)
+				mu.Unlock()
+
+				n := seq.Add(1)
+				if holdNext.CompareAndSwap(true, false) {
+					sugStarted <- struct{}{}
+					// 等待客户端主动取消（模拟 #1042 context canceled）
+					time.Sleep(300 * time.Millisecond)
+					return
+				}
+				writeEv := func(v any) {
+					_ = conn.WriteMessage(websocket.BinaryMessage, encodeMockAIDPServerEvent(v))
+				}
+				reply := fmt.Sprintf("reply-%d", n)
+				if n == 1 {
+					reply = "要我起草发给 GPT 和 Gemini 的同步 main 通知吗？"
+				} else if n == 3 {
+					reply = "这是完整的同步 main 通知正文，已按主对话上下文正常生成。"
+				} else if n == 4 {
+					reply = "起草通知" // 第 2 个完成的建议请求响应
+				}
+				writeEv(map[string]any{"type": "message_start", "payload": map[string]any{"message_id": fmt.Sprintf("m%d", n)}})
+				writeEv(map[string]any{"type": "text_delta", "payload": map[string]any{"delta": reply}})
+				writeEv(map[string]any{"type": "message_complete", "payload": map[string]any{"continuation_expected": false}})
+				writeEv(map[string]any{"type": "turn_completed", "payload": map[string]any{}})
+			}
+		}
+	}))
+	defer wsSrv.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "sug_iso.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+	if err := st.Save(context.Background(), &store.Account{
+		Email: "sug@example.com", Provider: "social",
+		WSHost: "ws://" + strings.TrimPrefix(wsSrv.URL, "http://"), WSPath: "/ws",
+		AccessToken: "jwt-sug", ActorARN: "arn:aws:quick:us-east-1:sug", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	}); err != nil {
+		t.Fatalf("st.Save: %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.SessionReuse = true
+	srv := NewServer(&cfg, accounts.New(st, &cfg))
+	httpSrv := httptest.NewServer(srv.Handler())
+	defer httpSrv.Close()
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}}
+
+	tools := []map[string]any{{
+		"name": "Bash", "description": "run shell", "input_schema": map[string]any{"type": "object"},
+	}}
+	sendMsg := func(ctx context.Context, msgs []map[string]any, cid string) (int, string, error) {
+		b, _ := json.Marshal(map[string]any{
+			"model": "claude-opus-5", "max_tokens": 256, "stream": false,
+			"thinking": map[string]any{"type": "enabled", "budget_tokens": 32000}, // high
+			"tools":    tools,
+			"messages": msgs,
+		})
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, httpSrv.URL+"/v1/messages", bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		if cid != "" {
+			req.Header.Set("X-Conversation-Id", cid)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, "", err
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(raw), nil
+	}
+
+	// 1. 主对话建链 (#1041)，包含一条早期标记消息用于测试建议窗口裁剪
+	mainMsgs1 := []map[string]any{
+		{"role": "user", "content": "EARLY_ANCESTOR_MARKER 授权你合入"},
+	}
+	for i := 0; i < 4; i++ {
+		mainMsgs1 = append(mainMsgs1,
+			map[string]any{"role": "assistant", "content": fmt.Sprintf("中间步骤-%d", i)},
+			map[string]any{"role": "user", "content": fmt.Sprintf("继续步骤-%d", i)},
+		)
+	}
+	code1, body1, err := sendMsg(context.Background(), mainMsgs1, "main-conv-cid")
+	if err != nil || code1 != http.StatusOK {
+		t.Fatalf("main round 1 failed: code=%d err=%v body=%s", code1, err, body1)
+	}
+
+	mu.Lock()
+	mainTID := turns[0].threadID
+	if !turns[0].hasCreate || mainTID == "" {
+		mu.Unlock()
+		t.Fatalf("expected main round 1 session_create, got %+v", turns[0])
+	}
+	mu.Unlock()
+
+	// 构建主对话后续历史
+	mainHistoryAfter1 := append(append([]map[string]any(nil), mainMsgs1...),
+		map[string]any{"role": "assistant", "content": "要我起草发给 GPT 和 Gemini 的同步 main 通知吗？"},
+	)
+
+	// 2. 带全量 tools + 主历史 + X-Conversation-Id 的 SUGGESTION MODE 请求，中途被用户操作取消 (#1042)
+	sugMsgs := append(append([]map[string]any(nil), mainHistoryAfter1...),
+		map[string]any{"role": "user", "content": "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]"},
+	)
+	holdNext.Store(true)
+	ctxCancel, cancel := context.WithCancel(context.Background())
+	sugDone := make(chan error, 1)
+	go func() {
+		_, _, e := sendMsg(ctxCancel, sugMsgs, "main-conv-cid")
+		sugDone <- e
+	}()
+	<-sugStarted
+	cancel()
+	<-sugDone
+
+	// 3. 用户紧接着发 "起草通知" (#1043) -> 必须仍然精准命中主线程 mainTID，未受 #1042 污染！
+	mainMsgs2 := append(append([]map[string]any(nil), mainHistoryAfter1...),
+		map[string]any{"role": "user", "content": "起草通知"},
+	)
+	code3, body3, err := sendMsg(context.Background(), mainMsgs2, "main-conv-cid")
+	if err != nil || code3 != http.StatusOK || !strings.Contains(body3, "同步 main 通知正文") {
+		t.Fatalf("main round 2 failed: code=%d err=%v body=%s", code3, err, body3)
+	}
+
+	// 4. 再发一次正常完成（不被取消）的带 tools SUGGESTION MODE 请求，验证用完即删且不覆盖主会话数据库映射
+	mainMsgsAfter3 := append(append([]map[string]any(nil), mainMsgs2...),
+		map[string]any{"role": "assistant", "content": "这是完整的同步 main 通知正文，已按主对话上下文正常生成。"},
+	)
+	sugMsgsCompleted := append(append([]map[string]any(nil), mainMsgsAfter3...),
+		map[string]any{"role": "user", "content": "[SUGGESTION MODE: Suggest next user input]"},
+	)
+	code4, body4, err := sendMsg(context.Background(), sugMsgsCompleted, "main-conv-cid")
+	if err != nil || code4 != http.StatusOK {
+		t.Fatalf("completed suggestion request failed: code=%d err=%v body=%s", code4, err, body4)
+	}
+
+	rec, err := st.GetConversation(context.Background(), "h:main-conv-cid")
+	if err != nil || rec == nil || rec.ThreadID != mainTID {
+		t.Fatalf("expected main conversation mapping preserved at %q, got %+v err=%v", mainTID, rec, err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(turns) != 4 {
+		t.Fatalf("expected 4 upstream turns, got %d", len(turns))
+	}
+	sugCancelTurn := turns[1]
+	if !sugCancelTurn.hasCreate || sugCancelTurn.threadID == mainTID {
+		t.Fatalf("canceled suggestion polluted main thread %q! got create=%t tid=%q", mainTID, sugCancelTurn.hasCreate, sugCancelTurn.threadID)
+	}
+	if strings.Contains(sugCancelTurn.text, "<client_tool_protocol>") || sugCancelTurn.thinkingEffort != "low" || strings.Contains(sugCancelTurn.text, "EARLY_ANCESTOR_MARKER") {
+		t.Fatalf("suggestion turn was not slimmed properly: eff=%q text=%s", sugCancelTurn.thinkingEffort, sugCancelTurn.text)
+	}
+
+	mainResumeTurn := turns[2]
+	if mainResumeTurn.hasCreate || mainResumeTurn.threadID != mainTID {
+		t.Fatalf("expected main turn #3 to reuse clean main thread %q, got create=%t tid=%q", mainTID, mainResumeTurn.hasCreate, mainResumeTurn.threadID)
+	}
+
+	sugCompleteTurn := turns[3]
+	if !sugCompleteTurn.hasCreate || !sugCompleteTurn.hasDelete || sugCompleteTurn.threadID == mainTID {
+		t.Fatalf("completed suggestion should create & delete its own isolated thread, got %+v", sugCompleteTurn)
+	}
+}

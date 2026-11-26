@@ -104,38 +104,139 @@ func applyThinkingGuards(effort string, explicitOff bool, isCompact bool, bridge
 	return effort, ""
 }
 
-// isAuxiliarySideRequest 识别客户端发起的无工具旁路辅助请求（例如建议输入、生成会话标题），
-// 使其使用独立一次性会话键与不写库隔离，防止覆盖或污染主编程/文档会话缓存。
-func isAuxiliarySideRequest(req *ChatRequest, prompt string) bool {
-	if req == nil || len(req.Tools) > 0 || len(req.Functions) > 0 {
+// isSuggestionModeRequest 判断当前请求是否为 Claude Code 发起的输入框下一步建议旁路请求。
+// 即使请求为复用缓存而携带全量 tools 与长对话历史，只要最后一条有效用户消息以 "[suggestion mode:" 开头即返回 true。
+func isSuggestionModeRequest(req *ChatRequest) bool {
+	if req == nil {
 		return false
 	}
-	var parts []string
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		role := strings.ToLower(strings.TrimSpace(req.Messages[i].Role))
+		if role == "system" || role == "developer" {
+			continue
+		}
+		if role == "" || role == "user" {
+			trimmed := strings.ToLower(strings.TrimSpace(contentText(req.Messages[i].Content)))
+			return strings.HasPrefix(trimmed, "[suggestion mode:")
+		}
+		return false
+	}
+	return false
+}
+
+// isAuxiliarySideRequest 识别客户端发起的旁路辅助请求（例如携带或未携带 tools 的建议输入、生成会话标题），
+// 使其使用独立一次性会话键与不写库隔离，防止覆盖或污染主编程/文档会话缓存。
+func isAuxiliarySideRequest(req *ChatRequest, prompt string) bool {
+	if req == nil {
+		return false
+	}
+	if isSuggestionModeRequest(req) {
+		return true
+	}
+	if len(req.Tools) > 0 || len(req.Functions) > 0 {
+		return false
+	}
+	var candidates []string
+	var userTexts []string
 	for _, m := range req.Messages {
-		if text := strings.TrimSpace(contentText(m.Content)); text != "" {
-			if len(text) > 1024 {
-				text = text[:1024]
-			}
-			parts = append(parts, text)
+		role := strings.ToLower(strings.TrimSpace(m.Role))
+		text := strings.TrimSpace(contentText(m.Content))
+		if text == "" {
+			continue
+		}
+		if len(text) > 1024 {
+			text = text[:1024]
+		}
+		if role == "system" || role == "developer" {
+			candidates = append(candidates, text)
+		} else if role == "" || role == "user" {
+			userTexts = append(userTexts, text)
 		}
 	}
+	if len(userTexts) > 2 {
+		userTexts = userTexts[len(userTexts)-2:]
+	}
+	candidates = append(candidates, userTexts...)
 	if trimmed := strings.TrimSpace(prompt); trimmed != "" {
 		if len(trimmed) > 1024 {
 			trimmed = trimmed[:1024]
 		}
-		parts = append(parts, trimmed)
+		candidates = append(candidates, trimmed)
 	}
-	lower := strings.ToLower(strings.Join(parts, "\n"))
+	lower := strings.ToLower(strings.Join(candidates, "\n"))
 	for _, sig := range []string{
 		"[suggestion mode:",
-		"you are coming up with a succinct title for an agent chat session",
+		"you are coming up with a succinct title",
 		"generate a concise title",
+		"write the title in the predominant language of the session",
 	} {
 		if strings.Contains(lower, sig) {
 			return true
 		}
 	}
 	return false
+}
+
+// trimSuggestionMessages 为建议模式旁路请求裁剪历史窗口：
+// 仅保留末尾最多 6 条非系统消息，将历史消息压平为纯文本并截断超长正文、清空巨型工具调用与图片载荷，
+// 同时完整保留最后一条 [SUGGESTION MODE: ...] 指令原文，绝不修改调用方原始消息切片。
+func trimSuggestionMessages(msgs []Message) []Message {
+	const (
+		maxSuggestionWindow = 6
+		maxHistoryRunes     = 2000
+	)
+	nonSys := make([]Message, 0, len(msgs))
+	for _, m := range msgs {
+		role := strings.ToLower(strings.TrimSpace(m.Role))
+		if role == "system" || role == "developer" {
+			continue
+		}
+		nonSys = append(nonSys, m)
+	}
+	if len(nonSys) > maxSuggestionWindow {
+		nonSys = nonSys[len(nonSys)-maxSuggestionWindow:]
+	}
+	out := make([]Message, 0, len(nonSys))
+	for i, m := range nonSys {
+		if i == len(nonSys)-1 {
+			out = append(out, Message{
+				Role:    m.Role,
+				Content: contentText(m.Content),
+				Name:    m.Name,
+			})
+			continue
+		}
+		text := strings.TrimSpace(contentText(m.Content))
+		if text == "" && (len(m.ToolCalls) > 0 || m.FunctionCall != nil) {
+			var names []string
+			for _, tc := range m.ToolCalls {
+				if n := strings.TrimSpace(tc.Function.Name); n != "" {
+					names = append(names, n)
+				}
+			}
+			if m.FunctionCall != nil {
+				if n := strings.TrimSpace(m.FunctionCall.Name); n != "" {
+					names = append(names, n)
+				}
+			}
+			if len(names) > 0 {
+				text = "[called tools: " + strings.Join(names, ", ") + "]"
+			} else {
+				text = "[called tools]"
+			}
+		}
+		if utf8.RuneCountInString(text) > maxHistoryRunes {
+			runes := []rune(text)
+			text = strings.TrimSpace(string(runes[:maxHistoryRunes])) + "...[truncated]"
+		}
+		out = append(out, Message{
+			Role:       m.Role,
+			Content:    text,
+			Name:       m.Name,
+			ToolCallID: m.ToolCallID,
+		})
+	}
+	return out
 }
 
 // hasToolResultHistory 检测当前对话历史中是否已有客户端工具执行结果回传，

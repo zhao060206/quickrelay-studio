@@ -143,9 +143,11 @@ type preparedTurn struct {
 	fullBridgePrompt        string
 	fullPrompt              string
 	fullImages              []ImageAttachment
+	fullMessages            []Message
 	fullLoaded              bool
 	fallbackText            string
 	auxRequest              bool
+	suggestionMode          bool
 
 	in                     ChatInput
 	requestedThinkingEffort string
@@ -287,7 +289,14 @@ func startSSEHeartbeat(
 }
 
 func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoint, idPrefix string) (*preparedTurn, error) {
-	prompt, err := formatPrompt(req.Messages)
+	isSuggestion := isSuggestionModeRequest(req)
+	fullMessages := req.Messages
+	if isSuggestion {
+		if trimmed := trimSuggestionMessages(req.Messages); len(trimmed) > 0 {
+			fullMessages = trimmed
+		}
+	}
+	prompt, err := formatPrompt(fullMessages)
 	if err != nil {
 		return nil, err
 	}
@@ -309,67 +318,89 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		parallelTools = *req.ParallelToolCalls
 	}
 	workMode := s.cfg.GetWorkMode()
-	bridgePrompt := buildToolBridgePromptForMode(req, choiceMode, choiceName, parallelTools, workMode)
-	bridgeActive := bridgePrompt != ""
-	leadingGuide := leadingGuidelinesForMode(req.Messages, workMode)
-	fullGuide := callerGuidelinesForMode(req.Messages, workMode)
-	toolHash := toolProtocolFingerprint(req, choiceMode, choiceName, parallelTools)
-	guideHash := shortSHA256(leadingGuide)
+	var bridgePrompt string
+	var bridgeActive bool
+	var leadingGuide string
+	var fullGuide string
+	var toolHash string
+	var guideHash string
+	if !isSuggestion {
+		bridgePrompt = buildToolBridgePromptForMode(req, choiceMode, choiceName, parallelTools, workMode)
+		bridgeActive = bridgePrompt != ""
+		leadingGuide = leadingGuidelinesForMode(req.Messages, workMode)
+		fullGuide = callerGuidelinesForMode(req.Messages, workMode)
+		toolHash = toolProtocolFingerprint(req, choiceMode, choiceName, parallelTools)
+		guideHash = shortSHA256(leadingGuide)
+	}
 	baseHash := encodeBaseHash(guideHash, toolHash)
-	isAux := isAuxiliarySideRequest(req, prompt)
+	isAux := isSuggestion || isAuxiliarySideRequest(req, prompt)
 
 	rawThinkingEffort := resolveThinkingEffort(req, s.cfg.ThinkingEffort)
 	thinkingEffort := rawThinkingEffort
-	isCompact := isCompactionRequest(req, prompt)
+	isCompact := !isSuggestion && isCompactionRequest(req, prompt)
 	explicitOff := isExplicitThinkingOff(req)
-	if guardedEffort, guardReason := applyThinkingGuards(thinkingEffort, explicitOff, isCompact, bridgeActive, choiceMode, s.cfg); guardReason != "" {
-		log.Printf("chat %s thinking_guard reason=%s effort=%q->%q bridge=%t choice=%q",
-			idPrefix, guardReason, thinkingEffort, guardedEffort, bridgeActive, choiceMode)
-		thinkingEffort = guardedEffort
-	}
-	if wmEffort, wmReason := applyWorkModeGuards(thinkingEffort, explicitOff, isCompact, bridgeActive, choiceMode, workMode, hasToolResultHistory(req.Messages)); wmReason != "" {
-		log.Printf("chat %s thinking_guard reason=%s effort=%q->%q work_mode=%s",
-			idPrefix, wmReason, thinkingEffort, wmEffort, workMode)
-		thinkingEffort = wmEffort
+	if isSuggestion {
+		if !explicitOff && thinkingEffort != "" && thinkingEffort != "low" {
+			log.Printf("chat %s thinking_guard reason=suggestion_mode_downgrade effort=%q->%q",
+				idPrefix, thinkingEffort, "low")
+			thinkingEffort = "low"
+		}
+	} else {
+		if guardedEffort, guardReason := applyThinkingGuards(thinkingEffort, explicitOff, isCompact, bridgeActive, choiceMode, s.cfg); guardReason != "" {
+			log.Printf("chat %s thinking_guard reason=%s effort=%q->%q bridge=%t choice=%q",
+				idPrefix, guardReason, thinkingEffort, guardedEffort, bridgeActive, choiceMode)
+			thinkingEffort = guardedEffort
+		}
+		if wmEffort, wmReason := applyWorkModeGuards(thinkingEffort, explicitOff, isCompact, bridgeActive, choiceMode, workMode, hasToolResultHistory(req.Messages)); wmReason != "" {
+			log.Printf("chat %s thinking_guard reason=%s effort=%q->%q work_mode=%s",
+				idPrefix, wmReason, thinkingEffort, wmEffort, workMode)
+			thinkingEffort = wmEffort
+		}
 	}
 	turnTimeout := s.turnTimeoutFor(thinkingEffort)
 	ctx, cancel := context.WithTimeout(r.Context(), turnTimeout)
-	conv, convEpoch, convVer, acqErr := s.sessions.acquire(ctx, conversationKey(r, req, baseHash))
+	convKey := conversationKey(r, req, baseHash)
+	if isAux && !strings.HasPrefix(convKey, "aux:") {
+		convKey = "aux:" + uuid()
+	}
+	conv, convEpoch, convVer, acqErr := s.sessions.acquire(ctx, convKey)
 	if acqErr != nil {
 		cancel()
 		return nil, acqErr
 	}
 
 	t := &preparedTurn{
-		server:            s,
-		ctx:               ctx,
-		cancel:            cancel,
-		conv:              conv,
-		convEpoch:         convEpoch,
-		convVersion:       convVer,
-		id:                idPrefix + strings.ReplaceAll(uuid(), "-", ""),
-		created:           time.Now().Unix(),
-		protocol:          protocol,
-		endpoint:          endpoint,
-		req:               req,
-		model:             model,
-		allowedTools:      allowedTools,
-		choiceMode:        choiceMode,
-		choiceName:        choiceName,
-		parallelTools:     parallelTools,
-		bridgeActive:      bridgeActive,
-		baseHash:          baseHash,
+		server:                  s,
+		ctx:                     ctx,
+		cancel:                  cancel,
+		conv:                    conv,
+		convEpoch:               convEpoch,
+		convVersion:             convVer,
+		id:                      idPrefix + strings.ReplaceAll(uuid(), "-", ""),
+		created:                 time.Now().Unix(),
+		protocol:                protocol,
+		endpoint:                endpoint,
+		req:                     req,
+		model:                   model,
+		allowedTools:            allowedTools,
+		choiceMode:              choiceMode,
+		choiceName:              choiceName,
+		parallelTools:           parallelTools,
+		bridgeActive:            bridgeActive,
+		baseHash:                baseHash,
 		fullGuide:               fullGuide,
 		fullBridgePrompt:        bridgePrompt,
+		fullMessages:            fullMessages,
 		fallbackText:            prompt,
 		auxRequest:              isAux,
+		suggestionMode:          isSuggestion,
 		requestedThinkingEffort: rawThinkingEffort,
 		startedAt:               time.Now(),
-		maxAttempts:       s.maxAttempts(),
-		blockedAccounts:    make(map[int64]bool),
-		attemptedAccounts:  make(map[int64]bool),
-		refreshedAccounts:  make(map[int64]bool),
-		sameAccountRetried: make(map[int64]bool),
+		maxAttempts:             s.maxAttempts(),
+		blockedAccounts:         make(map[int64]bool),
+		attemptedAccounts:       make(map[int64]bool),
+		refreshedAccounts:       make(map[int64]bool),
+		sameAccountRetried:      make(map[int64]bool),
 	}
 
 	promptText := ""
@@ -416,6 +447,9 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 	}
 
 	threadID := strings.TrimSpace(r.Header.Get("X-Thread-Id"))
+	if isAux {
+		threadID = ""
+	}
 	t.in = ChatInput{
 		Prompt:         promptText,
 		LatestUserText: latestTurnPreview(req.Messages),
@@ -463,7 +497,21 @@ func (t *preparedTurn) loadFull() error {
 	if t.fullLoaded {
 		return nil
 	}
-	p, imgs, err := formatPromptWithImages(t.ctx, t.req.Messages)
+	msgs := t.fullMessages
+	if len(msgs) == 0 && t.req != nil {
+		msgs = t.req.Messages
+	}
+	if t.suggestionMode {
+		p, err := formatPrompt(msgs)
+		if err != nil {
+			return err
+		}
+		t.fullPrompt = p
+		t.fullImages = nil
+		t.fullLoaded = true
+		return nil
+	}
+	p, imgs, err := formatPromptWithImages(t.ctx, msgs)
 	if err != nil {
 		return err
 	}

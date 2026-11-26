@@ -1,15 +1,15 @@
 {
-  "version": "2.4.4",
-  "tag": "v2.4.4",
-  "published_at": "2026-11-26T01:24:45Z",
-  "release_notes": "QuickRelay Studio v2.4.4 更新内容：\n1. 修复多轮长对话升级或切号全量重放时误报 400 invalid attachment（超过 16 附件上限）的问题：\n   - 明确区分「当前最新一轮提交的附件」与「更早历史轮次累计的旧截图/旧文档」：单轮请求、增量续聊及全量重放中的当前最新输入段仍 100% 严格校验完整性与 16 附件上限，损坏或单轮超限依然明确返回 400 且不派发残缺请求；\n   - 多轮全量重放时优先全额保留当前轮全部附件，并将剩余配额按从近到远分配给历史附件；超出配额或已失效的更早历史附件绝不虚标为 [attached ...]，而是诚实标注省略（[earlier image/document omitted] / [earlier image/document unavailable]），彻底避免旧长对话升级后首次全量重建或限流切号重建被锁死；\n   - 历史与当前轮中的 text/* 纯文本文档继续内联保留，不占用 16 个上传配额。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.4",
+  "version": "2.4.5",
+  "tag": "v2.4.5",
+  "published_at": "2026-11-26T02:33:00Z",
+  "release_notes": "QuickRelay Studio v2.4.5 更新内容：\n1. 彻底修复带 tools 的 Claude Code 后台自动补全请求污染主对话线程的问题：\n   - 识别末尾以 [SUGGESTION MODE: 开头的输入框建议请求时不再受是否携带 tools 限制，始终使用独立一次性 aux: 会话键隔离，即使用户同时传递 X-Conversation-Id / X-Thread-Id 也不会复用、抢锁或覆盖主会话 thread_id；\n   - 同步补全标题生成请求的新变体匹配（如 succinct title and git branch name、Write the title in the predominant language of the session），防止标题请求漏判。\n2. 建议模式旁路轻量瘦身，省配额提速度：\n   - [SUGGESTION MODE: 旁路请求自动跳过 20K 工具协议与长工作区指南注入、思考强度自动降至 low（未显式关闭时），并仅保留末尾最近 6 条纯文本历史窗口（剥离历史图片/PDF 与巨型工具参数 JSON），不再重放十几万 Token 主历史，显著缩短响应耗时并节省 Cache Write。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.5",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.4.4-win-x64.zip",
-      "size": 8646815,
-      "sha256": "d139c3a8c60d6e7aba8207e17fa34d9d58e95d8682e74641f7170323c4165a19",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.4/QuickRelay-Studio-v2.4.4-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.4.5-win-x64.zip",
+      "size": 8649303,
+      "sha256": "9ed209eb04eb88489729c1840ef81fdbe1e361dc7cc2ee929f8b1fdb6ddf91c0",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.5/QuickRelay-Studio-v2.4.5-win-x64.zip"
     }
   }
 }

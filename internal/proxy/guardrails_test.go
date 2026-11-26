@@ -191,3 +191,125 @@ func TestPrepareFrameWithinBudgetOpts_PreserveEnvSummary(t *testing.T) {
 		t.Fatalf("did not expect env summary when disabled, got: %s", fmt.Sprint(t2))
 	}
 }
+
+func TestIsAuxiliarySideRequest_WithToolsAndTitleVariants(t *testing.T) {
+	tools := []Tool{{Type: "function", Function: ToolFunction{Name: "Bash"}}}
+	cases := []struct {
+		name string
+		req  *ChatRequest
+		want bool
+	}{
+		{
+			name: "带 Tools 与长历史的 SUGGESTION MODE 命中旁路隔离",
+			req: &ChatRequest{
+				Tools: tools,
+				Messages: []Message{
+					{Role: "system", Content: "You are Claude Code."},
+					{Role: "user", Content: "请修复登录问题"},
+					{Role: "assistant", Content: "已修复，是否要我起草通知？"},
+					{Role: "user", Content: "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.] FIRST: Look at recent messages."},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "普通主对话正文中提及 SUGGESTION MODE 字符串不误判",
+			req: &ChatRequest{
+				Tools: tools,
+				Messages: []Message{
+					{Role: "user", Content: "昨天有个 [SUGGESTION MODE: 触发的 bug，请你查一下 [SUGGESTION MODE: 在代码里的位置。"},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "早期历史含 SUGGESTION MODE 但当前末尾是正常提问不误判",
+			req: &ChatRequest{
+				Tools: tools,
+				Messages: []Message{
+					{Role: "user", Content: "[SUGGESTION MODE: old snippet]"},
+					{Role: "assistant", Content: "ok"},
+					{Role: "user", Content: "起草通知"},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "无工具标题生成新变体 succinct title and git branch name",
+			req: &ChatRequest{
+				Messages: []Message{
+					{Role: "user", Content: "You are coming up with a succinct title and git branch name for a coding session based on the provided description."},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "无工具标题生成变体 Write the title in the predominant language",
+			req: &ChatRequest{
+				Messages: []Message{
+					{Role: "user", Content: "<session> Ultracode: hi </session> Write the title in the predominant language of the session."},
+				},
+			},
+			want: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isAuxiliarySideRequest(tc.req, ""); got != tc.want {
+				t.Fatalf("isAuxiliarySideRequest() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTrimSuggestionMessages(t *testing.T) {
+	longBody := strings.Repeat("历史详情文本-", 500) // > 2000 runes
+	suggestionCmd := "[SUGGESTION MODE: Suggest next input] " + strings.Repeat("保持指令完整-", 300)
+	orig := []Message{
+		{Role: "system", Content: "huge system prompt"},
+		{Role: "user", Content: "轮次1很早的历史不应保留"},
+		{Role: "assistant", Content: "轮次1回复不应保留"},
+		{Role: "user", Content: "轮次1追问不应保留"},
+		{Role: "user", Content: "最近上下文提问"},
+		{Role: "user", Content: []any{
+			map[string]any{"type": "text", "text": "带图历史"},
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,AAAABBBBCCCCDDDD"}},
+		}},
+		{Role: "assistant", ToolCalls: []ToolCall{{ID: "c1", Type: "function", Function: FunctionCall{Name: "Bash", Arguments: `{"command":"echo big"}`}}}},
+		{Role: "tool", ToolCallID: "c1", Name: "Bash", Content: longBody},
+		{Role: "assistant", Content: "要我起草同步通知吗？"},
+		{Role: "user", Content: suggestionCmd},
+	}
+
+	// 记录原切片末尾前一条内容长度，校验不修改原切片
+	origToolText, _ := orig[7].Content.(string)
+	trimmed := trimSuggestionMessages(orig)
+	if len(trimmed) != 6 {
+		t.Fatalf("expected 6 trailing non-system messages, got %d", len(trimmed))
+	}
+	// 验证未保留最早的几条对话及 system 消息
+	for _, m := range trimmed {
+		if m.Role == "system" {
+			t.Fatalf("trimmed must exclude system messages")
+		}
+		if s, _ := m.Content.(string); strings.Contains(s, "轮次1") || strings.Contains(s, "AAAABBBBCCCCDDDD") {
+			t.Fatalf("trimmed leaked old history or raw base64: %q", s)
+		}
+		if len(m.ToolCalls) != 0 || m.FunctionCall != nil {
+			t.Fatalf("trimmed should clear heavyweight tool calls")
+		}
+	}
+	if s, _ := trimmed[2].Content.(string); !strings.Contains(s, "[called tools: Bash]") {
+		t.Fatalf("expected compact tool summary, got %q", s)
+	}
+	if s, _ := trimmed[3].Content.(string); !strings.HasSuffix(s, "...[truncated]") {
+		t.Fatalf("expected truncated long history item, got %q", s)
+	}
+	if last, _ := trimmed[len(trimmed)-1].Content.(string); last != suggestionCmd {
+		t.Fatalf("expected last suggestion instruction preserved verbatim, got len=%d want=%d", len(last), len(suggestionCmd))
+	}
+	if afterToolText, _ := orig[7].Content.(string); afterToolText != origToolText {
+		t.Fatalf("trimSuggestionMessages mutated original slice")
+	}
+}

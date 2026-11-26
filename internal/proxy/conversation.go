@@ -578,18 +578,18 @@ func writeCanonicalContent(h interface{ Write([]byte) (int, error) }, content an
 }
 
 // conversationKey 标识一条会话：
-// 1) 优先使用显式请求头 X-Conversation-Id / X-Thread-Id；
-// 2) 旁路无工具辅助请求（建议/标题）分配一次性隔离键防止污染主会话；
+// 1) 旁路辅助请求（建议输入/标题生成）优先分配一次性隔离键，即使携带显式会话头也绝不抢锁或污染主会话；
+// 2) 优先使用显式请求头 X-Conversation-Id / X-Thread-Id；
 // 3) 正常主会话仅绑定鉴权身份、是否有工具及首条非 system/developer 消息指纹，
 //    不再把易变的系统提示词或 work_mode 焊死在会话路由键中，大幅提升多轮复用命中率。
 func conversationKey(r *http.Request, req *ChatRequest, baseHash string) string {
+	if isAuxiliarySideRequest(req, "") {
+		return "aux:" + uuid()
+	}
 	for _, header := range []string{"X-Conversation-Id", "X-Thread-Id"} {
 		if id := strings.TrimSpace(r.Header.Get(header)); id != "" {
 			return "h:" + id
 		}
-	}
-	if isAuxiliarySideRequest(req, "") {
-		return "aux:" + uuid()
 	}
 	h := sha256.New()
 	h.Write([]byte(r.Header.Get("Authorization")))
