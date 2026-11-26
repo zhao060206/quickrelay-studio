@@ -1,4 +1,4 @@
-# QuickRelay Studio v2.5.1
+# QuickRelay Studio v2.5.2
 
 **QuickRelay Studio** 是一款基于 Go 与 WebView2 桌面端打造的独立双协议 AI 反代网关与账号池管理控制台。支持将多个 AWS Quick 账号聚合为标准的 **OpenAI** 与 **Anthropic Messages** API，免改造直连 **Claude Code**、**Codex CLI** 及各类开源 SDK，并内置完整的请求明细统计与 1M 上下文持久化会话追踪。
 
@@ -7,9 +7,10 @@
 ## 核心特性
 
 1. **双协议原生网关**
-   - **虚拟 Outpost 原生工具直通与常驻挂起会话池（v2.5.0 架构升级 / v2.5.1 稳定性加固）**：
+   - **虚拟 Outpost 原生工具直通与常驻挂起会话池（v2.5.0 架构升级 / v2.5.1 ~ v2.5.2 稳定性与审批体验优化）**：
      - 在 AIDP + 有效租户地址且携带工具的无多模态附件请求中，默认以 `tool_mode: "auto"` 通过 `putOutpost` 注册虚拟设备并直接暴露客户端工具为上游原生工具（避免文本 `<client_tool_call>` 协议退化与身份漂移），并支持 `native_outpost` / `text_bridge` 三模式切换及 `PUT /api/tool-mode` 热更新；
      - **零延迟同线程续写与结构化历史冷导入**：挂起期由单一常驻 WebSocket 读循环保持连接活性与事件缓冲，同线程工具结果回传原位恢复；新建或切号重放时通过 `/store/sessions` + `/events/batch` 写入结构化历史事件；停机及会话单删/全清自动反注册虚拟 Outpost；
+     - **v2.5.2 自动审批加速与减少误弹窗**：针对无工具 `<transcript>` 自动审批分类请求强制分流极速模型 `fast`、在未显式传思考参数时强制设为 `low` 并执行保首尾及闭合标签后待审指令的结构感知裁剪（消除大上下文重写与附件 DLP 延迟）；在虚拟 Outpost 工具路由指引中优先引导使用 `Read`/`Glob`/`Grep`/`Edit`/`Write`/`MultiEdit` 等专用工具替代 `Bash` 以减少客户端手动审批弹窗；同时将原生并行工具聚拢窗口扩至 `180ms`，并在收到同轮下一个工具的 `tool_start`/`tool_progress`/`tool_arguments` 时自动滑动续期 `600ms`，防止大参数并行调用被拆成多轮；
      - **v2.5.1 全链路稳定性加固**：完整支持多段 `continuation_expected` 回答与中途断流保护；执行原生 `user_message` 完整序列化 `63 KiB` 帧预算检查（`auto` 无损回退 `text_bridge`，`native_outpost` 明确报错）并修复长思考首包 SSE 预热派发；跨原生、自动回退与文本桥全路径统一执行强制工具选择（`function`/`tool`/`required`/`any`）与精确设备前缀匹配；收紧显式 `X-Thread-Id` 全链路历史核对、配额错误保留绑定与断连防下发一致性；
      - **Agent 切换线程边界隔离与当前轮逐字保真**：识别 Claude Code 主/子 Agent 与系统指令指纹切换自动隔离新线程，并在文本桥长会话中优先外置历史消息、完整保留当前轮逐字内容；同时清洗流式/非流式行首独立 `[assistant]`/`[main]` 路由标记。
    - **OpenAI 协议**：完整兼容 `POST /v1/chat/completions` 与 `GET /v1/models`。

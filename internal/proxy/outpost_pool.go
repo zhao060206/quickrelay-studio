@@ -24,7 +24,11 @@ const (
 	defaultOutpostIdleTTL     = 10 * time.Minute
 	defaultOutpostMaxSessions = 16
 	outpostMaxBacklogEvents   = 128
-	outpostParallelToolWindow = 30 * time.Millisecond
+)
+
+var (
+	outpostParallelToolWindow       = 180 * time.Millisecond
+	outpostParallelActiveStepWindow = 600 * time.Millisecond
 )
 
 type outpostInboundPacket struct {
@@ -1075,6 +1079,24 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 	turnFinished := false
 	var parallelDeadline <-chan time.Time
 	var parallelTimer *time.Timer
+	armParallelTimer := func(d time.Duration) {
+		if d <= 0 {
+			return
+		}
+		if parallelTimer == nil {
+			parallelTimer = time.NewTimer(d)
+			parallelDeadline = parallelTimer.C
+			return
+		}
+		if !parallelTimer.Stop() {
+			select {
+			case <-parallelTimer.C:
+			default:
+			}
+		}
+		parallelTimer.Reset(d)
+		parallelDeadline = parallelTimer.C
+	}
 	defer func() {
 		if parallelTimer != nil {
 			parallelTimer.Stop()
@@ -1292,6 +1314,11 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 			if err := handlePermissionRequest(p); err != nil {
 				return false, err
 			}
+		case "tool_start", "tool_progress", "tool_arguments":
+			// 已有并行 tool_call 等待聚拢时，上游流式生成同轮下一个工具期间自动滑动续期，防止大参数工具中途超时拆分
+			if len(rawToolCalls) > 0 && turn.parallelTools {
+				armParallelTimer(outpostParallelActiveStepWindow)
+			}
 		case "tool_call":
 			callID, _ := p["tool_call_id"].(string)
 			callID = strings.TrimSpace(callID)
@@ -1313,12 +1340,10 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 				Name:      origName,
 				Arguments: argsJSON,
 			})
-			if parallelTimer == nil && turn.parallelTools {
-				parallelTimer = time.NewTimer(outpostParallelToolWindow)
-				parallelDeadline = parallelTimer.C
-			} else if !turn.parallelTools {
+			if !turn.parallelTools {
 				return true, nil
 			}
+			armParallelTimer(outpostParallelToolWindow)
 		case "thinking_delta":
 			if d := thinkingDeltaText(payloadBytes); d != "" {
 				thinking.WriteString(d)

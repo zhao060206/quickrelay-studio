@@ -259,6 +259,102 @@ func trimSuggestionMessages(msgs []Message) []Message {
 	return out
 }
 
+const (
+	maxTranscriptInnerBytes = 12000
+	transcriptKeepHeadBytes = 2500
+	transcriptKeepTailBytes = 9000
+	transcriptOmitMarker    = "\n...[earlier transcript entries omitted for fast classification]...\n"
+)
+
+// trimTranscriptMessages 对无工具的 <transcript> 旁路分类/摘要请求执行结构感知裁剪：
+// 100% 保留所有 system / developer 消息（分类器输出格式规范位于此处），
+// 并保留末尾有效 <transcript>...</transcript> 之外的闭合标签与待审指令，仅裁剪超长中间历史。
+func trimTranscriptMessages(msgs []Message) []Message {
+	if len(msgs) == 0 {
+		return nil
+	}
+	targetIdx := -1
+	for i := len(msgs) - 1; i >= 0; i-- {
+		role := strings.ToLower(strings.TrimSpace(msgs[i].Role))
+		if role == "system" || role == "developer" {
+			continue
+		}
+		if role == "" || role == "user" {
+			trimmed := strings.ToLower(strings.TrimSpace(contentText(msgs[i].Content)))
+			if strings.HasPrefix(trimmed, "<transcript>") {
+				targetIdx = i
+			}
+		}
+		break
+	}
+	if targetIdx < 0 {
+		return nil
+	}
+	out := make([]Message, len(msgs))
+	copy(out, msgs)
+	orig := out[targetIdx]
+	out[targetIdx] = Message{
+		Role:       orig.Role,
+		Content:    trimTranscriptText(contentText(orig.Content)),
+		Name:       orig.Name,
+		ToolCallID: orig.ToolCallID,
+	}
+	return out
+}
+
+// trimTranscriptText 在保留首部任务目标与 </transcript> 闭合后待审指令的前提下，裁剪超长中间转录历史。
+func trimTranscriptText(raw string) string {
+	lower := strings.ToLower(raw)
+	openIdx := strings.Index(lower, "<transcript>")
+	closeIdx := strings.LastIndex(lower, "</transcript>")
+	if openIdx >= 0 && closeIdx > openIdx+len("<transcript>") {
+		innerStart := openIdx + len("<transcript>")
+		inner := raw[innerStart:closeIdx]
+		if len(inner) <= maxTranscriptInnerBytes {
+			return raw
+		}
+		headEnd := transcriptKeepHeadBytes
+		if headEnd > len(inner) {
+			headEnd = len(inner)
+		}
+		for headEnd > 0 && headEnd < len(inner) && !utf8.RuneStart(inner[headEnd]) {
+			headEnd--
+		}
+		tailStart := len(inner) - transcriptKeepTailBytes
+		if tailStart < headEnd {
+			tailStart = headEnd
+		}
+		for tailStart < len(inner) && !utf8.RuneStart(inner[tailStart]) {
+			tailStart++
+		}
+		if tailStart <= headEnd {
+			return raw
+		}
+		return raw[:innerStart] + inner[:headEnd] + transcriptOmitMarker + inner[tailStart:] + raw[closeIdx:]
+	}
+	if len(raw) <= maxTranscriptInnerBytes {
+		return raw
+	}
+	headEnd := transcriptKeepHeadBytes
+	if headEnd > len(raw) {
+		headEnd = len(raw)
+	}
+	for headEnd > 0 && headEnd < len(raw) && !utf8.RuneStart(raw[headEnd]) {
+		headEnd--
+	}
+	tailStart := len(raw) - 9500
+	if tailStart < headEnd {
+		tailStart = headEnd
+	}
+	for tailStart < len(raw) && !utf8.RuneStart(raw[tailStart]) {
+		tailStart++
+	}
+	if tailStart <= headEnd {
+		return raw
+	}
+	return raw[:headEnd] + transcriptOmitMarker + raw[tailStart:]
+}
+
 // hasToolResultHistory 检测当前对话历史中是否已有客户端工具执行结果回传，
 // 用于区分“首次建立工具协作的破冰轮次”与“已读入文件后的深度分析轮次”。
 func hasToolResultHistory(msgs []Message) bool {

@@ -286,6 +286,7 @@ func (r *outpostToolRegistry) routingInstructions(outpostID, devName, choiceMode
 	for _, t := range r.Tools {
 		fmt.Fprintf(&b, "- %s: %s (wire name %s)\n", t.OriginalName, outpostModelToolNameForAlias(devName, t.Alias), t.Alias)
 	}
+	b.WriteString("\nWhen dedicated file or search tools (such as Read, Glob, Grep, Edit, Write, or MultiEdit) are listed above, prefer them for reading, searching, creating, and editing workspace files instead of Bash/shell commands (cat, grep, rg, find, ls, sed, awk, echo/heredoc), because shell commands trigger manual approval prompts in the client.\n")
 	switch choiceMode {
 	case "required":
 		b.WriteString("\nYou MUST invoke at least one of the registered client tools above before answering.\n")

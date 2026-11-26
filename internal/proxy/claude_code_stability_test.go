@@ -636,11 +636,11 @@ func TestAnthropicStream_MultiTextBlocksPreserveConversationReuse(t *testing.T) 
 }
 
 // TestTranscriptSideRequest_IsolatedAndLowThinking 验证无工具的 <transcript> 后台摘要请求
-// 被隔离为一次性 aux: 会话（DeleteSession=true、不入库、思考降至 low），而带工具的正常提问不误判。
+// 被隔离为一次性 aux: 会话（DeleteSession=true、不入库、自动映射 fast 模型、空/高思考均降至 low 并裁剪超长中间历史），而带工具的正常提问不误判。
 func TestTranscriptSideRequest_IsolatedAndLowThinking(t *testing.T) {
 	srv := newTestServerForReuse(t)
 
-	// 1. 无工具 <transcript> 请求 -> aux 隔离 + low 思考 + 不持久化
+	// 1. 无工具 <transcript> 请求（高思考）-> fast 模型 + aux 隔离 + low 思考 + 不持久化
 	transcriptReq := &ChatRequest{
 		Model:     "claude-sonnet-5",
 		Reasoning: &ReasoningOptions{Effort: "max"},
@@ -662,6 +662,10 @@ func TestTranscriptSideRequest_IsolatedAndLowThinking(t *testing.T) {
 		turn.Close()
 		t.Fatalf("expected auxRequest=true and DeleteSession=true, got aux=%t del=%t", turn.auxRequest, turn.in.DeleteSession)
 	}
+	if turn.in.Model != "fast" {
+		turn.Close()
+		t.Fatalf("expected transcript model mapped to fast, got %q", turn.in.Model)
+	}
 	if turn.in.ThinkingEffort != "low" {
 		turn.Close()
 		t.Fatalf("expected thinking effort downgraded to low, got %q", turn.in.ThinkingEffort)
@@ -677,7 +681,49 @@ func TestTranscriptSideRequest_IsolatedAndLowThinking(t *testing.T) {
 		t.Fatalf("transcript side request must not persist into conversations table, got %d", n)
 	}
 
-	// 2. 带工具的主对话正文中即使提及 <transcript> 也不误判
+	// 2. 无工具 <transcript> 请求未传思考强度且携带 60KB 历史 -> fast 模型 + 强制 low + 保首尾与 </transcript> 后指令 + 不改原切片
+	filler := strings.Repeat("middle-log-entry-0123456789abcdef\n", 1800)
+	longContent := "<transcript>\nHEAD_MARKER initial user task\n" + filler + "\nTAIL_MARKER recent tool output\n</transcript>\n<pending_tool>Write src/app.ts</pending_tool>"
+	longReq := &ChatRequest{
+		Model:     "claude-sonnet-5",
+		Reasoning: nil,
+		Messages: []Message{
+			{Role: "system", Content: "Output classifier XML <block>yes|no</block>."},
+			{Role: "user", Content: longContent},
+		},
+	}
+	longTurn, err := srv.prepareTurn(httptest.NewRequest(http.MethodPost, "/v1/messages", nil), longReq, "anthropic", "/v1/messages", "msg_")
+	if err != nil {
+		t.Fatalf("prepareTurn long transcript failed: %v", err)
+	}
+	defer longTurn.Close()
+	if longTurn.in.Model != "fast" {
+		t.Fatalf("expected long transcript model=fast, got %q", longTurn.in.Model)
+	}
+	if longTurn.in.ThinkingEffort != "low" {
+		t.Fatalf("expected empty effort transcript forced to low, got %q", longTurn.in.ThinkingEffort)
+	}
+	if got := contentText(longReq.Messages[1].Content); got != longContent {
+		t.Fatalf("prepareTurn mutated original req.Messages[1], len=%d vs %d", len(got), len(longContent))
+	}
+	if len(longTurn.in.Prompt) >= 16000 {
+		t.Fatalf("expected trimmed transcript prompt < 16000 bytes, got %d", len(longTurn.in.Prompt))
+	}
+	combined := longTurn.in.Guidelines + "\n" + longTurn.in.Prompt
+	for _, mustKeep := range []string{
+		"Output classifier XML <block>yes|no</block>.",
+		"HEAD_MARKER",
+		"TAIL_MARKER",
+		"</transcript>",
+		"<pending_tool>Write src/app.ts</pending_tool>",
+		"earlier transcript entries omitted",
+	} {
+		if !strings.Contains(combined, mustKeep) {
+			t.Fatalf("expected trimmed transcript to keep %q", mustKeep)
+		}
+	}
+
+	// 3. 带工具的主对话正文中即使提及 <transcript> 也不误判
 	normalWithTools := &ChatRequest{
 		Model: "claude-opus-5",
 		Tools: []Tool{{Type: "function", Function: ToolFunction{Name: "Read"}}},
@@ -865,4 +911,108 @@ func TestRunPython_EmptyArgumentsInToolStartWaitsForRealCode(t *testing.T) {
 			t.Fatalf("expected auto-correction back to Write tool when write code arrived after empty tool_start, got %d: %s", resp.StatusCode, string(raw))
 		}
 	})
+}
+
+// TestOutpostParallelTools_SlidingWindowAndRoutingGuidance 验证虚拟 Outpost 工具路由指引优先使用专用文件工具，
+// 且并行工具聚拢窗口在收到同轮下一个工具的 tool_start / tool_progress 时会自动滑动续期、单轮一次聚拢返回多个 tool_use。
+func TestOutpostParallelTools_SlidingWindowAndRoutingGuidance(t *testing.T) {
+	reqSample := &ChatRequest{
+		Tools: []Tool{
+			{Type: "function", Function: ToolFunction{Name: "Read", Description: "Read file", Parameters: json.RawMessage(`{"type":"object"}`)}},
+			{Type: "function", Function: ToolFunction{Name: "Bash", Description: "Run bash", Parameters: json.RawMessage(`{"type":"object"}`)}},
+		},
+	}
+	reg := newOutpostToolRegistry(reqSample)
+	routing := reg.routingInstructions("op_1", "dev_1", "auto", "", true)
+	if !strings.Contains(routing, "prefer them for reading, searching, creating, and editing workspace files instead of Bash/shell commands") {
+		t.Fatalf("expected dedicated file/search tool guidance in routingInstructions, got:\n%s", routing)
+	}
+
+	oldBase := outpostParallelToolWindow
+	oldStep := outpostParallelActiveStepWindow
+	outpostParallelToolWindow = 60 * time.Millisecond
+	outpostParallelActiveStepWindow = 220 * time.Millisecond
+	defer func() {
+		outpostParallelToolWindow = oldBase
+		outpostParallelActiveStepWindow = oldStep
+	}()
+
+	mock := newMockOutpostServer(t)
+	mock.onWSInbound = func(conn *websocket.Conn, writeFrame func(any) error, ev map[string]any, connIndex int32) {
+		if ev["type"] != "user_message" {
+			return
+		}
+		p, _ := ev["payload"].(map[string]any)
+		outpostID, _ := p["outpostId"].(string)
+		mock.mu.Lock()
+		out := mock.activeOutposts[outpostID]
+		mock.mu.Unlock()
+		caps := out["capabilities"].([]any)
+		tools := caps[0].(map[string]any)["tools"].([]any)
+		wireRead := tools[0].(map[string]any)["name"].(string)
+		_ = writeFrame(map[string]any{"type": "message_start", "payload": map[string]any{"message_id": "m_par"}})
+		_ = writeFrame(map[string]any{"type": "tool_call", "payload": map[string]any{
+			"tool_call_id": "tc_read_1",
+			"tool_name":    wireRead,
+			"arguments":    map[string]any{"file_path": "a.go"},
+		}})
+		time.Sleep(35 * time.Millisecond)
+		_ = writeFrame(map[string]any{"type": "tool_start", "payload": map[string]any{"tool_id": "t2"}})
+		time.Sleep(90 * time.Millisecond)
+		_ = writeFrame(map[string]any{"type": "tool_progress", "payload": map[string]any{"tool_id": "t2"}})
+		time.Sleep(90 * time.Millisecond)
+		_ = writeFrame(map[string]any{"type": "tool_call", "payload": map[string]any{
+			"tool_call_id": "tc_read_2",
+			"tool_name":    wireRead,
+			"arguments":    map[string]any{"file_path": "b.go"},
+		}})
+	}
+
+	srv, httpSrv := setupOutpostTestServer(t, mock, config.ToolModeNativeOutpost)
+	client := &http.Client{Timeout: 8 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	code, body := doProxyJSONCall(t, client, httpSrv.URL+"/v1/messages", nil, map[string]any{
+		"model":      "smart",
+		"max_tokens": 256,
+		"stream":     false,
+		"tools": []map[string]any{
+			{"name": "Read", "description": "Read file", "input_schema": map[string]any{"type": "object"}},
+			{"name": "Bash", "description": "Run shell", "input_schema": map[string]any{"type": "object"}},
+		},
+		"messages": []map[string]any{{"role": "user", "content": "并行读取 a.go 和 b.go"}},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", code, string(body))
+	}
+	var antResp struct {
+		StopReason string `json:"stop_reason"`
+		Content    []struct {
+			Type string `json:"type"`
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(body, &antResp); err != nil {
+		t.Fatalf("decode Anthropic response failed: %v, body=%s", err, string(body))
+	}
+	if antResp.StopReason != "tool_use" {
+		t.Fatalf("expected stop_reason=tool_use, got %q", antResp.StopReason)
+	}
+	var gotIDs []string
+	for _, blk := range antResp.Content {
+		if blk.Type == "tool_use" {
+			gotIDs = append(gotIDs, blk.ID)
+		}
+	}
+	if len(gotIDs) != 2 || gotIDs[0] != "tc_read_1" || gotIDs[1] != "tc_read_2" {
+		t.Fatalf("expected 2 coalesced parallel tool_use blocks [tc_read_1 tc_read_2], got %v", gotIDs)
+	}
+	srv.outposts.mu.Lock()
+	var parkedPending []string
+	for _, s := range srv.outposts.idle {
+		parkedPending = append(parkedPending, s.pendingCalls...)
+	}
+	srv.outposts.mu.Unlock()
+	if len(parkedPending) != 2 {
+		t.Fatalf("expected parked outpost session pendingCalls length 2, got %v", parkedPending)
+	}
 }

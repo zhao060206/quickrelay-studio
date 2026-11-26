@@ -375,9 +375,14 @@ func startSSEHeartbeat(
 
 func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoint, idPrefix string) (*preparedTurn, error) {
 	isSuggestion := isSuggestionModeRequest(req)
+	isTranscript := !isSuggestion && isTranscriptSideRequest(req)
 	fullMessages := req.Messages
 	if isSuggestion {
 		if trimmed := trimSuggestionMessages(req.Messages); len(trimmed) > 0 {
+			fullMessages = trimmed
+		}
+	} else if isTranscript {
+		if trimmed := trimTranscriptMessages(req.Messages); len(trimmed) > 0 {
 			fullMessages = trimmed
 		}
 	}
@@ -391,6 +396,11 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		model = s.mapAnthropicModel(req.Model)
 	} else {
 		model = s.mapModel(req.Model)
+	}
+	if isTranscript && model != "fast" {
+		log.Printf("chat %s model_guard reason=transcript_side_fast model=%q->%q",
+			idPrefix, model, "fast")
+		model = "fast"
 	}
 
 	allowedTools := requestedToolNames(req)
@@ -423,7 +433,6 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 	rawThinkingEffort := resolveThinkingEffort(req, s.cfg.ThinkingEffort)
 	thinkingEffort := rawThinkingEffort
 	isCompact := !isSuggestion && isCompactionRequest(req, prompt)
-	isTranscript := !isSuggestion && isTranscriptSideRequest(req)
 	explicitOff := isExplicitThinkingOff(req)
 	if isSuggestion {
 		if !explicitOff && thinkingEffort != "" && thinkingEffort != "low" {
@@ -432,7 +441,7 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 			thinkingEffort = "low"
 		}
 	} else if isTranscript {
-		if !explicitOff && thinkingEffort != "" && thinkingEffort != "low" {
+		if !explicitOff && thinkingEffort != "low" {
 			log.Printf("chat %s thinking_guard reason=transcript_side_downgrade effort=%q->%q",
 				idPrefix, thinkingEffort, "low")
 			thinkingEffort = "low"
