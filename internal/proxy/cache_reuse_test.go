@@ -74,9 +74,13 @@ func TestResumedTurn_CompactsToolProtocolAndRecoversOnReset(t *testing.T) {
 		turn1.Close()
 		t.Fatalf("turn 1 should carry full tool protocol, len=%d", fullProtoLen)
 	}
-	// 模拟首轮完成并保存会话映射
+	// 模拟首轮完成并保存会话映射（含上一轮真实对外工具输出指纹）
 	turn1.usedAccount = &store.Account{ID: 7}
-	turn1.saveConversation(ChatResult{ThreadID: "thread-cache-001"})
+	turn1.saveConversation(ChatResult{ThreadID: "thread-cache-001"}, "", []ToolCall{{
+		ID:       "t1",
+		Type:     "function",
+		Function: FunctionCall{Name: "workspace_tool_00", Arguments: `{"path":"."}`},
+	}})
 	turn1.Close()
 
 	// 第 2 轮：system 动态变化 + 运行时切换工作模式为 document，工具未变 -> 依然命中复用且极简工具提醒
@@ -110,7 +114,10 @@ func TestResumedTurn_CompactsToolProtocolAndRecoversOnReset(t *testing.T) {
 	}
 
 	// 若续聊失败需要 resetConversation，应立刻恢复完整工具定义以便重开干净线程
-	turn2.resetConversation()
+	if err := turn2.resetConversation(); err != nil {
+		turn2.Close()
+		t.Fatalf("resetConversation failed: %v", err)
+	}
 	if turn2.in.ToolProtocol != turn2.fullBridgePrompt || !strings.Contains(turn2.in.ToolProtocol, `"workspace_tool_19"`) {
 		turn2.Close()
 		t.Fatalf("resetConversation failed to restore full tool protocol")
@@ -132,7 +139,7 @@ func TestResumedTurn_ToolSchemaChangeUpdatesSameThread(t *testing.T) {
 		t.Fatalf("turn 1: %v", err)
 	}
 	t1.usedAccount = &store.Account{ID: 3}
-	t1.saveConversation(ChatResult{ThreadID: "thread-evolve-1"})
+	t1.saveConversation(ChatResult{ThreadID: "thread-evolve-1"}, "好的", nil)
 	t1.Close()
 
 	// 第 2 轮工具集新增 1 个工具：保持同一 thread_id 复用，但重发完整工具表
@@ -159,7 +166,7 @@ func TestResumedTurn_ToolSchemaChangeUpdatesSameThread(t *testing.T) {
 		t.Fatalf("expected updated full tool protocol when tools changed")
 	}
 	t2.usedAccount = &store.Account{ID: 3}
-	t2.saveConversation(ChatResult{ThreadID: "thread-evolve-1"})
+	t2.saveConversation(ChatResult{ThreadID: "thread-evolve-1"}, "收到", nil)
 	t2.Close()
 
 	// 第 3 轮工具集再次与第 2 轮一致：再次自动切换回极简提醒
@@ -202,13 +209,14 @@ func TestAuxiliarySideRequestIsolationAndLegacyDeltaCompat(t *testing.T) {
 		t.Fatalf("aux request should be marked isolated and DeleteSession=true")
 	}
 	tAux.usedAccount = &store.Account{ID: 1}
-	tAux.saveConversation(ChatResult{ThreadID: "aux-tid-should-not-persist"})
+	tAux.saveConversation(ChatResult{ThreadID: "aux-tid-should-not-persist"}, "aux reply", nil)
 	tAux.Close()
 	if n, _ := srv.store.CountConversations(t.Context()); n != 0 {
 		t.Fatalf("aux request must not persist into conversations table, got count=%d", n)
 	}
 
-	// 2. 兼容旧版不带 "nl:" 前缀的 SQLite message_hashes 记录
+	// 2. 兼容旧版不带 "nl:" 前缀的 SQLite message_hashes 记录：
+	//    若缺少 lastAssistantHash 必须安全返回 false 重建；补齐匹配指纹后仍可复用。
 	legacyMsgs := []Message{
 		{Role: "system", Content: "Old sys"},
 		{Role: "user", Content: "旧对话首句"},
@@ -219,9 +227,14 @@ func TestAuxiliarySideRequestIsolationAndLegacyDeltaCompat(t *testing.T) {
 		baseHash:  strings.Repeat("a", 64),
 		msgHashes: messageFingerprints(legacyMsgs),
 	}
-	delta, ok := conv.delta(append(legacyMsgs, Message{Role: "assistant", Content: "旧回复"}, Message{Role: "user", Content: "继续旧对话"}))
+	nextMsgs := append(legacyMsgs, Message{Role: "assistant", Content: "旧回复"}, Message{Role: "user", Content: "继续旧对话"})
+	if _, ok := conv.delta(nextMsgs); ok {
+		t.Fatalf("expected legacy record without lastAssistantHash to safely fall back to full rebuild")
+	}
+	conv.lastAssistantHash = assistantOutputFingerprint("旧回复", nil)
+	delta, ok := conv.delta(nextMsgs)
 	if !ok || len(delta) != 2 {
-		t.Fatalf("expected legacy msgHashes prefix compatibility, ok=%t len=%d", ok, len(delta))
+		t.Fatalf("expected legacy msgHashes prefix compatibility when lastAssistantHash matches, ok=%t len=%d", ok, len(delta))
 	}
 
 	// 3. 验证新版带 "nl:" 前缀在首条 system 变动时仍匹配

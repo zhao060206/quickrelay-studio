@@ -231,8 +231,11 @@ func TestConversationPersistenceAcrossRestart(t *testing.T) {
 	key1 := conversationKey(r1, req1, baseHash1)
 
 	s1 := newConversationStore(24*time.Hour, 64, db1)
-	c1 := s1.acquire(key1)
-	s1.save(c1, "thread-persist-001", 4, baseHash1, msgs1)
+	c1, ep1, ver1, err := s1.acquire(context.Background(), key1)
+	if err != nil {
+		t.Fatalf("s1.acquire: %v", err)
+	}
+	s1.save(c1, ep1, ver1, "thread-persist-001", 4, baseHash1, msgs1, assistantOutputFingerprint("已记住，暗号是 ORION-9472。", nil))
 	s1.release(c1)
 	_ = db1.Close()
 
@@ -265,7 +268,10 @@ func TestConversationPersistenceAcrossRestart(t *testing.T) {
 	}
 
 	s2 := newConversationStore(24*time.Hour, 64, db2)
-	c2 := s2.acquire(key2)
+	c2, ep2, ver2, err := s2.acquire(context.Background(), key2)
+	if err != nil {
+		t.Fatalf("s2.acquire: %v", err)
+	}
 
 	if c2.threadID != "thread-persist-001" || c2.accountID != 4 {
 		s2.release(c2)
@@ -291,10 +297,13 @@ func TestConversationPersistenceAcrossRestart(t *testing.T) {
 	}
 
 	// 验证重置后会清除持久化记录
-	s2.reset(c2)
+	s2.reset(c2, ep2, ver2)
 	s2.release(c2)
 
-	c2AfterReset := s2.acquire(key2)
+	c2AfterReset, _, _, err := s2.acquire(context.Background(), key2)
+	if err != nil {
+		t.Fatalf("s2.acquire after reset: %v", err)
+	}
 	if c2AfterReset.threadID != "" {
 		s2.release(c2AfterReset)
 		t.Fatalf("expected reset to clear in-memory threadID")
@@ -302,7 +311,10 @@ func TestConversationPersistenceAcrossRestart(t *testing.T) {
 	s2.release(c2AfterReset)
 
 	s3 := newConversationStore(24*time.Hour, 64, db2)
-	c3 := s3.acquire(key2)
+	c3, _, _, err := s3.acquire(context.Background(), key2)
+	if err != nil {
+		t.Fatalf("s3.acquire: %v", err)
+	}
 	defer s3.release(c3)
 	if c3.threadID != "" {
 		t.Fatalf("expected reset to remove persisted record from SQLite, got %q", c3.threadID)

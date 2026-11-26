@@ -229,7 +229,7 @@ func TestSessionPreserved_OnCancelAndTransientErrors(t *testing.T) {
 		t.Fatalf("prepareTurn 1: %v", err)
 	}
 	t1.usedAccount = &store.Account{ID: 3}
-	t1.saveConversation(ChatResult{ThreadID: "tid-preserved-01"})
+	t1.saveConversation(ChatResult{ThreadID: "tid-preserved-01"}, "第一轮回答", nil)
 	t1.Close()
 
 	// 模拟第 2 轮发生 context.Canceled：按新策略不应重置
@@ -250,7 +250,7 @@ func TestSessionPreserved_OnCancelAndTransientErrors(t *testing.T) {
 		t.Fatalf("expected t2 resume tid-preserved-01")
 	}
 	if shouldResetConversation(t2.conv, context.Canceled) {
-		srv.sessions.reset(t2.conv)
+		srv.sessions.reset(t2.conv, t2.convEpoch, t2.convVersion)
 	}
 	t2.Close()
 

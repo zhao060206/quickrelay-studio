@@ -1,15 +1,15 @@
 {
-  "version": "2.4.2",
-  "tag": "v2.4.2",
-  "published_at": "2026-11-25T14:56:40Z",
-  "release_notes": "QuickRelay Studio v2.4.2 更新内容：\n1. 修复 20 秒 WebSocket 握手超时与 SSE 首包预热竞态锁死流式重试的问题：\n   - 新增 OnDispatched 门控信号：仅在 WebSocket 建连成功并已发出 user_message 进入等待模型响应阶段后，才允许启动 high/max/附件请求的 20s 首包 SSE 预热；\n   - 将 WebSocket 拨号握手超时收敛至 12s，彻底避免代理短时波动时抢先发出空 SSE 响应头导致 max_attempts 自动重试被锁死。\n2. 修复续聊遇网络超时/临时故障跨账号重试时的上下文丢失隐患：\n   - 补齐 retryTemporary 重试路由策略，并将 context.DeadlineExceeded 明确归入可重试瞬态错误；\n   - 续聊遇网络超时等非限流临时故障时，优先在原绑定账号原地重连 1 次，尽力保住云端既有百万 Token 缓存；\n   - 仅当原账号原地重连再次失败或命中 429 限流时才切往备号，并在切号前强制新建 thread_id、完整携带前文历史与完整工具表，杜绝把旧账号增量错发给新账号；\n   - 全账号因网络断连均失败时保留既有持久化会话绑定，网络恢复后仍可无损续聊。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.2",
+  "version": "2.4.3",
+  "tag": "v2.4.3",
+  "published_at": "2026-11-26T00:50:30Z",
+  "release_notes": "QuickRelay Studio v2.4.3 更新内容：\n1. 会话正确性加固与并发淘汰修复：\n   - 新增上一轮助手最终对外输出指纹校验（含规范化工具调用参数 JSON），彻底防止无显式会话 ID 时同开场白多窗口续聊误串线程，不匹配或旧记录安全回退以完整历史新建；\n   - OpenAI 与 Anthropic 的流式及非流式路径统一在输出清洗、工具解析及流尾 Flush 完成后提交最终输出指纹，取消或失败不再提交半截记录；\n   - 管理控制台单删/全清会话改为内存缓存与 SQLite 双端同步失效，阻断在途旧请求把已清理映射写回复活；\n   - 容量淘汰严格限定仅淘汰空闲会话，且同会话串行排队支持 context 取消/超时立即退出。\n2. 附件完整性严格校验：\n   - 单轮最多 16 个有效图片/二进制文档附件（纯文本文档内联不占配额），超限、损坏、不支持格式/来源或上传及 DLP 失败均直接返回明确错误，绝不静默丢弃或向模型派发残缺生成请求。\n3. 明确限流跨请求账号冷却：\n   - 识别上游 429 / Throttling 限流及 Retry-After 头并记录进程内跨请求冷却（默认 45s，上限 5m），后续新请求自动避开冷却账号并用完整历史重建接手；\n   - 全部账号均处冷却时停止重拨，直接返回 429 与 Retry-After 头并保留既有会话映射；普通网络超时绝不触发冷却。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.3",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.4.2-win-x64.zip",
-      "size": 8658081,
-      "sha256": "6c8174bbc59372216bd69ac43ee7aee37bb1601788d0f0236332fd2747bbff41",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.2/QuickRelay-Studio-v2.4.2-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.4.3-win-x64.zip",
+      "size": 8674719,
+      "sha256": "9308527fd7ee3d6579ca7637336139aebddbf0b2c3326f2846f226908cea9dd8",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.3/QuickRelay-Studio-v2.4.3-win-x64.zip"
     }
   }
 }

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -15,11 +16,15 @@ import (
 	"quickrelay-studio/internal/accounts"
 )
 
-var ErrEmptyResponse = errors.New("upstream returned no visible text or tool calls")
+var (
+	ErrEmptyResponse     = errors.New("upstream returned no visible text or tool calls")
+	ErrInvalidAttachment = errors.New("invalid attachment")
+)
 
 type UpstreamError struct {
 	StatusCode int
 	Code       string
+	RetryAfter time.Duration
 	Err        error
 }
 
@@ -45,7 +50,7 @@ const (
 )
 
 func retryActionFor(err error) retryAction {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, ErrUserMessageTooLarge) {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, ErrUserMessageTooLarge) || errors.Is(err, ErrInvalidAttachment) {
 		return retryStop
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
@@ -103,13 +108,14 @@ func retryActionFor(err error) retryAction {
 }
 
 // shouldResetConversation 判断单轮请求失败后是否真正需要销毁既有会话映射：
-// 用户取消（Esc）、单轮超时或已有成功历史记录时的临时错误/单轮内容拦截均保留 thread_id 与已落盘指纹，
+// 用户取消（Esc）、单轮超时、全账号冷却、附件校验失败或已有成功历史记录时的临时错误/单轮内容拦截均保留 thread_id 与已落盘指纹，
 // 仅当上游明确返回会话过期/失效或当前账号不可用需要切换账号时才清理重建。
 func shouldResetConversation(conv *conversation, err error) bool {
 	if err == nil || conv == nil {
 		return false
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, accounts.ErrAllAccountsCoolingDown) || errors.Is(err, ErrInvalidAttachment) {
 		return false
 	}
 	action := retryActionFor(err)
@@ -130,13 +136,14 @@ func retryActionForCode(code string) (retryAction, bool) {
 		"unauthorized", "unauthenticated", "notauthenticated", "authenticationfailed":
 		return retryRefresh, true
 	case "accessdenied", "forbidden", "permissiondenied", "insufficientcredits", "insufficientquota", "quotaexceeded",
-		"resourceexhausted", "creditsexhausted", "subscriptionrequired", "paymentrequired":
+		"resourceexhausted", "creditsexhausted", "subscriptionrequired", "paymentrequired", "attachmenttransportunsupported":
 		return retryNextAccount, true
 	case "sessionnotfound", "threadnotfound", "conversationnotfound", "invalidsession", "sessionexpired",
 		"invalidthread", "threadexpired", "sessiondoesnotexist":
 		return retryNewSession, true
 	case "validation", "validationerror", "invalidargument", "invalidrequest", "invalidrequesterror", "badrequest",
-		"malformedrequest", "prompttoolarge", "messagetoolarge", "requesttoolarge", "contextlengthexceeded":
+		"malformedrequest", "prompttoolarge", "messagetoolarge", "requesttoolarge", "contextlengthexceeded",
+		"attachmentblockedbydlp":
 		return retryStop, true
 	case "throttling", "throttled", "toomanyrequests", "ratelimitexceeded", "ratelimited", "serviceunavailable", "unavailable",
 		"internalservererror", "internalerror", "timeout", "requesttimeout", "gatewaytimeout", "upstreamtimeout",
@@ -208,7 +215,7 @@ func isRateLimitTemporary(err error) bool {
 }
 
 func invalidChatRequest(err error) bool {
-	if errors.Is(err, ErrUserMessageTooLarge) {
+	if errors.Is(err, ErrUserMessageTooLarge) || errors.Is(err, ErrInvalidAttachment) {
 		return true
 	}
 	var upstreamErr *UpstreamError
@@ -228,6 +235,8 @@ func invalidChatRequest(err error) bool {
 
 func chatErrorStatus(err error) (int, string) {
 	switch {
+	case errors.Is(err, accounts.ErrAllAccountsCoolingDown):
+		return http.StatusTooManyRequests, "rate_limit_exceeded"
 	case errors.Is(err, accounts.ErrNoAccounts), errors.Is(err, accounts.ErrNoAvailableAccounts):
 		return http.StatusUnauthorized, "upstream_session_unavailable"
 	case errors.Is(err, ErrUserMessageTooLarge):
@@ -239,6 +248,49 @@ func chatErrorStatus(err error) (int, string) {
 	default:
 		return http.StatusBadGateway, "upstream_error"
 	}
+}
+
+// parseRetryAfterHeader 解析标准 HTTP Retry-After 头（支持十进制秒数与 HTTP-date 格式）。
+func parseRetryAfterHeader(raw string, now time.Time) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if secs, err := strconv.ParseFloat(raw, 64); err == nil && secs > 0 {
+		return time.Duration(secs * float64(time.Second))
+	}
+	if t, err := http.ParseTime(raw); err == nil {
+		if d := t.Sub(now); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+// rateLimitCooldownFor 计算明确限流触发的账号冷却时长：优先采用上游可信 Retry-After，否则使用短默认值。
+func rateLimitCooldownFor(err error) time.Duration {
+	var upstreamErr *UpstreamError
+	if errors.As(err, &upstreamErr) && upstreamErr.RetryAfter > 0 {
+		d := upstreamErr.RetryAfter
+		if d > accounts.MaxRateLimitCooldown {
+			return accounts.MaxRateLimitCooldown
+		}
+		return d
+	}
+	return accounts.DefaultRateLimitCooldown
+}
+
+// writeCooldownRetryHeader 在全账号均处于冷却期返回 429 时附带标准 Retry-After 秒数头。
+func writeCooldownRetryHeader(w http.ResponseWriter, err error) {
+	var cdErr *accounts.CooldownError
+	if !errors.As(err, &cdErr) || cdErr.RetryAfter <= 0 {
+		return
+	}
+	secs := int((cdErr.RetryAfter + time.Second - 1) / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
 }
 
 func waitForRetry(ctx context.Context, attempt int) error {

@@ -225,8 +225,46 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_a
 CREATE INDEX IF NOT EXISTS idx_request_logs_status ON request_logs(status);
 CREATE INDEX IF NOT EXISTS idx_request_logs_account ON request_logs(account_id);
 `
-	_, err := s.db.Exec(schema)
-	return err
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+	return s.ensureConversationColumns()
+}
+
+// ensureConversationColumns 幂等迁移 conversations 表新增列，确保老版本数据库无损升级。
+func (s *Store) ensureConversationColumns() error {
+	rows, err := s.db.Query(`PRAGMA table_info(conversations)`)
+	if err != nil {
+		return err
+	}
+	hasLastAssistantHash := false
+	for rows.Next() {
+		var (
+			cid        int
+			name, typ  string
+			notnull    int
+			dflt       sql.NullString
+			pk         int
+		)
+		if scanErr := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); scanErr != nil {
+			rows.Close()
+			return scanErr
+		}
+		if strings.EqualFold(strings.TrimSpace(name), "last_assistant_hash") {
+			hasLastAssistantHash = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if !hasLastAssistantHash {
+		if _, err := s.db.Exec(`ALTER TABLE conversations ADD COLUMN last_assistant_hash TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 const columns = `id, email, display_name, provider, build_stage, region,

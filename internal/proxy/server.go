@@ -47,6 +47,22 @@ func NewServer(cfg *config.Config, mgr *accounts.Manager) *Server {
 	}
 }
 
+// DeleteConversation 同步清除指定会话的内存映射与持久化记录。
+func (s *Server) DeleteConversation(ctx context.Context, key string) error {
+	if s == nil || s.sessions == nil {
+		return nil
+	}
+	return s.sessions.invalidateKey(ctx, key)
+}
+
+// ClearConversations 同步清空全部会话的内存映射与持久化记录。
+func (s *Server) ClearConversations(ctx context.Context) error {
+	if s == nil || s.sessions == nil {
+		return nil
+	}
+	return s.sessions.invalidateAll(ctx)
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
@@ -102,10 +118,12 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 
 // preparedTurn 封装一次 OpenAI 或 Anthropic 请求共享的会话上下文、重试路由、输出过滤与日志埋点。
 type preparedTurn struct {
-	server *Server
-	ctx    context.Context
-	cancel context.CancelFunc
-	conv   *conversation
+	server      *Server
+	ctx         context.Context
+	cancel      context.CancelFunc
+	conv        *conversation
+	convEpoch   uint64
+	convVersion uint64
 
 	id             string
 	created        int64
@@ -316,13 +334,19 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 	}
 	turnTimeout := s.turnTimeoutFor(thinkingEffort)
 	ctx, cancel := context.WithTimeout(r.Context(), turnTimeout)
-	conv := s.sessions.acquire(conversationKey(r, req, baseHash))
+	conv, convEpoch, convVer, acqErr := s.sessions.acquire(ctx, conversationKey(r, req, baseHash))
+	if acqErr != nil {
+		cancel()
+		return nil, acqErr
+	}
 
 	t := &preparedTurn{
 		server:            s,
 		ctx:               ctx,
 		cancel:            cancel,
 		conv:              conv,
+		convEpoch:         convEpoch,
+		convVersion:       convVer,
 		id:                idPrefix + strings.ReplaceAll(uuid(), "-", ""),
 		created:           time.Now().Unix(),
 		protocol:          protocol,
@@ -354,7 +378,12 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 	if s.cfg.SessionReuse && !isAux && conv.threadID != "" {
 		if delta, ok := conv.delta(req.Messages); ok {
 			deltaGuide := deltaDeveloperGuidelinesForMode(delta, workMode)
-			if deltaPrompt, deltaImages, dErr := formatResumeDeltaWithImages(ctx, req.Messages, delta); dErr == nil && (hasVisibleText(deltaPrompt) || len(deltaImages) > 0 || deltaGuide != "") {
+			deltaPrompt, deltaImages, dErr := formatResumeDeltaWithImages(ctx, req.Messages, delta)
+			if dErr != nil && errors.Is(dErr, ErrInvalidAttachment) {
+				t.Close()
+				return nil, dErr
+			}
+			if dErr == nil && (hasVisibleText(deltaPrompt) || len(deltaImages) > 0 || deltaGuide != "") {
 				promptText = deltaPrompt
 				images = deltaImages
 				turnGuidelines = deltaGuide
@@ -446,30 +475,30 @@ func (t *preparedTurn) loadFull() error {
 
 // switchToFullTranscript 将当前轮切换为新建会话与完整历史/工具表发送，但不提前销毁持久化会话映射，
 // 以便在后续重试仍因临时网络故障失败时保留原账号既有缓存，待切号成功后由 saveConversation 自然覆盖。
-func (t *preparedTurn) switchToFullTranscript() {
+// 若重放完整历史所需的附件校验失败，明确返回错误以阻断残缺请求。
+func (t *preparedTurn) switchToFullTranscript() error {
+	if fErr := t.loadFull(); fErr != nil {
+		return fErr
+	}
 	t.resume = false
 	t.in.ThreadID = ""
 	t.in.CreateSession = true
 	t.in.Guidelines = t.fullGuide
 	t.in.ToolProtocol = t.fullBridgePrompt
-	if fErr := t.loadFull(); fErr != nil {
-		log.Printf("chat %s reset conversation image load failed: %v", t.id, fErr)
-		t.in.Prompt = t.fallbackText
-		t.in.Images = nil
-		return
-	}
 	t.in.Prompt = t.fullPrompt
 	t.in.Images = t.fullImages
+	return nil
 }
 
-func (t *preparedTurn) resetConversation() {
-	t.server.sessions.reset(t.conv)
-	t.switchToFullTranscript()
+func (t *preparedTurn) resetConversation() error {
+	t.server.sessions.reset(t.conv, t.convEpoch, t.convVersion)
+	return t.switchToFullTranscript()
 }
 
-func (t *preparedTurn) saveConversation(res ChatResult) {
+func (t *preparedTurn) saveConversation(res ChatResult, outText string, outTools []ToolCall) {
 	if !t.auxRequest && t.server.cfg.SessionReuse && res.ThreadID != "" && t.usedAccount != nil {
-		t.server.sessions.save(t.conv, res.ThreadID, t.usedAccount.ID, t.baseHash, t.req.Messages)
+		asstHash := assistantOutputFingerprint(outText, outTools)
+		t.server.sessions.save(t.conv, t.convEpoch, t.convVersion, res.ThreadID, t.usedAccount.ID, t.baseHash, t.req.Messages, asstHash)
 	}
 }
 
@@ -498,6 +527,7 @@ func (t *preparedTurn) responseOutput(result ChatResult) (string, []ToolCall) {
 }
 
 func (t *preparedTurn) selectAccount() (*store.Account, *Session, error) {
+	var pinnedCooldownErr *accounts.CooldownError
 	for {
 		if err := t.ctx.Err(); err != nil {
 			return nil, nil, err
@@ -513,9 +543,15 @@ func (t *preparedTurn) selectAccount() (*store.Account, *Session, error) {
 			}
 			acct, selectErr = t.server.accounts.NextPinned(t.ctx, accountID)
 			if selectErr != nil {
+				var cdErr *accounts.CooldownError
+				if errors.As(selectErr, &cdErr) {
+					pinnedCooldownErr = cdErr
+				}
 				t.blockedAccounts[accountID] = true
 				log.Printf("chat %s preferred account %d unavailable; selecting another account", t.id, accountID)
-				t.switchToFullTranscript()
+				if swErr := t.switchToFullTranscript(); swErr != nil {
+					return nil, nil, swErr
+				}
 				continue
 			}
 		} else {
@@ -537,6 +573,15 @@ func (t *preparedTurn) selectAccount() (*store.Account, *Session, error) {
 				acct, selectErr = t.server.accounts.NextExcluding(t.ctx, t.blockedAccounts)
 			}
 			if selectErr != nil {
+				if errors.Is(selectErr, accounts.ErrAllAccountsCoolingDown) {
+					return nil, nil, selectErr
+				}
+				if pinnedCooldownErr != nil {
+					return nil, nil, pinnedCooldownErr
+				}
+				if rem := t.server.accounts.PoolCooldownRemaining(t.ctx); rem > 0 {
+					return nil, nil, &accounts.CooldownError{RetryAfter: rem}
+				}
 				return nil, nil, selectErr
 			}
 		}
@@ -546,7 +591,9 @@ func (t *preparedTurn) selectAccount() (*store.Account, *Session, error) {
 			t.server.accounts.ReportFailure(t.ctx, acct.ID, err)
 			log.Printf("chat %s account=%s invalid_session error=%v", t.id, accountLogLabel(acct), err)
 			if t.resume {
-				t.resetConversation()
+				if rErr := t.resetConversation(); rErr != nil {
+					return nil, nil, rErr
+				}
 			}
 			continue
 		}
@@ -565,6 +612,9 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamStarted func() bool, res
 		}
 		acct, sess, err := t.selectAccount()
 		if err != nil {
+			if errors.Is(err, accounts.ErrAllAccountsCoolingDown) {
+				return res, err
+			}
 			if lastErr != nil && errors.Is(err, accounts.ErrNoAvailableAccounts) {
 				return res, lastErr
 			}
@@ -574,7 +624,9 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamStarted func() bool, res
 		// 必须强制切换为新会话并携带完整历史与完整工具表，杜绝把旧账号 thread_id 与精简增量发给新账号。
 		if t.resume && t.conv != nil && t.conv.accountID != 0 && acct.ID != t.conv.accountID {
 			log.Printf("chat %s switched account %d->%d during resume; rebuilding full transcript", t.id, t.conv.accountID, acct.ID)
-			t.switchToFullTranscript()
+			if swErr := t.switchToFullTranscript(); swErr != nil {
+				return res, swErr
+			}
 		}
 		if resetOutput != nil {
 			resetOutput()
@@ -623,6 +675,11 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamStarted func() bool, res
 			return res, t.ctx.Err()
 		}
 		action := retryActionFor(err)
+		if isRateLimitTemporary(err) {
+			// 对明确限流账号写入跨请求短暂冷却并屏蔽本轮再选，避免新请求反复命中同一限流账号。
+			t.server.accounts.MarkCooldown(acct.ID, rateLimitCooldownFor(err))
+			t.blockedAccounts[acct.ID] = true
+		}
 		if action == retryStop || t.attempts >= t.maxAttempts {
 			return res, err
 		}
@@ -630,7 +687,9 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamStarted func() bool, res
 		switch action {
 		case retryRefresh:
 			if t.refreshedAccounts[acct.ID] {
-				t.resetConversation()
+				if rErr := t.resetConversation(); rErr != nil {
+					return res, rErr
+				}
 				t.blockedAccounts[acct.ID] = true
 				break
 			}
@@ -640,14 +699,20 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamStarted func() bool, res
 				// 刷新同一账号 Token 成功时保留既有 thread_id 与增量上下文，不清空会话
 				t.preferredAccount = acct.ID
 			} else {
-				t.resetConversation()
+				if rErr := t.resetConversation(); rErr != nil {
+					return res, rErr
+				}
 				t.blockedAccounts[acct.ID] = true
 			}
 		case retryNextAccount:
-			t.resetConversation()
+			if rErr := t.resetConversation(); rErr != nil {
+				return res, rErr
+			}
 			t.blockedAccounts[acct.ID] = true
 		case retryNewSession:
-			t.resetConversation()
+			if rErr := t.resetConversation(); rErr != nil {
+				return res, rErr
+			}
 			if wasResume {
 				t.preferredAccount = acct.ID
 				log.Printf("chat %s session resume failed; retrying with full transcript", t.id)
@@ -663,7 +728,9 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamStarted func() bool, res
 					log.Printf("chat %s temporary error on resumed account %s; retrying same account once to preserve cache", t.id, accountLogLabel(acct))
 				} else {
 					// 原账号已重连失败或命中 429 限流，切往其他账号前先切换为完整历史与完整工具表重建。
-					t.switchToFullTranscript()
+					if swErr := t.switchToFullTranscript(); swErr != nil {
+						return res, swErr
+					}
 					log.Printf("chat %s temporary error after same-account retry or rate limit; switching account with full transcript", t.id)
 				}
 			}
@@ -762,7 +829,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	turn, err := s.prepareTurn(r, &req, "openai", "/v1/chat/completions", "chatcmpl-")
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		status, code := chatErrorStatus(err)
+		writeOpenAIError(w, status, code, err.Error())
 		return
 	}
 	defer turn.Close()
@@ -771,22 +842,27 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		res, lastErr := turn.runChat(nil, nil, nil)
 		if lastErr != nil {
 			if shouldResetConversation(turn.conv, lastErr) {
-				s.sessions.reset(turn.conv)
+				s.sessions.reset(turn.conv, turn.convEpoch, turn.convVersion)
 			}
 			status, code := chatErrorStatus(lastErr)
 			turn.finishTurn("failed", "", res, 0, lastErr)
+			writeCooldownRetryHeader(w, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
 			return
 		}
-		if turn.ctx.Err() == nil {
-			turn.saveConversation(res)
-		}
 		text, toolCalls := turn.responseOutput(res)
+		visibleOut := ""
+		if hasVisibleText(text) {
+			visibleOut = text
+		}
+		if turn.ctx.Err() == nil {
+			turn.saveConversation(res, visibleOut, toolCalls)
+		}
 		message := map[string]any{"role": "assistant"}
-		if !hasVisibleText(text) {
+		if visibleOut == "" {
 			message["content"] = nil
 		} else {
-			message["content"] = text
+			message["content"] = visibleOut
 		}
 		if strings.TrimSpace(res.Thinking) != "" {
 			message["reasoning_content"] = res.Thinking
@@ -932,6 +1008,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	sawVisibleText := false
 	var pendingText strings.Builder
+	var finalOutText strings.Builder
+	var finalOutTools []ToolCall
 	var bridgeStream *toolBridgeStream
 	if turn.bridgeActive {
 		bridgeStream = newToolBridgeStream(turn.allowedTools, turn.choiceMode, turn.choiceName, turn.parallelTools)
@@ -948,12 +1026,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if !hasVisibleText(pendingText.String()) {
 				return
 			}
-			sawVisibleText = true
-			writeChunk(map[string]any{"content": pendingText.String()}, nil)
+			chunk = pendingText.String()
 			pendingText.Reset()
-			return
+			sawVisibleText = true
 		}
 		writeChunk(map[string]any{"content": chunk}, nil)
+		if getClientWriteErr() == nil {
+			finalOutText.WriteString(chunk)
+		}
 	}
 	emitToolStart := func(ts ToolCallStart) {
 		if ts.ID == "" || ts.Name == "" {
@@ -984,18 +1064,28 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 					"arguments": tc.Arguments,
 				},
 			}}}, nil)
-			return
+		} else {
+			writeChunk(map[string]any{"tool_calls": []map[string]any{{
+				"index": emittedToolIdx,
+				"id":    tc.ID,
+				"type":  "function",
+				"function": map[string]any{
+					"name":      tc.Name,
+					"arguments": tc.Arguments,
+				},
+			}}}, nil)
+			emittedToolIdx++
 		}
-		writeChunk(map[string]any{"tool_calls": []map[string]any{{
-			"index": emittedToolIdx,
-			"id":    tc.ID,
-			"type":  "function",
-			"function": map[string]any{
-				"name":      tc.Name,
-				"arguments": tc.Arguments,
-			},
-		}}}, nil)
-		emittedToolIdx++
+		if getClientWriteErr() == nil {
+			finalOutTools = append(finalOutTools, ToolCall{
+				ID:   tc.ID,
+				Type: "function",
+				Function: FunctionCall{
+					Name:      tc.Name,
+					Arguments: tc.Arguments,
+				},
+			})
+		}
 	}
 	quickFilter := newQuickOutputFilter(turn.allowedTools, func(tc ToolCallReply) bool {
 		return turn.bridgeActive && emittedToolIdx == 0 && bridgeStream.acceptCall(tc)
@@ -1050,6 +1140,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}, isStarted, func() {
 		sawVisibleText = false
 		pendingText.Reset()
+		finalOutText.Reset()
+		finalOutTools = nil
 		emittedToolIdx = 0
 		clear(startedTools)
 		if bridgeStream != nil {
@@ -1060,7 +1152,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	stopHB()
 	if lastErr != nil {
 		if shouldResetConversation(turn.conv, lastErr) {
-			s.sessions.reset(turn.conv)
+			s.sessions.reset(turn.conv, turn.convEpoch, turn.convVersion)
 		}
 		if wErr := getClientWriteErr(); wErr != nil {
 			turn.finishTurn("failed", "", res, 0, wErr)
@@ -1069,6 +1161,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if !isStarted() {
 			status, code := chatErrorStatus(lastErr)
 			turn.finishTurn("failed", "", res, 0, lastErr)
+			writeCooldownRetryHeader(w, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
 			return
 		}
@@ -1086,7 +1179,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		turn.finishTurn("failed", "", res, emittedToolIdx, errOut)
 		return
 	}
-	turn.saveConversation(res)
 	finish := "stop"
 	if turn.bridgeActive {
 		remText, remCalls := bridgeStream.Flush()
@@ -1134,6 +1226,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				emitText(cleanedRes)
 			}
 		}
+	}
+	if getClientWriteErr() == nil && turn.ctx.Err() == nil {
+		turn.saveConversation(res, finalOutText.String(), finalOutTools)
+	} else {
+		errOut := getClientWriteErr()
+		if errOut == nil {
+			errOut = turn.ctx.Err()
+		}
+		turn.finishTurn("failed", "", res, emittedToolIdx, errOut)
+		return
 	}
 	finalModel := resolvedResponseModel(turn.model, res.Usage)
 	writePayload(map[string]any{

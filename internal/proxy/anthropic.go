@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -285,11 +287,8 @@ func convertAnthropicDocumentParts(blk anthropicContentBlock) []any {
 		}
 	case "base64":
 		b64 := strings.TrimSpace(blk.Source.Data)
-		if b64 == "" {
-			return nil
-		}
 		media := normalizeImageMIME(blk.Source.MediaType)
-		if isTextDocumentMIME(media) {
+		if b64 != "" && isTextDocumentMIME(media) {
 			if _, decoded, err := decodeDocumentBase64(media, b64); err == nil {
 				return []any{wrapDocText(string(decoded))}
 			}
@@ -316,9 +315,6 @@ func convertAnthropicDocumentParts(blk anthropicContentBlock) []any {
 		return parts
 	case "url":
 		u := strings.TrimSpace(blk.Source.URL)
-		if u == "" {
-			return nil
-		}
 		part := map[string]any{
 			"type": "document",
 			"source": map[string]any{
@@ -352,9 +348,6 @@ func anthropicImagePart(src *anthropicImageSource) map[string]any {
 	}
 	switch strings.ToLower(strings.TrimSpace(src.Type)) {
 	case "base64":
-		if strings.TrimSpace(src.Data) == "" {
-			return nil
-		}
 		media := strings.TrimSpace(src.MediaType)
 		if media == "" {
 			media = "image/png"
@@ -366,9 +359,6 @@ func anthropicImagePart(src *anthropicImageSource) map[string]any {
 			},
 		}
 	case "url":
-		if strings.TrimSpace(src.URL) == "" {
-			return nil
-		}
 		return map[string]any{
 			"type":      "image_url",
 			"image_url": map[string]any{"url": strings.TrimSpace(src.URL)},
@@ -568,7 +558,11 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	req := anthropicToChatRequest(&ar)
 	turn, err := s.prepareTurn(r, &req, "anthropic", "/v1/messages", "msg_")
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		status, _ := chatErrorStatus(err)
+		writeAnthropicError(w, status, anthropicErrorType(status, err), err.Error())
 		return
 	}
 	defer turn.Close()
@@ -577,17 +571,22 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		res, lastErr := turn.runChat(nil, nil, nil)
 		if lastErr != nil {
 			if shouldResetConversation(turn.conv, lastErr) {
-				s.sessions.reset(turn.conv)
+				s.sessions.reset(turn.conv, turn.convEpoch, turn.convVersion)
 			}
 			status, _ := chatErrorStatus(lastErr)
 			turn.finishTurn("failed", "", res, 0, lastErr)
+			writeCooldownRetryHeader(w, lastErr)
 			writeAnthropicError(w, status, anthropicErrorType(status, lastErr), lastErr.Error())
 			return
 		}
-		if turn.ctx.Err() == nil {
-			turn.saveConversation(res)
-		}
 		text, toolCalls := turn.responseOutput(res)
+		visibleOut := ""
+		if hasVisibleText(text) {
+			visibleOut = text
+		}
+		if turn.ctx.Err() == nil {
+			turn.saveConversation(res, visibleOut, toolCalls)
+		}
 
 		var blocks []map[string]any
 		if strings.TrimSpace(res.Thinking) != "" {
@@ -786,6 +785,8 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	sawVisibleText := false
 	var pendingText strings.Builder
+	var finalOutText strings.Builder
+	var finalOutTools []ToolCall
 	emittedTools := 0
 
 	emitText := func(chunk string) {
@@ -824,6 +825,9 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 				"text": chunk,
 			},
 		})
+		if getClientWriteErr() == nil {
+			finalOutText.WriteString(chunk)
+		}
 	}
 	emitToolStart := func(ts ToolCallStart) {
 		if ts.ID == "" || ts.Name == "" {
@@ -885,6 +889,16 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			"index": idx,
 		})
 		emittedTools++
+		if getClientWriteErr() == nil {
+			finalOutTools = append(finalOutTools, ToolCall{
+				ID:   tc.ID,
+				Type: "function",
+				Function: FunctionCall{
+					Name:      tc.Name,
+					Arguments: args,
+				},
+			})
+		}
 	}
 
 	var bridgeStream *toolBridgeStream
@@ -942,6 +956,8 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	}, isStarted, func() {
 		sawVisibleText = false
 		pendingText.Reset()
+		finalOutText.Reset()
+		finalOutTools = nil
 		emittedTools = 0
 		nextBlockIdx = 0
 		openType = ""
@@ -956,7 +972,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	if lastErr != nil {
 		if shouldResetConversation(turn.conv, lastErr) {
-			s.sessions.reset(turn.conv)
+			s.sessions.reset(turn.conv, turn.convEpoch, turn.convVersion)
 		}
 		if wErr := getClientWriteErr(); wErr != nil {
 			turn.finishTurn("failed", "", res, 0, wErr)
@@ -965,6 +981,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		if !isStarted() {
 			status, _ := chatErrorStatus(lastErr)
 			turn.finishTurn("failed", "", res, 0, lastErr)
+			writeCooldownRetryHeader(w, lastErr)
 			writeAnthropicError(w, status, anthropicErrorType(status, lastErr), lastErr.Error())
 			return
 		}
@@ -988,7 +1005,6 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		turn.finishTurn("failed", "", res, emittedTools, errOut)
 		return
 	}
-	turn.saveConversation(res)
 	if turn.bridgeActive {
 		remText, remCalls := bridgeStream.Flush()
 		if remText != "" {
@@ -1036,6 +1052,16 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	ensureStarted()
 	closeOpenBlock()
+	if getClientWriteErr() == nil && turn.ctx.Err() == nil {
+		turn.saveConversation(res, finalOutText.String(), finalOutTools)
+	} else {
+		errOut := getClientWriteErr()
+		if errOut == nil {
+			errOut = turn.ctx.Err()
+		}
+		turn.finishTurn("failed", "", res, emittedTools, errOut)
+		return
+	}
 	stopReason := "end_turn"
 	if emittedTools > 0 {
 		stopReason = "tool_use"

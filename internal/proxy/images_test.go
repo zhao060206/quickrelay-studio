@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -101,31 +102,36 @@ func TestFormatPromptWithImages_FormatsAndDedup(t *testing.T) {
 	}
 }
 
-// TestFormatPromptWithImages_MaxLimitKeepsLatest 验证超过单轮 16 张上限时保留最新的图片。
+// TestFormatPromptWithImages_MaxLimitKeepsLatest 验证不超过 16 个有效附件正常通过，超出上限则明确报错且不静默裁剪。
 func TestFormatPromptWithImages_MaxLimitKeepsLatest(t *testing.T) {
-	parts := make([]any, 0, 20)
-	for i := 0; i < 20; i++ {
+	parts16 := make([]any, 0, 16)
+	for i := 0; i < 16; i++ {
 		raw := makeFakePNG(byte(i + 1))
-		parts = append(parts, map[string]any{
+		parts16 = append(parts16, map[string]any{
 			"type":      "input_image",
 			"image_url": "data:image/png;base64," + base64.StdEncoding.EncodeToString(raw),
 		})
 	}
 	_, imgs, err := formatPromptWithImages(context.Background(), []Message{{
 		Role:    "user",
-		Content: parts,
+		Content: parts16,
 	}})
 	if err != nil {
-		t.Fatalf("formatPromptWithImages failed: %v", err)
+		t.Fatalf("formatPromptWithImages(16) failed: %v", err)
 	}
 	if len(imgs) != maxImagesPerTurn {
 		t.Fatalf("got %d images, want %d", len(imgs), maxImagesPerTurn)
 	}
-	if !strings.HasPrefix(imgs[0].Name, "img-05-") {
-		t.Fatalf("expected oldest kept image to start with img-05-, got %q", imgs[0].Name)
-	}
-	if !strings.HasPrefix(imgs[len(imgs)-1].Name, "img-20-") {
-		t.Fatalf("expected newest kept image to start with img-20-, got %q", imgs[len(imgs)-1].Name)
+
+	parts17 := append(append([]any(nil), parts16...), map[string]any{
+		"type":      "input_image",
+		"image_url": "data:image/png;base64," + base64.StdEncoding.EncodeToString(makeFakePNG(17)),
+	})
+	if _, _, err := formatPromptWithImages(context.Background(), []Message{{
+		Role:    "user",
+		Content: parts17,
+	}}); !errors.Is(err, ErrInvalidAttachment) {
+		t.Fatalf("expected ErrInvalidAttachment for 17 images, got %v", err)
 	}
 }
 
@@ -234,14 +240,23 @@ func TestUploadImageAttachments_MockServer(t *testing.T) {
 		{Name: "fail.png", MIMEType: "image/png", Data: makeFakePNG(2)},
 	}
 
-	metas, failed := uploadImageAttachments(context.Background(), sess, "thread-test", images)
-	if len(metas) != 1 {
-		t.Fatalf("got %d uploaded metas, want 1 (failed=%v)", len(metas), failed)
+	metas, err := uploadImageAttachments(context.Background(), sess, "thread-test", images)
+	if err == nil || len(metas) != 0 {
+		t.Fatalf("expected upload failure to abort with nil metas when fail.png fails, got metas=%d err=%v", len(metas), err)
 	}
-	if len(failed) != 1 || !strings.Contains(failed[0], "fail.png") {
-		t.Fatalf("unexpected failed list: %v", failed)
+	if !strings.Contains(err.Error(), "fail.png") {
+		t.Fatalf("expected error to identify fail.png, got: %v", err)
 	}
-	m := metas[0]
+
+	// 单传有效图片应正常返回完整元数据
+	okMetas, okErr := uploadImageAttachments(context.Background(), sess, "thread-test", images[:1])
+	if okErr != nil {
+		t.Fatalf("expected valid image upload to succeed, got: %v", okErr)
+	}
+	if len(okMetas) != 1 {
+		t.Fatalf("got %d uploaded metas, want 1", len(okMetas))
+	}
+	m := okMetas[0]
 	if m["type"] != "image" || m["mimeType"] != "image/png" || m["name"] != "ok.png" {
 		t.Fatalf("unexpected image meta: %#v", m)
 	}

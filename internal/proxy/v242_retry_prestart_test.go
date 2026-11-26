@@ -306,10 +306,12 @@ func TestRetryTemporary_SameAccountRetryPreservesCache(t *testing.T) {
 	var ownerCap *[]capturedUpstreamTurn
 	var ownerMu *sync.Mutex
 	var failNext *atomic.Bool
+	firstReply := "账号A成功回复"
 	if ownerIsA {
 		ownerDials, otherDials, ownerCap, ownerMu, failNext = dialsA, dialsB, capA, muA, &failNextA
 	} else {
 		ownerDials, otherDials, ownerCap, ownerMu, failNext = dialsB, dialsA, capB, muB, &failNextB
+		firstReply = "账号B成功回复"
 	}
 	ownerMu.Lock()
 	establishedTID := (*ownerCap)[0].ThreadID
@@ -322,7 +324,7 @@ func TestRetryTemporary_SameAccountRetryPreservesCache(t *testing.T) {
 	failNext.Store(true)
 	postAnthropic([]map[string]any{
 		{"role": "user", "content": "第一轮独特记忆锚点-ALPHA"},
-		{"role": "assistant", "content": "第一轮回答"},
+		{"role": "assistant", "content": firstReply},
 		{"role": "user", "content": "第二轮增量问题-BETA"},
 	})
 
@@ -413,6 +415,7 @@ func TestRetryTemporary_FailTwiceSwitchesAccountWithFullTranscript(t *testing.T)
 	var ownerCap, otherCap *[]capturedUpstreamTurn
 	var ownerMu, otherMu *sync.Mutex
 	var ownerDials, otherDials *atomic.Int32
+	firstReply := "账号A正常回复"
 	if ownerIsA {
 		ownerCap, ownerMu, ownerDials = capA, muA, dialsA
 		otherCap, otherMu, otherDials = capB, muB, dialsB
@@ -421,6 +424,7 @@ func TestRetryTemporary_FailTwiceSwitchesAccountWithFullTranscript(t *testing.T)
 		ownerCap, ownerMu, ownerDials = capB, muB, dialsB
 		otherCap, otherMu, otherDials = capA, muA, dialsA
 		alwaysTimeoutB.Store(true)
+		firstReply = "账号B兜底重建成功"
 	}
 	ownerMu.Lock()
 	oldTID := (*ownerCap)[0].ThreadID
@@ -429,7 +433,7 @@ func TestRetryTemporary_FailTwiceSwitchesAccountWithFullTranscript(t *testing.T)
 	// 第 2 轮：原账号连续失败 2 次后，第 3 次切到备份账号
 	sendTurn([]map[string]any{
 		{"role": "user", "content": "历史关键上下文-ANCHOR-9988"},
-		{"role": "assistant", "content": "第一轮回答"},
+		{"role": "assistant", "content": firstReply},
 		{"role": "user", "content": "第二轮最新指令-NEW-7766"},
 	})
 
@@ -511,17 +515,19 @@ func TestRetryTemporary_RateLimitSwitchesImmediatelyAndNetworkOutagePreservesCon
 		var ownerDials, otherDials *atomic.Int32
 		var otherCap *[]capturedUpstreamTurn
 		var otherMu *sync.Mutex
+		firstReply := "ok-A"
 		if ownerIsA {
 			ownerDials, otherDials, otherCap, otherMu = dialsA, dialsB, capB, muB
 			rateLimitA.Store(true)
 		} else {
 			ownerDials, otherDials, otherCap, otherMu = dialsB, dialsA, capA, muA
 			rateLimitB.Store(true)
+			firstReply = "ok-B"
 		}
 
 		postTurn([]map[string]any{
 			{"role": "user", "content": "首轮历史-RL-111"},
-			{"role": "assistant", "content": "第一轮答复"},
+			{"role": "assistant", "content": firstReply},
 			{"role": "user", "content": "续聊-RL-222"},
 		})
 
@@ -589,10 +595,12 @@ func TestRetryTemporary_RateLimitSwitchesImmediatelyAndNetworkOutagePreservesCon
 		var ownerCap *[]capturedUpstreamTurn
 		var ownerMu *sync.Mutex
 		var otherDials *atomic.Int32
+		firstReply := "ok-A"
 		if ownerIsA {
 			ownerCap, ownerMu, otherDials = capA, muA, dialsB
 		} else {
 			ownerCap, ownerMu, otherDials = capB, muB, dialsA
+			firstReply = "ok-B"
 		}
 		ownerMu.Lock()
 		savedTID := (*ownerCap)[0].ThreadID
@@ -602,7 +610,7 @@ func TestRetryTemporary_RateLimitSwitchesImmediatelyAndNetworkOutagePreservesCon
 		timeoutAll.Store(true)
 		msgs2 := []map[string]any{
 			{"role": "user", "content": "持久锚点-OUTAGE-1"},
-			{"role": "assistant", "content": "第一轮答复"},
+			{"role": "assistant", "content": firstReply},
 			{"role": "user", "content": "第二轮重发-OUTAGE-2"},
 		}
 		if code := postRaw(msgs2); code == http.StatusOK {

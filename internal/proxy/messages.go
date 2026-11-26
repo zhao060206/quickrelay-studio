@@ -191,10 +191,11 @@ var supportedImageExt = map[string]string{
 	"image/webp": ".webp",
 }
 
-// imageCollector 收集单轮对话中的图片附件，完成内容去重、唯一命名与上限控制。
+// imageCollector 收集单轮对话中的图片与文档附件，完成内容去重、唯一命名与严格上限校验。
 type imageCollector struct {
 	byHash map[string]string // sha256 -> 已分配的文件名
 	order  []ImageAttachment
+	seen   int
 }
 
 func newImageCollector() *imageCollector {
@@ -203,12 +204,16 @@ func newImageCollector() *imageCollector {
 	}
 }
 
-// add 注册一张已校验通过的图片，若内容完全相同则返回已有文件名而不重复添加。
-func (c *imageCollector) add(mimeType string, data []byte) string {
+// add 注册一张已校验通过的图片，若内容完全相同则复用已有文件名；超过单轮上限时明确返回错误。
+func (c *imageCollector) add(mimeType string, data []byte) (string, error) {
+	c.seen++
 	sum := sha256.Sum256(data)
 	hashHex := hex.EncodeToString(sum[:])
 	if name, ok := c.byHash[hashHex]; ok {
-		return name
+		return name, nil
+	}
+	if len(c.order) >= maxImagesPerTurn {
+		return "", fmt.Errorf("%w: image #%d exceeds the limit of %d attachments per turn", ErrInvalidAttachment, c.seen, maxImagesPerTurn)
 	}
 	ext := supportedImageExt[mimeType]
 	if ext == "" {
@@ -223,15 +228,23 @@ func (c *imageCollector) add(mimeType string, data []byte) string {
 		Data:     data,
 		SHA256:   hashHex,
 	})
-	return name
+	return name, nil
 }
 
-// addDocument 注册一份待上传的文档附件（如 PDF），按内容 SHA-256 去重并保留安全可读文件名。
-func (c *imageCollector) addDocument(title, mimeType string, data []byte) string {
+// addDocument 注册一份待上传的文档附件（如 PDF），按内容 SHA-256 去重；超过单轮上限时明确返回错误。
+func (c *imageCollector) addDocument(title, mimeType string, data []byte) (string, error) {
+	c.seen++
 	sum := sha256.Sum256(data)
 	hashHex := hex.EncodeToString(sum[:])
 	if name, ok := c.byHash[hashHex]; ok {
-		return name
+		return name, nil
+	}
+	label := strings.TrimSpace(title)
+	if label == "" {
+		label = fmt.Sprintf("document #%d", c.seen)
+	}
+	if len(c.order) >= maxImagesPerTurn {
+		return "", fmt.Errorf("%w: %s exceeds the limit of %d attachments per turn", ErrInvalidAttachment, label, maxImagesPerTurn)
 	}
 	ext := ".pdf"
 	if strings.EqualFold(mimeType, "text/plain") {
@@ -256,7 +269,7 @@ func (c *imageCollector) addDocument(title, mimeType string, data []byte) string
 		SHA256:     hashHex,
 		IsDocument: true,
 	})
-	return name
+	return name, nil
 }
 
 func sanitizeAttachmentTitle(title string) string {
@@ -285,17 +298,12 @@ func sanitizeAttachmentTitle(title string) string {
 	return strings.Trim(b.String(), "._-")
 }
 
-// images 返回最终待上传的图片及文档附件列表，超过单轮上限时保留最新的附件。
+// images 返回最终待上传的全部有效图片及文档附件列表。
 func (c *imageCollector) images() []ImageAttachment {
 	if c == nil || len(c.order) == 0 {
 		return nil
 	}
-	if len(c.order) <= maxImagesPerTurn {
-		return append([]ImageAttachment(nil), c.order...)
-	}
-	log.Printf("image attachments capped %d -> %d (keeping latest)", len(c.order), maxImagesPerTurn)
-	kept := c.order[len(c.order)-maxImagesPerTurn:]
-	return append([]ImageAttachment(nil), kept...)
+	return append([]ImageAttachment(nil), c.order...)
 }
 
 func imagePartURL(p map[string]any) string {
@@ -568,7 +576,7 @@ func decodeDocumentBase64(declaredMIME, b64 string) (string, []byte, error) {
 	return mime, data, nil
 }
 
-func formatDocumentPart(p map[string]any, collector *imageCollector) string {
+func formatDocumentPart(p map[string]any, collector *imageCollector) (string, error) {
 	title, _ := p["title"].(string)
 	title = strings.TrimSpace(title)
 	rawURL, b64Data, b64MIME := extractImageSource(p)
@@ -586,110 +594,126 @@ func formatDocumentPart(p map[string]any, collector *imageCollector) string {
 	}
 	if collector == nil {
 		if title != "" {
-			return "[document: " + title + "]"
+			return "[document: " + title + "]", nil
 		}
 		if rawURL != "" && !(len(rawURL) >= 5 && strings.EqualFold(rawURL[:5], "data:")) {
-			return "[document: " + rawURL + "]"
+			return "[document: " + rawURL + "]", nil
 		}
-		return "[document]"
+		return "[document]", nil
+	}
+	docLabel := title
+	if docLabel == "" {
+		docLabel = fmt.Sprintf("document #%d", collector.seen+1)
 	}
 	if b64Data == "" && len(rawURL) >= 5 && strings.EqualFold(rawURL[:5], "data:") {
-		if comma := strings.IndexByte(rawURL, ','); comma > 5 {
-			meta := rawURL[5:comma]
-			parts := strings.Split(meta, ";")
-			if len(parts) > 0 {
-				b64MIME = parts[0]
-			}
-			for _, seg := range parts[1:] {
-				if strings.EqualFold(strings.TrimSpace(seg), "base64") {
-					b64Data = rawURL[comma+1:]
-					break
-				}
+		comma := strings.IndexByte(rawURL, ',')
+		if comma <= 5 {
+			return "", fmt.Errorf("%w: malformed data uri for %s", ErrInvalidAttachment, docLabel)
+		}
+		meta := rawURL[5:comma]
+		parts := strings.Split(meta, ";")
+		if len(parts) > 0 {
+			b64MIME = parts[0]
+		}
+		isB64 := false
+		for _, seg := range parts[1:] {
+			if strings.EqualFold(strings.TrimSpace(seg), "base64") {
+				isB64 = true
+				break
 			}
 		}
+		if !isB64 {
+			return "", fmt.Errorf("%w: data uri for %s missing base64 encoding", ErrInvalidAttachment, docLabel)
+		}
+		b64Data = rawURL[comma+1:]
 	}
 	if b64Data != "" {
 		mime, data, err := decodeDocumentBase64(b64MIME, b64Data)
 		if err != nil {
-			log.Printf("document base64 decode skipped: %v", err)
-			if title != "" {
-				return "[document: " + title + "]"
-			}
-			return "[document]"
+			return "", fmt.Errorf("%w: %s: %v", ErrInvalidAttachment, docLabel, err)
 		}
 		if strings.HasPrefix(mime, "text/") {
 			header := "<document>"
 			if title != "" {
-				header = fmt.Sprintf(`<document title="%s">`, strings.ReplaceAll(title, `"`, `'`) )
+				header = fmt.Sprintf(`<document title="%s">`, strings.ReplaceAll(title, `"`, `'`))
 			}
-			return "\n" + header + "\n" + string(data) + "\n</document>\n"
+			return "\n" + header + "\n" + string(data) + "\n</document>\n", nil
 		}
-		name := collector.addDocument(title, mime, data)
-		return "[attached document: " + name + "]"
+		name, addErr := collector.addDocument(title, mime, data)
+		if addErr != nil {
+			return "", addErr
+		}
+		return "[attached document: " + name + "]", nil
+	}
+	if src, ok := p["source"].(map[string]any); ok {
+		if st, _ := src["type"].(string); strings.EqualFold(strings.TrimSpace(st), "base64") {
+			return "", fmt.Errorf("%w: empty base64 data for %s", ErrInvalidAttachment, docLabel)
+		}
 	}
 	if rawURL != "" {
-		if title != "" {
-			return fmt.Sprintf("[document: %s (%s)]", title, rawURL)
-		}
-		return "[document: " + rawURL + "]"
+		return "", fmt.Errorf("%w: remote or unsupported document source for %s", ErrInvalidAttachment, docLabel)
 	}
-	if title != "" {
-		return "[document: " + title + "]"
-	}
-	return "[document]"
+	return "", fmt.Errorf("%w: missing readable data for %s", ErrInvalidAttachment, docLabel)
 }
 
-func formatImagePart(ctx context.Context, p map[string]any, collector *imageCollector) string {
+func formatImagePart(ctx context.Context, p map[string]any, collector *imageCollector) (string, error) {
 	rawURL, b64Data, b64MIME := extractImageSource(p)
 	if collector == nil {
 		if b64Data != "" || (len(rawURL) >= 5 && strings.EqualFold(rawURL[:5], "data:")) {
-			return "[image]"
+			return "[image]", nil
 		}
 		if rawURL != "" {
-			return "[image: " + rawURL + "]"
+			return "[image: " + rawURL + "]", nil
 		}
-		return "[image]"
+		return "[image]", nil
 	}
-
+	imgLabel := fmt.Sprintf("image #%d", collector.seen+1)
 	if b64Data != "" {
 		mime, data, err := decodeImageBase64(b64MIME, b64Data)
 		if err != nil {
-			log.Printf("image base64 decode skipped: %v", err)
-			return "[image]"
+			return "", fmt.Errorf("%w: %s: %v", ErrInvalidAttachment, imgLabel, err)
 		}
-		name := collector.add(mime, data)
-		return "[attached image: " + name + "]"
+		name, addErr := collector.add(mime, data)
+		if addErr != nil {
+			return "", addErr
+		}
+		return "[attached image: " + name + "]", nil
 	}
 	if len(rawURL) >= 5 && strings.EqualFold(rawURL[:5], "data:") {
 		mime, data, err := decodeImageDataURI(rawURL)
 		if err != nil {
-			log.Printf("image data uri decode skipped: %v", err)
-			return "[image]"
+			return "", fmt.Errorf("%w: %s: %v", ErrInvalidAttachment, imgLabel, err)
 		}
-		name := collector.add(mime, data)
-		return "[attached image: " + name + "]"
+		name, addErr := collector.add(mime, data)
+		if addErr != nil {
+			return "", addErr
+		}
+		return "[attached image: " + name + "]", nil
 	}
 	if rawURL != "" {
 		mime, data, err := fetchRemoteImage(ctx, rawURL)
 		if err != nil {
-			log.Printf("remote image fetch skipped url=%q: %v", rawURL, err)
-			return "[image: " + rawURL + "]"
+			return "", fmt.Errorf("%w: %s (%s): %v", ErrInvalidAttachment, imgLabel, rawURL, err)
 		}
-		name := collector.add(mime, data)
-		return "[attached image: " + name + "]"
+		name, addErr := collector.add(mime, data)
+		if addErr != nil {
+			return "", addErr
+		}
+		return "[attached image: " + name + "]", nil
 	}
-	return "[image]"
+	return "", fmt.Errorf("%w: missing image data for %s", ErrInvalidAttachment, imgLabel)
 }
 
 // contentText 将 OpenAI 消息 content 字段快速压平为纯文本，不解码图片字节，供会话键与快速校验使用。
 func contentText(v any) string {
-	return contentTextWithCollector(context.Background(), v, nil)
+	s, _ := contentTextWithCollector(context.Background(), v, nil)
+	return s
 }
 
-func contentTextWithCollector(ctx context.Context, v any, collector *imageCollector) string {
+func contentTextWithCollector(ctx context.Context, v any, collector *imageCollector) (string, error) {
 	switch c := v.(type) {
 	case string:
-		return c
+		return c, nil
 	case []any:
 		var b strings.Builder
 		for _, part := range c {
@@ -704,17 +728,36 @@ func contentTextWithCollector(ctx context.Context, v any, collector *imageCollec
 						b.WriteString(t)
 					}
 				case "image_url", "input_image", "image":
-					b.WriteString(formatImagePart(ctx, p, collector))
+					partStr, err := formatImagePart(ctx, p, collector)
+					if err != nil {
+						return "", err
+					}
+					b.WriteString(partStr)
 				case "document":
-					b.WriteString(formatDocumentPart(p, collector))
+					partStr, err := formatDocumentPart(p, collector)
+					if err != nil {
+						return "", err
+					}
+					b.WriteString(partStr)
 				case "input_audio":
 					b.WriteString("[audio]")
 				case "file":
 					if _, hasFile := p["file"]; hasFile {
-						b.WriteString(formatDocumentPart(p, collector))
+						partStr, err := formatDocumentPart(p, collector)
+						if err != nil {
+							return "", err
+						}
+						b.WriteString(partStr)
 					} else if _, hasSrc := p["source"]; hasSrc {
-						b.WriteString(formatDocumentPart(p, collector))
+						partStr, err := formatDocumentPart(p, collector)
+						if err != nil {
+							return "", err
+						}
+						b.WriteString(partStr)
 					} else {
+						if collector != nil {
+							return "", fmt.Errorf("%w: unsupported file attachment missing data", ErrInvalidAttachment)
+						}
 						b.WriteString("[file]")
 					}
 				default:
@@ -730,15 +773,15 @@ func contentTextWithCollector(ctx context.Context, v any, collector *imageCollec
 				}
 			}
 		}
-		return b.String()
+		return b.String(), nil
 	case nil:
-		return ""
+		return "", nil
 	default:
 		body, err := json.Marshal(c)
 		if err != nil {
-			return ""
+			return "", nil
 		}
-		return string(body)
+		return string(body), nil
 	}
 }
 
@@ -885,7 +928,10 @@ func formatPromptCore(ctx context.Context, allMsgs []Message, msgs []Message, co
 			continue
 		}
 		nonSystemCount++
-		content := contentTextWithCollector(ctx, m.Content, collector)
+		content, cErr := contentTextWithCollector(ctx, m.Content, collector)
+		if cErr != nil {
+			return "", cErr
+		}
 		if role == "user" {
 			singleUser = true
 			singleUserText = content

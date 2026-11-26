@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -218,7 +219,11 @@ func uploadAttachment(ctx context.Context, sess *Session, threadID, name, conten
 		return ref, attachErr("attachment upload read: %v", readErr)
 	}
 	if resp.StatusCode >= 400 {
-		return ref, attachErr("attachment upload HTTP %d: %s", resp.StatusCode, snippet(body))
+		return ref, &UpstreamError{
+			StatusCode: resp.StatusCode,
+			RetryAfter: parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now()),
+			Err:        attachErr("attachment upload HTTP %d: %s", resp.StatusCode, snippet(body)),
+		}
 	}
 	var up struct {
 		AttachmentID string      `json:"attachmentId"`
@@ -253,9 +258,9 @@ func uploadAttachment(ctx context.Context, sess *Session, threadID, name, conten
 	return ref, nil
 }
 
-// uploadImageAttachments 受并发信号量限制上传多张图片，按输入顺序返回成功的附件元数据
-// 及每张失败图片的简短描述（单张失败不会中止其余图片上传）。
-func uploadImageAttachments(ctx context.Context, sess *Session, threadID string, images []ImageAttachment) ([]map[string]any, []string) {
+// uploadImageAttachments 受并发信号量限制上传多张图片或文档，按输入顺序返回附件元数据。
+// 若任意必需附件上传或投递失败，立即聚合返回错误，避免把缺失附件的残缺上下文交给上游模型。
+func uploadImageAttachments(ctx context.Context, sess *Session, threadID string, images []ImageAttachment) ([]map[string]any, error) {
 	if len(images) == 0 {
 		return nil, nil
 	}
@@ -312,20 +317,23 @@ func uploadImageAttachments(ctx context.Context, sess *Session, threadID string,
 	}
 	wg.Wait()
 
-	var metas []map[string]any
-	var failed []string
+	metas := make([]map[string]any, 0, len(images))
+	var failedErrs []error
 	for i, out := range outcomes {
 		if out.err != nil {
-			log.Printf("user_message image attachment failed thread=%s name=%s mime=%s bytes=%d: %v",
+			log.Printf("user_message attachment failed thread=%s name=%s mime=%s bytes=%d: %v",
 				threadID, images[i].Name, images[i].MIMEType, len(images[i].Data), out.err)
-			failed = append(failed, fmt.Sprintf("%s: %v", images[i].Name, out.err))
+			failedErrs = append(failedErrs, fmt.Errorf("attachment %s: %w", images[i].Name, out.err))
 			continue
 		}
 		if out.meta != nil {
 			metas = append(metas, out.meta)
 		}
 	}
-	return metas, failed
+	if len(failedErrs) > 0 {
+		return nil, errors.Join(failedErrs...)
+	}
+	return metas, nil
 }
 
 // dlpPollDelay 返回第 attempt 次（从 1 开始）DLP 状态复查前的渐进退避间隔，降低小文件首轮等待。
@@ -367,7 +375,11 @@ func waitAttachmentDLP(ctx context.Context, base, token, attachmentID string) er
 			return attachErr("attachment DLP read: %v", readErr)
 		}
 		if resp.StatusCode >= 400 {
-			return attachErr("attachment DLP HTTP %d: %s", resp.StatusCode, snippet(body))
+			return &UpstreamError{
+				StatusCode: resp.StatusCode,
+				RetryAfter: parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now()),
+				Err:        attachErr("attachment DLP HTTP %d: %s", resp.StatusCode, snippet(body)),
+			}
 		}
 		var out struct {
 			DLPJobStatus string `json:"dlpJobStatus"`
@@ -382,16 +394,28 @@ func waitAttachmentDLP(ctx context.Context, base, token, attachmentID string) er
 		case "ALLOW":
 			return nil
 		case "BLOCK", "DENY", "REJECT", "WARN":
-			return attachErr("attachment blocked by DLP (%s)", action)
+			return &UpstreamError{
+				StatusCode: http.StatusUnprocessableEntity,
+				Code:       "AttachmentBlockedByDLP",
+				Err:        attachErr("attachment blocked by DLP (%s)", action),
+			}
 		}
 		switch status {
 		case "SKIPPED", "NOT_APPLICABLE", "DISABLED":
 			return nil
 		case "FAILED", "ERROR":
-			return attachErr("attachment DLP scan failed (%s)", status)
+			return &UpstreamError{
+				StatusCode: http.StatusUnprocessableEntity,
+				Code:       "AttachmentBlockedByDLP",
+				Err:        attachErr("attachment DLP scan failed (%s)", status),
+			}
 		case "COMPLETED":
 			// The job finished without an explicit allow verdict.
-			return attachErr("attachment DLP completed without an allow verdict")
+			return &UpstreamError{
+				StatusCode: http.StatusUnprocessableEntity,
+				Code:       "AttachmentBlockedByDLP",
+				Err:        attachErr("attachment DLP completed without an allow verdict"),
+			}
 		}
 	}
 	return attachErr("attachment DLP scan did not settle")
@@ -430,7 +454,11 @@ func deliverAttachment(ctx context.Context, base, token, threadID, attachmentID 
 		return "", attachErr("attachment deliver read: %v", readErr)
 	}
 	if resp.StatusCode >= 400 {
-		return "", attachErr("attachment deliver HTTP %d: %s", resp.StatusCode, snippet(body))
+		return "", &UpstreamError{
+			StatusCode: resp.StatusCode,
+			RetryAfter: parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now()),
+			Err:        attachErr("attachment deliver HTTP %d: %s", resp.StatusCode, snippet(body)),
+		}
 	}
 	path := extractAttachmentPath(body)
 	if path == "" {

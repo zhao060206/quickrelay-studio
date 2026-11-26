@@ -106,7 +106,8 @@ func runServer(args []string) int {
 
 	mgr := accounts.New(st, cfg)
 	count, _ := mgr.EnabledCount(context.Background())
-	handler := proxy.NewServer(cfg, mgr).Handler()
+	proxySrv := proxy.NewServer(cfg, mgr)
+	handler := proxySrv.Handler()
 	if cfg.WebUI.Enabled {
 		panel, err := admin.NewServer(cfg, st, mgr, *addr != "")
 		if err != nil {
@@ -114,6 +115,7 @@ func runServer(args []string) int {
 			return 1
 		}
 		defer panel.Close()
+		panel.SetConversationInvalidator(proxySrv)
 		handler = panel.Handler(handler)
 		log.Printf("WebUI enabled at / (management authentication is independent of proxy API keys)")
 		if !panel.Configured() {

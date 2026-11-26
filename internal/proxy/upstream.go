@@ -188,11 +188,17 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 	if err != nil {
 		detail := ""
 		status := 0
+		var retryAfter time.Duration
 		if resp != nil {
 			status = resp.StatusCode
 			detail = fmt.Sprintf(" HTTP %d", resp.StatusCode)
+			retryAfter = parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now())
 		}
-		return ChatResult{}, &UpstreamError{StatusCode: status, Err: fmt.Errorf("upstream WebSocket dial failed%s: %w", detail, err)}
+		return ChatResult{}, &UpstreamError{
+			StatusCode: status,
+			RetryAfter: retryAfter,
+			Err:        fmt.Errorf("upstream WebSocket dial failed%s: %w", detail, err),
+		}
 	}
 	defer conn.Close()
 
@@ -315,20 +321,25 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		payload["thinking_effort"] = effort
 	}
 
-	// 单条 user_message 帧上限为 64 KB：先上传图片，再通过预算保护函数逐级外置/压缩
+	// 单条 user_message 帧上限为 64 KB：存在必需附件时必须全部上传成功，
+	// 严禁在不支持附件或上传失败时仍派发残缺请求给模型；随后通过预算保护函数逐级外置/压缩
 	// prompt 与 workspace_guidelines，确保 <client_tool_protocol> 始终完整留在主帧中。
+	if len(in.Images) > 0 && (isGatewayProvider(sess.Provider) || strings.TrimSpace(sess.TenantURL) == "") {
+		return ChatResult{}, &UpstreamError{
+			StatusCode: http.StatusBadGateway,
+			Code:       "AttachmentTransportUnsupported",
+			Err:        fmt.Errorf("upstream account does not support attachment uploads (%d required)", len(in.Images)),
+		}
+	}
 	if !isGatewayProvider(sess.Provider) && strings.TrimSpace(sess.TenantURL) != "" {
 		var attachments []map[string]any
-		var failedImgs []string
 		if len(in.Images) > 0 {
-			var imgMetas []map[string]any
-			imgMetas, failedImgs = uploadImageAttachments(ctx, sess, threadID, in.Images)
+			imgMetas, uploadErr := uploadImageAttachments(ctx, sess, threadID, in.Images)
+			if uploadErr != nil {
+				return ChatResult{}, uploadErr
+			}
 			if len(imgMetas) > 0 {
 				attachments = append(attachments, imgMetas...)
-			}
-			if len(failedImgs) > 0 {
-				basePrompt = in.Prompt + "\n\n[Note: failed to upload image attachment(s): " + strings.Join(failedImgs, "; ") + "]"
-				payload["text"] = renderTurnTextForMode(in.WorkMode, guidelines, toolProtocol, legacySystem, basePrompt)
 			}
 			if len(attachments) > 0 {
 				payload["attachments"] = attachments
@@ -336,7 +347,7 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		}
 
 		preserveEnv := u.cfg == nil || u.cfg.Guardrails.PreserveEnvSummaryEnabled()
-		prepareFrameWithinBudgetWithMode(payload, messageID, guidelines, toolProtocol, legacySystem, basePrompt, in.LatestUserText, attachments, failedImgs, preserveEnv, in.WorkMode,
+		prepareFrameWithinBudgetWithMode(payload, messageID, guidelines, toolProtocol, legacySystem, basePrompt, in.LatestUserText, attachments, nil, preserveEnv, in.WorkMode,
 			func(name string, data []byte) (attachmentRef, error) {
 				att, attErr := uploadPromptAttachment(ctx, sess, threadID, name, data)
 				if attErr != nil {
@@ -350,10 +361,6 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 				return att, nil
 			})
 	} else {
-		if len(in.Images) > 0 {
-			log.Printf("user_message image attachments skipped (unsupported transport or missing tenant_url) thread=%s count=%d",
-				threadID, len(in.Images))
-		}
 		// 无带外附件能力时仍尝试单帧技能列表压缩，尽力保住工具协议
 		if n, err := userMessageBytes(payload); err == nil && n > maxUserMessageBytes && guidelines != "" {
 			if compacted := compactSkillsSection(guidelines); compacted != guidelines {
@@ -956,10 +963,12 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 				code = env.ErrorCode
 			}
 			var detail struct {
-				Code       string `json:"code"`
-				ErrorCode  string `json:"error_code"`
-				StatusCode int    `json:"status_code"`
-				Status     int    `json:"status"`
+				Code       string  `json:"code"`
+				ErrorCode  string  `json:"error_code"`
+				StatusCode int     `json:"status_code"`
+				Status     int     `json:"status"`
+				RetryAfter float64 `json:"retry_after"`
+				RetryCamel float64 `json:"retryAfter"`
 			}
 			_ = json.Unmarshal(env.Payload, &detail)
 			if code == "" {
@@ -972,8 +981,16 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			if status == 0 {
 				status = detail.Status
 			}
+			retrySecs := detail.RetryAfter
+			if retrySecs <= 0 {
+				retrySecs = detail.RetryCamel
+			}
+			var retryAfter time.Duration
+			if retrySecs > 0 {
+				retryAfter = time.Duration(retrySecs * float64(time.Second))
+			}
 			log.Printf("upstream %s code=%q status=%d", env.Type, code, status)
-			return res, &UpstreamError{StatusCode: status, Code: code, Err: fmt.Errorf("upstream %s: %s", env.Type, errorText(env.Payload, message, code))}
+			return res, &UpstreamError{StatusCode: status, Code: code, RetryAfter: retryAfter, Err: fmt.Errorf("upstream %s: %s", env.Type, errorText(env.Payload, message, code))}
 		default:
 			if terminal[env.Type] {
 				return finish()

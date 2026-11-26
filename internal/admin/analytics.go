@@ -141,7 +141,13 @@ func (s *Server) handleConversationsList(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleConversationsClear(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.ClearConversations(r.Context()); err != nil {
+	var err error
+	if s.conversations != nil {
+		err = s.conversations.ClearConversations(r.Context())
+	} else {
+		err = s.store.ClearConversations(r.Context())
+	}
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "conversations_clear_error", "Could not clear conversations")
 		return
 	}
@@ -157,7 +163,13 @@ func (s *Server) handleConversationDelete(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "invalid_conversation_key", fmt.Sprintf("Conversation key must not be empty"))
 		return
 	}
-	if err := s.store.DeleteConversation(r.Context(), key); err != nil {
+	var err error
+	if s.conversations != nil {
+		err = s.conversations.DeleteConversation(r.Context(), key)
+	} else {
+		err = s.store.DeleteConversation(r.Context(), key)
+	}
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "conversation_delete_error", "Could not delete conversation")
 		return
 	}

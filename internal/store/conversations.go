@@ -10,12 +10,13 @@ import (
 
 // ConversationRecord 保存一条可跨进程重启恢复的代理会话映射及消息前缀指纹。
 type ConversationRecord struct {
-	Key           string
-	ThreadID      string
-	AccountID     int64
-	BaseHash      string
-	MessageHashes []string
-	LastUsed      int64
+	Key               string
+	ThreadID          string
+	AccountID         int64
+	BaseHash          string
+	MessageHashes     []string
+	LastAssistantHash string
+	LastUsed          int64
 }
 
 // GetConversation 根据规范化的 conv_key 读取持久化的会话映射；若不存在则返回 (nil, nil)。
@@ -23,12 +24,12 @@ func (s *Store) GetConversation(ctx context.Context, key string) (*ConversationR
 	if s == nil || s.db == nil || strings.TrimSpace(key) == "" {
 		return nil, nil
 	}
-	const q = `SELECT conv_key, thread_id, account_id, base_hash, message_hashes, last_used
+	const q = `SELECT conv_key, thread_id, account_id, base_hash, message_hashes, last_assistant_hash, last_used
 		FROM conversations WHERE conv_key = ?`
 	var rec ConversationRecord
 	var hashesJSON string
 	err := s.db.QueryRowContext(ctx, q, key).Scan(
-		&rec.Key, &rec.ThreadID, &rec.AccountID, &rec.BaseHash, &hashesJSON, &rec.LastUsed,
+		&rec.Key, &rec.ThreadID, &rec.AccountID, &rec.BaseHash, &hashesJSON, &rec.LastAssistantHash, &rec.LastUsed,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -58,16 +59,17 @@ func (s *Store) UpsertConversation(ctx context.Context, rec *ConversationRecord)
 	if err != nil {
 		return err
 	}
-	const stmt = `INSERT INTO conversations (conv_key, thread_id, account_id, base_hash, message_hashes, last_used)
-		VALUES (?, ?, ?, ?, ?, ?)
+	const stmt = `INSERT INTO conversations (conv_key, thread_id, account_id, base_hash, message_hashes, last_assistant_hash, last_used)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(conv_key) DO UPDATE SET
 			thread_id = excluded.thread_id,
 			account_id = excluded.account_id,
 			base_hash = excluded.base_hash,
 			message_hashes = excluded.message_hashes,
+			last_assistant_hash = excluded.last_assistant_hash,
 			last_used = excluded.last_used`
 	_, err = s.db.ExecContext(ctx, stmt,
-		rec.Key, rec.ThreadID, rec.AccountID, rec.BaseHash, string(encoded), rec.LastUsed,
+		rec.Key, rec.ThreadID, rec.AccountID, rec.BaseHash, string(encoded), rec.LastAssistantHash, rec.LastUsed,
 	)
 	return err
 }

@@ -28,25 +28,39 @@ type loginEntry struct {
 	flow  *oauth.BrowserLogin
 }
 
+type ConversationInvalidator interface {
+	DeleteConversation(ctx context.Context, key string) error
+	ClearConversations(ctx context.Context) error
+}
+
 type Server struct {
-	cfg            *config.Config
-	store          *store.Store
-	accounts       *accounts.Manager
-	routes         *http.ServeMux
-	startedAt      time.Time
-	addrOverridden bool
-	configured     bool
-	passwordHash   [32]byte
-	mu             sync.Mutex
-	sessions       map[[32]byte]adminSession
-	attempts       map[string]loginAttempts
-	logins         map[string]loginEntry
+	cfg             *config.Config
+	store           *store.Store
+	accounts        *accounts.Manager
+	conversations   ConversationInvalidator
+	routes          *http.ServeMux
+	startedAt       time.Time
+	addrOverridden  bool
+	configured      bool
+	passwordHash    [32]byte
+	mu              sync.Mutex
+	sessions        map[[32]byte]adminSession
+	attempts        map[string]loginAttempts
+	logins          map[string]loginEntry
 	configMu        sync.Mutex
 	saved           config.Config
 	restartNeeded   bool
 	agentsMu        sync.Mutex
 	localAppDataDir func() string
 	updater         *updater.Manager
+}
+
+// SetConversationInvalidator 注入代理层统一的会话失效接口，使控制台单删/全清同步使内存映射与数据库失效。
+func (s *Server) SetConversationInvalidator(inv ConversationInvalidator) {
+	if s == nil {
+		return
+	}
+	s.conversations = inv
 }
 
 type sessionContextKey struct{}
