@@ -163,28 +163,32 @@ type preparedTurn struct {
 	bridgeActive          bool
 	nativeOutpostActive   bool
 	nativeOutpostFallback bool
-	baseHash                string
-	fullGuide         string
-	fullBridgePrompt  string
-	fullPrompt        string
-	fullHistory       string
-	fullCurrentTurn   string
-	fullCurrentIsTool bool
-	fullImages        []ImageAttachment
-	fullMessages            []Message
-	fullLoaded              bool
-	fallbackText            string
-	auxRequest              bool
-	suggestionMode          bool
+	baseHash              string
+	fullGuide             string
+	fullBridgePrompt      string
+	fullPrompt            string
+	fullHistory           string
+	fullCurrentTurn       string
+	fullCurrentIsTool     bool
+	fullImages            []ImageAttachment
+	fullMessages          []Message
+	fullLoaded            bool
+	fallbackText          string
+	auxRequest            bool
+	suggestionMode        bool
 
 	in                      ChatInput
 	chatAgentID             string
+	explicitThreadID        string
+	explicitThreadKnown     bool
+	explicitThreadAccountID int64
+	skipConvSave            bool
 	requestedThinkingEffort string
-	resume                 bool
-	startedAt   time.Time
-	attempts    int
-	maxAttempts int
-	usedAccount *store.Account
+	resume                  bool
+	startedAt               time.Time
+	attempts                int
+	maxAttempts             int
+	usedAccount             *store.Account
 
 	blockedAccounts     map[int64]bool
 	attemptedAccounts   map[int64]bool
@@ -458,11 +462,17 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 	}
 
 	effectiveAgentID := strings.TrimSpace(s.cfg.ChatAgentID)
+	explicitConvID := strings.TrimSpace(r.Header.Get("X-Conversation-Id"))
 	explicitThreadID := strings.TrimSpace(r.Header.Get("X-Thread-Id"))
 	if isAux {
 		explicitThreadID = ""
 	}
-	// 显式 X-Thread-Id 跨 Agent 或归属未知拦截：禁止在切换 Agent 或旧库未记录绑定时悄悄续接或原样发出旧线程 ID。
+	explicitThreadKnown := false
+	var explicitThreadAccountID int64
+	var explicitTargetConv *conversation
+	skipConvSave := false
+	// 在选择传输方式之前彻底解决显式 X-Thread-Id 与本地会话/历史的冲突：
+	// 禁止在命中其他会话 A 时把 A 的增量或线程 ID 误发给上游，也不把与 B 历史不匹配的请求假作续接 B。
 	if !isAux && explicitThreadID != "" {
 		if conv.threadID != "" && conv.threadID == explicitThreadID {
 			if !conv.matchesChatAgent(effectiveAgentID) {
@@ -470,17 +480,50 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 				cancel()
 				return nil, fmt.Errorf("%w: thread %q", ErrThreadAgentMismatch, explicitThreadID)
 			}
-		} else if found, bound, boundAgentID := s.sessions.lookupThreadBinding(ctx, explicitThreadID); found {
-			if !bound || strings.TrimSpace(boundAgentID) != effectiveAgentID {
+			explicitThreadKnown = true
+			explicitThreadAccountID = conv.accountID
+			explicitTargetConv = conv
+		} else {
+			rec, found := s.sessions.lookupThreadRecord(ctx, explicitThreadID)
+			if found && (!rec.ChatAgentBound || strings.TrimSpace(rec.ChatAgentID) != effectiveAgentID) {
 				s.sessions.release(conv)
 				cancel()
 				return nil, fmt.Errorf("%w: thread %q", ErrThreadAgentMismatch, explicitThreadID)
+			}
+			if conv.threadID != "" && conv.threadID != explicitThreadID {
+				// convKey 已绑定线程 A（例如携带了 A 的 X-Conversation-Id 或匹配 A 的前缀），此时禁止冲突复用或覆盖 A。
+				if explicitConvID != "" {
+					s.sessions.release(conv)
+					cancel()
+					return nil, fmt.Errorf("%w: X-Conversation-Id %q is bound to thread %q, conflicts with X-Thread-Id %q", ErrExplicitThreadConflict, explicitConvID, conv.threadID, explicitThreadID)
+				}
+				if !found || rec == nil {
+					s.sessions.release(conv)
+					cancel()
+					return nil, fmt.Errorf("%w: history matched thread %q rather than explicit X-Thread-Id %q", ErrExplicitThreadConflict, conv.threadID, explicitThreadID)
+				}
+				candConv := conversationFromRecord(rec)
+				explicitThreadKnown = true
+				explicitThreadAccountID = rec.AccountID
+				explicitTargetConv = candConv
+				skipConvSave = true
+			} else if found && rec != nil {
+				explicitThreadKnown = true
+				explicitThreadAccountID = rec.AccountID
+				explicitTargetConv = conversationFromRecord(rec)
+			}
+		}
+		if explicitTargetConv != nil && (skipConvSave || len(nonLeadingMessages(req.Messages)) > 1) {
+			if _, ok := explicitTargetConv.delta(req.Messages); !ok {
+				s.sessions.release(conv)
+				cancel()
+				return nil, fmt.Errorf("%w: request history does not match explicit X-Thread-Id %q", ErrExplicitThreadConflict, explicitThreadID)
 			}
 		}
 	}
 	// 常规会话 Agent 边界校验：切换 Agent（默认<->自定义 / A<->B / 老库无绑定）时仅废弃该条本地复用映射，
 	// 强制以全新线程和完整历史、完整工具表重建，不删除 AWS 云端历史也不影响其他会话。
-	if s.cfg.SessionReuse && !isAux && conv.threadID != "" && !conv.matchesChatAgent(effectiveAgentID) {
+	if s.cfg.SessionReuse && !isAux && explicitThreadID == "" && conv.threadID != "" && !conv.matchesChatAgent(effectiveAgentID) {
 		log.Printf("chat %s resetting stale session thread=%q due to chat_agent_id boundary (bound=%t prev=%q cur=%q)",
 			idPrefix, conv.threadID, conv.chatAgentBound, conv.chatAgentID, effectiveAgentID)
 		s.sessions.reset(conv, convEpoch, convVer)
@@ -507,6 +550,10 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		bridgeActive:            bridgeActive,
 		baseHash:                baseHash,
 		chatAgentID:             effectiveAgentID,
+		explicitThreadID:        explicitThreadID,
+		explicitThreadKnown:     explicitThreadKnown,
+		explicitThreadAccountID: explicitThreadAccountID,
+		skipConvSave:            skipConvSave,
 		fullGuide:               fullGuide,
 		fullBridgePrompt:        bridgePrompt,
 		fullMessages:            fullMessages,
@@ -522,14 +569,18 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		sameAccountRetried:      make(map[int64]bool),
 	}
 
+	resumeSource := conv
+	if !isAux && explicitThreadID != "" {
+		resumeSource = explicitTargetConv
+	}
 	promptText := ""
 	promptHistory := ""
 	promptCurrent := ""
 	promptCurrentIsTool := false
 	turnGuidelines := ""
 	var images []ImageAttachment
-	if s.cfg.SessionReuse && !isAux && conv.threadID != "" {
-		if delta, ok := conv.delta(req.Messages); ok {
+	if s.cfg.SessionReuse && !isAux && resumeSource != nil && resumeSource.threadID != "" {
+		if delta, ok := resumeSource.delta(req.Messages); ok {
 			deltaGuide := deltaDeveloperGuidelinesForMode(delta, workMode)
 			deltaFormatted, deltaImages, dErr := formatResumeDeltaSplitWithImages(ctx, req.Messages, delta)
 			if dErr != nil && errors.Is(dErr, ErrInvalidAttachment) {
@@ -564,8 +615,8 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 	// 仅发 ~90 Token 极简提醒（附无引号本地工具名清单），消除每轮重复灌入 ~20,000 Token 的黑洞。
 	turnToolProtocol := bridgePrompt
 	toolCompact := false
-	if t.resume && bridgeActive && toolHash != "" {
-		_, prevToolHash := splitBaseHash(conv.baseHash)
+	if t.resume && bridgeActive && toolHash != "" && resumeSource != nil {
+		_, prevToolHash := splitBaseHash(resumeSource.baseHash)
 		turnCount := len(nonLeadingMessages(req.Messages)) / 2
 		needPeriodicAnchor := turnCount > 0 && turnCount%16 == 0
 		if prevToolHash == toolHash && !needPeriodicAnchor {
@@ -594,11 +645,23 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		DeleteSession:     (!s.cfg.SessionReuse && !s.cfg.KeepSessions) || isAux,
 		ClientToolsActive: bridgeActive,
 	}
-	if t.resume {
-		t.in.ThreadID = conv.threadID
+	if t.resume && resumeSource != nil {
+		t.in.ThreadID = resumeSource.threadID
+		t.in.CreateSession = false
+	} else if explicitThreadKnown {
+		t.in.ThreadID = explicitThreadID
 		t.in.CreateSession = false
 	}
-	t.pinnedFirst = t.resume && conv.accountID != 0
+	var pinnedAccountID int64
+	if t.resume && resumeSource != nil {
+		pinnedAccountID = resumeSource.accountID
+	} else if explicitThreadKnown {
+		pinnedAccountID = explicitThreadAccountID
+	}
+	t.pinnedFirst = t.resume && resumeSource == conv && conv.accountID != 0
+	if !t.pinnedFirst && pinnedAccountID != 0 {
+		t.preferredAccount = pinnedAccountID
+	}
 
 	t.requestedModel = strings.TrimSpace(req.Model)
 	if t.requestedModel == "" {
@@ -660,6 +723,9 @@ func (t *preparedTurn) loadFull() error {
 // 以便在后续重试仍因临时网络故障失败时保留原账号既有缓存，待切号成功后由 saveConversation 自然覆盖。
 // 若重放完整历史所需的附件校验失败，明确返回错误以阻断残缺请求。
 func (t *preparedTurn) switchToFullTranscript() error {
+	if t.explicitThreadID != "" {
+		return fmt.Errorf("%w: cannot replace explicit X-Thread-Id %q with a new thread", ErrExplicitThreadConflict, t.explicitThreadID)
+	}
 	if fErr := t.loadFull(); fErr != nil {
 		return fErr
 	}
@@ -677,11 +743,26 @@ func (t *preparedTurn) switchToFullTranscript() error {
 }
 
 func (t *preparedTurn) resetConversation() error {
+	if err := t.switchToFullTranscript(); err != nil {
+		return err
+	}
 	t.server.sessions.reset(t.conv, t.convEpoch, t.convVersion)
-	return t.switchToFullTranscript()
+	return nil
+}
+
+func (t *preparedTurn) resetConversationAfterFailure(err error) {
+	if t.explicitThreadID == "" && shouldResetConversation(t.conv, err) {
+		t.server.sessions.reset(t.conv, t.convEpoch, t.convVersion)
+	}
 }
 
 func (t *preparedTurn) saveConversation(res ChatResult, outText string, outTools []ToolCall) {
+	if t.skipConvSave {
+		return
+	}
+	if t.explicitThreadID != "" && t.conv != nil && t.conv.threadID != "" && t.conv.threadID != t.explicitThreadID {
+		return
+	}
 	if !t.auxRequest && t.server.cfg.SessionReuse && res.ThreadID != "" && t.usedAccount != nil {
 		asstHash := assistantOutputFingerprint(outText, outTools)
 		t.server.sessions.saveWithAgent(t.conv, t.convEpoch, t.convVersion, res.ThreadID, t.usedAccount.ID, t.baseHash, t.chatAgentID, t.req.Messages, asstHash)
@@ -748,6 +829,26 @@ func (t *preparedTurn) responseOutput(result ChatResult) (string, []ToolCall) {
 	return text, replyToolCalls(replies)
 }
 
+func (t *preparedTurn) validateToolChoice(calls []ToolCall) error {
+	if t.suggestionMode {
+		return nil
+	}
+	switch t.choiceMode {
+	case "function":
+		for _, call := range calls {
+			if call.Function.Name == t.choiceName {
+				return nil
+			}
+		}
+		return fmt.Errorf("%w: choice=function(%q) required tool call, but no matching call was returned", ErrOutpostToolPolicyMismatch, t.choiceName)
+	case "required":
+		if len(calls) == 0 {
+			return fmt.Errorf("%w: choice=required expected at least one tool call", ErrOutpostToolPolicyMismatch)
+		}
+	}
+	return nil
+}
+
 func (t *preparedTurn) selectAccount() (*store.Account, *Session, error) {
 	var pinnedCooldownErr *accounts.CooldownError
 	for {
@@ -765,6 +866,9 @@ func (t *preparedTurn) selectAccount() (*store.Account, *Session, error) {
 			}
 			acct, selectErr = t.server.accounts.NextPinned(t.ctx, accountID)
 			if selectErr != nil {
+				if t.explicitThreadID != "" {
+					return nil, nil, fmt.Errorf("%w: account %d for explicit X-Thread-Id %q is unavailable", ErrExplicitThreadConflict, accountID, t.explicitThreadID)
+				}
 				var cdErr *accounts.CooldownError
 				if errors.As(selectErr, &cdErr) {
 					pinnedCooldownErr = cdErr
@@ -823,7 +927,7 @@ func (t *preparedTurn) selectAccount() (*store.Account, *Session, error) {
 	}
 }
 
-func (t *preparedTurn) runChat(onEvent EventFunc, streamProgress func() (started, hasOutput bool), resetOutput func()) (ChatResult, error) {
+func (t *preparedTurn) runChat(onEvent EventFunc, streamProgress func() (started, hasOutput bool), resetOutput func(), completeOutput func(ChatResult) ([]ToolCall, error)) (ChatResult, error) {
 	var res ChatResult
 	var lastErr error
 	forceCorrection := false
@@ -846,8 +950,15 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamProgress func() (started
 			return res, err
 		}
 		// 终极防线：若当前仍处于续聊状态但选中账号已不是原会话所属账号，
-		// 必须强制切换为新会话并携带完整历史与完整工具表，杜绝把旧账号 thread_id 与精简增量发给新账号。
+		// 必须强制切换为新会话并携带完整历史与完整工具表，杜绝把旧账号 thread_id 与精简增量发给新账号；
+		// 若调用方显式指定 X-Thread-Id 则绝不静默替换新线程，而是直接报 409 冲突。
+		if t.explicitThreadID != "" && t.explicitThreadAccountID != 0 && acct.ID != t.explicitThreadAccountID {
+			return res, fmt.Errorf("%w: explicit X-Thread-Id %q belongs to account %d, cannot dispatch to account %d", ErrExplicitThreadConflict, t.explicitThreadID, t.explicitThreadAccountID, acct.ID)
+		}
 		if t.resume && t.conv != nil && t.conv.accountID != 0 && acct.ID != t.conv.accountID {
+			if t.explicitThreadID != "" {
+				return res, fmt.Errorf("%w: cannot replace explicit X-Thread-Id %q across account switch", ErrExplicitThreadConflict, t.explicitThreadID)
+			}
 			log.Printf("chat %s switched account %d->%d during resume; rebuilding full transcript", t.id, t.conv.accountID, acct.ID)
 			if swErr := t.switchToFullTranscript(); swErr != nil {
 				return res, swErr
@@ -867,7 +978,7 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamProgress func() (started
 		t.nativeOutpostActive = false
 		if t.shouldUseNativeOutpost(sess) {
 			t.nativeOutpostActive = true
-			res, err = t.server.outposts.RunTurn(t.ctx, t, sess, onEvent)
+			res, err = t.server.outposts.RunTurn(t.ctx, t, sess, attemptIn.OnDispatched, onEvent)
 			if err != nil && errors.Is(err, ErrOutpostUnsupported) && t.server.cfg.GetToolMode() == config.ToolModeAuto {
 				started := false
 				if streamProgress != nil {
@@ -892,7 +1003,13 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamProgress func() (started
 		attemptDuration := time.Since(attemptStarted)
 		if err == nil {
 			text, toolCalls := t.responseOutput(res)
-			if !hasVisibleText(text) && len(toolCalls) == 0 && !hasVisibleText(res.Thinking) {
+			if completeOutput != nil {
+				toolCalls, err = completeOutput(res)
+			}
+			if err == nil {
+				err = t.validateToolChoice(toolCalls)
+			}
+			if err == nil && !hasVisibleText(text) && len(toolCalls) == 0 && !hasVisibleText(res.Thinking) {
 				err = fmt.Errorf("%w (completion_tokens=%d)", ErrEmptyResponse, res.Usage.CompletionTokens)
 			}
 		}
@@ -926,6 +1043,9 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamProgress func() (started
 			return res, t.ctx.Err()
 		}
 		if blockedRemoteTool {
+			if t.explicitThreadID != "" {
+				return res, err
+			}
 			if !t.remoteToolCorrected {
 				t.remoteToolCorrected = true
 				blockedName := "remote_tool"
@@ -960,6 +1080,28 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamProgress func() (started
 		}
 		if action == retryStop || t.attempts >= t.maxAttempts {
 			return res, err
+		}
+		if t.explicitThreadID != "" {
+			switch action {
+			case retryRefresh:
+				if t.refreshedAccounts[acct.ID] {
+					return res, err
+				}
+				t.refreshedAccounts[acct.ID] = true
+				refreshed, refreshErr := t.server.accounts.RefreshOne(t.ctx, acct.ID)
+				if refreshErr != nil || refreshed.Disabled {
+					return res, err
+				}
+			case retryTemporary:
+				if !t.resume || t.sameAccountRetried[acct.ID] || isRateLimitTemporary(err) {
+					return res, err
+				}
+				t.sameAccountRetried[acct.ID] = true
+			default:
+				return res, err
+			}
+			t.preferredAccount = acct.ID
+			continue
 		}
 		wasResume := t.resume
 		switch action {
@@ -1117,11 +1259,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	defer turn.Close()
 
 	if !req.Stream {
-		res, lastErr := turn.runChat(nil, nil, nil)
+		res, lastErr := turn.runChat(nil, nil, nil, nil)
 		if lastErr != nil {
-			if shouldResetConversation(turn.conv, lastErr) {
-				s.sessions.reset(turn.conv, turn.convEpoch, turn.convVersion)
-			}
+			turn.resetConversationAfterFailure(lastErr)
 			status, code := chatErrorStatus(lastErr)
 			turn.finishTurn("failed", "", res, 0, lastErr)
 			writeCooldownRetryHeader(w, lastErr)
@@ -1291,11 +1431,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		defer writeMu.Unlock()
 		ensureStartedLocked()
 	}
-	writeStreamError := func(message string) {
+	writeStreamError := func(err error) {
+		_, code := chatErrorStatus(err)
 		writePayload(map[string]any{"error": map[string]any{
-			"message": message,
-			"type":    "upstream_error",
-			"code":    "upstream_error",
+			"message": err.Error(),
+			"type":    code,
+			"code":    code,
 		}})
 	}
 
@@ -1460,12 +1601,64 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			bridgeStream.Reset()
 		}
 		quickFilter.Reset()
+	}, func(res ChatResult) ([]ToolCall, error) {
+		if err := turn.ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := getClientWriteErr(); err != nil {
+			return nil, err
+		}
+		if turn.bridgeActive {
+			if !turn.nativeOutpostActive {
+				remText, remCalls := bridgeStream.Flush()
+				if remText != "" {
+					emitFilteredText(remText)
+				}
+				for _, tc := range remCalls {
+					emitToolReply(tc)
+				}
+			}
+			fText, fCalls := quickFilter.Flush()
+			if fText != "" {
+				emitText(fText)
+			}
+			for _, tc := range fCalls {
+				emitToolReply(tc)
+			}
+			if emittedToolIdx == 0 && len(res.ToolCalls) > 0 {
+				for _, tc := range limitToolReplies(nativeToolReplies(res.ToolCalls, turn.allowedTools), turn.choiceMode, turn.choiceName, turn.parallelTools) {
+					emitToolReply(tc)
+				}
+			}
+			if !sawVisibleText && emittedToolIdx == 0 && hasVisibleText(res.Text) {
+				outText, outTools := turn.responseOutput(res)
+				if hasVisibleText(outText) {
+					emitText(outText)
+				}
+				for _, tc := range outTools {
+					emitToolReply(ToolCallReply{
+						ID:        tc.ID,
+						Name:      tc.Function.Name,
+						Arguments: tc.Function.Arguments,
+					})
+				}
+			}
+		} else {
+			fText, _ := quickFilter.Flush()
+			if fText != "" {
+				emitText(fText)
+			}
+			if !sawVisibleText && hasVisibleText(res.Text) {
+				if cleanedRes, _ := cleanQuickOutput(res.Text, nil, nil); hasVisibleText(cleanedRes) {
+					emitText(cleanedRes)
+				}
+			}
+		}
+		return finalOutTools, getClientWriteErr()
 	})
 	stopHB()
 	if lastErr != nil {
-		if shouldResetConversation(turn.conv, lastErr) {
-			s.sessions.reset(turn.conv, turn.convEpoch, turn.convVersion)
-		}
+		turn.resetConversationAfterFailure(lastErr)
 		if wErr := getClientWriteErr(); wErr != nil {
 			turn.finishTurn("failed", "", res, 0, wErr)
 			return
@@ -1478,68 +1671,16 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		turn.finishTurn("failed", "", res, 0, lastErr)
-		writeStreamError(lastErr.Error())
-		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-		flusher.Flush()
-		return
-	}
-	if getClientWriteErr() != nil || turn.ctx.Err() != nil {
-		errOut := getClientWriteErr()
-		if errOut == nil {
-			errOut = turn.ctx.Err()
+		writeStreamError(lastErr)
+		if !errors.Is(lastErr, ErrOutpostToolPolicyMismatch) {
+			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+			flusher.Flush()
 		}
-		turn.finishTurn("failed", "", res, emittedToolIdx, errOut)
 		return
 	}
 	finish := "stop"
-	if turn.bridgeActive {
-		if !turn.nativeOutpostActive {
-			remText, remCalls := bridgeStream.Flush()
-			if remText != "" {
-				emitFilteredText(remText)
-			}
-			for _, tc := range remCalls {
-				emitToolReply(tc)
-			}
-		}
-		fText, fCalls := quickFilter.Flush()
-		if fText != "" {
-			emitText(fText)
-		}
-		for _, tc := range fCalls {
-			emitToolReply(tc)
-		}
-		if emittedToolIdx == 0 && len(res.ToolCalls) > 0 {
-			for _, tc := range limitToolReplies(nativeToolReplies(res.ToolCalls, turn.allowedTools), turn.choiceMode, turn.choiceName, turn.parallelTools) {
-				emitToolReply(tc)
-			}
-		}
-		if !sawVisibleText && emittedToolIdx == 0 && hasVisibleText(res.Text) {
-			outText, outTools := turn.responseOutput(res)
-			if hasVisibleText(outText) {
-				emitText(outText)
-			}
-			for _, tc := range outTools {
-				emitToolReply(ToolCallReply{
-					ID:        tc.ID,
-					Name:      tc.Function.Name,
-					Arguments: tc.Function.Arguments,
-				})
-			}
-		}
-		if emittedToolIdx > 0 {
-			finish = "tool_calls"
-		}
-	} else {
-		fText, _ := quickFilter.Flush()
-		if fText != "" {
-			emitText(fText)
-		}
-		if !sawVisibleText && hasVisibleText(res.Text) {
-			if cleanedRes, _ := cleanQuickOutput(res.Text, nil, nil); hasVisibleText(cleanedRes) {
-				emitText(cleanedRes)
-			}
-		}
+	if emittedToolIdx > 0 {
+		finish = "tool_calls"
 	}
 	flushPendingThinking()
 	if getClientWriteErr() == nil && turn.ctx.Err() == nil {

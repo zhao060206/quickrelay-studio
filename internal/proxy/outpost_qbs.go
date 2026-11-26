@@ -61,14 +61,22 @@ func outpostToolAlias(origName string) string {
 	return "qr__" + sha256LowerHex(origName)[:16] + "_" + slug.String()
 }
 
-// outpostModelToolName 生成上游模型可见的完整工具名，并遵守 Bedrock 64 字符上限。
-func outpostModelToolName(deviceName, origName string) string {
-	prefix := strings.ReplaceAll(deviceName, " ", "_")
-	raw := prefix + "_" + outpostToolAlias(origName)
+// outpostModelToolNameForAlias 基于设备名与工具实际注册别名生成上游模型可见的完整工具名，并遵守 Bedrock 64 字符上限。
+func outpostModelToolNameForAlias(deviceName, alias string) string {
+	prefix := strings.ReplaceAll(strings.TrimSpace(deviceName), " ", "_")
+	if prefix == "" {
+		return alias
+	}
+	raw := prefix + "_" + alias
 	if len(raw) <= 64 {
 		return raw
 	}
 	return "t_" + sha256LowerHex(raw)[:8] + "_" + raw[len(raw)-53:]
+}
+
+// outpostModelToolName 生成上游模型可见的完整工具名，并遵守 Bedrock 64 字符上限。
+func outpostModelToolName(deviceName, origName string) string {
+	return outpostModelToolNameForAlias(deviceName, outpostToolAlias(origName))
 }
 
 type outpostRegisteredTool struct {
@@ -183,8 +191,13 @@ func (r *outpostToolRegistry) resolveName(wireName, devName string) (string, boo
 	if orig, ok := r.AliasToOrig[w]; ok {
 		return orig, true
 	}
+	normPrefix := strings.ReplaceAll(strings.TrimSpace(devName), " ", "_")
+	if normPrefix == "" {
+		return "", false
+	}
+	// 仅接受本次注册可枚举的精确名称集合（短名 alias、本设备前缀完整名或 64 字符哈希截断完整名），拒绝其他设备或附加前缀。
 	for alias, orig := range r.AliasToOrig {
-		if (devName != "" && w == outpostModelToolName(devName, orig)) || strings.HasSuffix(w, alias) {
+		if w == normPrefix+"_"+alias || w == outpostModelToolNameForAlias(devName, alias) {
 			return orig, true
 		}
 	}
@@ -271,14 +284,18 @@ func (r *outpostToolRegistry) routingInstructions(outpostID, devName, choiceMode
 	fmt.Fprintf(&b, "This session executes client-owned tools on virtual device %s (%s). Always invoke these registered tools for local workspace files, search, shell commands, or client actions; NEVER substitute Quick's remote sandbox/container tools (such as run_python_on_device, device_terminal) or cloud VFS. Client file paths belong to the local workspace and are passed as arguments to these tools.\nTool name mapping:\n",
 		outpostID, devName)
 	for _, t := range r.Tools {
-		fmt.Fprintf(&b, "- %s: %s (wire name %s)\n", t.OriginalName, outpostModelToolName(devName, t.OriginalName), t.Alias)
+		fmt.Fprintf(&b, "- %s: %s (wire name %s)\n", t.OriginalName, outpostModelToolNameForAlias(devName, t.Alias), t.Alias)
 	}
 	switch choiceMode {
 	case "required":
 		b.WriteString("\nYou MUST invoke at least one of the registered client tools above before answering.\n")
 	case "function":
 		if strings.TrimSpace(choiceName) != "" {
-			fmt.Fprintf(&b, "\nYou MUST invoke client tool %q (%s) for this turn.\n", choiceName, outpostModelToolName(devName, choiceName))
+			alias := r.OrigToAlias[choiceName]
+			if alias == "" {
+				alias = outpostToolAlias(choiceName)
+			}
+			fmt.Fprintf(&b, "\nYou MUST invoke client tool %q (%s) for this turn.\n", choiceName, outpostModelToolNameForAlias(devName, alias))
 		}
 	}
 	if !parallelTools {

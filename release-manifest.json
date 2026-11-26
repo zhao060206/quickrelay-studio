@@ -1,15 +1,15 @@
 {
-  "version": "2.5.0",
-  "tag": "v2.5.0",
-  "published_at": "2026-11-26T12:06:30Z",
-  "release_notes": "架构重磅升级：新增虚拟 Outpost 原生工具直通与常驻挂起 WebSocket 会话池，支持 /store/sessions + /events/batch 结构化历史冷导入、tool_mode 三模式热切换（PUT /api/tool-mode）、Agent 切换线程边界隔离及文本桥当前轮逐字保真，并自动清洗行首独立路由标记。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.5.0",
+  "version": "2.5.1",
+  "tag": "v2.5.1",
+  "published_at": "2026-11-26T13:35:30Z",
+  "release_notes": "加固虚拟 Outpost 原生工具链路：修复多段续接断流、完整 63 KiB 帧预算与长思考首包保活、跨传输统一强制工具策略与精确设备前缀匹配，并收紧显式 X-Thread-Id 历史校验、配额保留绑定与工具回传一致性。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.5.1",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.5.0-win-x64.zip",
-      "size": 8803031,
-      "sha256": "3b96dca3c742e237e39c70f7a451ab6d29140461c8c4aa8a42ef0c959eb327cc",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.5.0/QuickRelay-Studio-v2.5.0-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.5.1-win-x64.zip",
+      "size": 8810821,
+      "sha256": "efe32432901f708e1f8ec66e891b9b89135da7bf73a8ae3217c221a39a442c94",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.5.1/QuickRelay-Studio-v2.5.1-win-x64.zip"
     }
   }
 }

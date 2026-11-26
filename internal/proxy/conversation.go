@@ -397,44 +397,86 @@ func (s *conversationStore) loadFromDB(c *conversation) {
 	}
 }
 
-// lookupThreadBinding 检查指定 thread_id 在内存或持久化存储中的 Agent 归属情况，用于拦截跨 Agent 的显式 X-Thread-Id 复用。
-func (s *conversationStore) lookupThreadBinding(ctx context.Context, threadID string) (found bool, bound bool, agentID string) {
+// lookupThreadRecord 检查指定 thread_id 在内存或持久化存储中最近一次会话记录快照。
+func (s *conversationStore) lookupThreadRecord(ctx context.Context, threadID string) (*store.ConversationRecord, bool) {
 	threadID = strings.TrimSpace(threadID)
 	if s == nil || threadID == "" {
-		return false, false, ""
+		return nil, false
 	}
 	s.mu.Lock()
+	var matched *store.ConversationRecord
 	var latestUsed int64 = -1
 	for _, c := range s.entries {
 		if c.threadID != threadID {
 			continue
 		}
 		used := c.lastUsed.Load()
-		if !found || used >= latestUsed {
-			found = true
+		if matched == nil || used >= latestUsed {
 			latestUsed = used
-			bound = c.chatAgentBound
-			agentID = strings.TrimSpace(c.chatAgentID)
+			hashesCopy := append([]string(nil), c.msgHashes...)
+			matched = &store.ConversationRecord{
+				Key:               c.key,
+				ThreadID:          c.threadID,
+				AccountID:         c.accountID,
+				BaseHash:          c.baseHash,
+				ChatAgentID:       strings.TrimSpace(c.chatAgentID),
+				ChatAgentBound:    c.chatAgentBound,
+				MessageHashes:     hashesCopy,
+				LastAssistantHash: c.lastAssistantHash,
+				LastUsed:          used,
+			}
 		}
 	}
 	s.mu.Unlock()
-	if found {
-		return true, bound, agentID
+	if matched != nil {
+		return matched, true
 	}
 	if s.store == nil {
-		return false, false, ""
+		return nil, false
 	}
 	dbCtx, cancel := context.WithTimeout(ctx, dbPersistTimeout)
 	defer cancel()
 	rec, err := s.store.GetConversationByThreadID(dbCtx, threadID)
 	if err != nil {
 		log.Printf("conversation lookup thread=%s failed: %v", threadID, err)
-		return false, false, ""
+		return nil, false
 	}
 	if rec == nil || rec.ThreadID == "" {
-		return false, false, ""
+		return nil, false
 	}
-	return true, rec.ChatAgentBound, strings.TrimSpace(rec.ChatAgentID)
+	return rec, true
+}
+
+// conversationFromRecord 基于持久化或内存快照构建只读 conversation 视图，用于 delta 历史核对。
+func conversationFromRecord(rec *store.ConversationRecord) *conversation {
+	if rec == nil {
+		return nil
+	}
+	return &conversation{
+		key:               rec.Key,
+		threadID:          rec.ThreadID,
+		accountID:         rec.AccountID,
+		baseHash:          rec.BaseHash,
+		chatAgentID:       strings.TrimSpace(rec.ChatAgentID),
+		chatAgentBound:    rec.ChatAgentBound,
+		msgHashes:         rec.MessageHashes,
+		lastAssistantHash: rec.LastAssistantHash,
+	}
+}
+
+// lookupThreadOwnership 检查指定 thread_id 在内存或持久化存储中的 Agent 与账号归属情况，用于拦截跨 Agent 或归属不明的显式 X-Thread-Id 复用。
+func (s *conversationStore) lookupThreadOwnership(ctx context.Context, threadID string) (found bool, bound bool, agentID string, accountID int64) {
+	rec, ok := s.lookupThreadRecord(ctx, threadID)
+	if !ok || rec == nil {
+		return false, false, "", 0
+	}
+	return true, rec.ChatAgentBound, strings.TrimSpace(rec.ChatAgentID), rec.AccountID
+}
+
+// lookupThreadBinding 检查指定 thread_id 在内存或持久化存储中的 Agent 归属情况，用于拦截跨 Agent 的显式 X-Thread-Id 复用。
+func (s *conversationStore) lookupThreadBinding(ctx context.Context, threadID string) (found bool, bound bool, agentID string) {
+	found, bound, agentID, _ = s.lookupThreadOwnership(ctx, threadID)
+	return found, bound, agentID
 }
 
 // save 在与失效操作共用的短临界区内校验会话版本并同步写回内存与 SQLite，防止已被清理的旧映射写回复活。

@@ -178,3 +178,107 @@ func TestQuickOutputCleansRoleMarkersOutsideCodeBlocks(t *testing.T) {
 		t.Fatalf("fenced code block marker was modified: %q", out)
 	}
 }
+
+func TestOutpostToolRegistry_ResolveNameExactMatching(t *testing.T) {
+	longToolName := "ExtremelyLongCustomWorkspaceInspectorToolNameThatMustBeHashTruncatedAt64Chars"
+	req := &ChatRequest{
+		Tools: []Tool{
+			{
+				Type: "function",
+				Function: ToolFunction{
+					Name:        "AlphaTool",
+					Description: "Fictional alpha tool",
+					Parameters:  map[string]any{"type": "object"},
+				},
+			},
+			{
+				Type: "function",
+				Function: ToolFunction{
+					Name:        longToolName,
+					Description: "Fictional long tool",
+					Parameters:  map[string]any{"type": "object"},
+				},
+			},
+		},
+	}
+
+	reg := newOutpostToolRegistry(req)
+	devName := outpostDeviceName("thread-device-a")
+	otherDevName := outpostDeviceName("thread-device-b")
+
+	alphaAlias := reg.OrigToAlias["AlphaTool"]
+	longAlias := reg.OrigToAlias[longToolName]
+	alphaFull := outpostModelToolNameForAlias(devName, alphaAlias)
+	longTruncated := outpostModelToolNameForAlias(devName, longAlias)
+	if len(longTruncated) > 64 {
+		t.Fatalf("truncated name exceeded 64 chars: %d", len(longTruncated))
+	}
+
+	cases := []struct {
+		name     string
+		wireName string
+		wantOrig string
+		wantOK   bool
+	}{
+		{
+			name:     "registered_short_alias",
+			wireName: alphaAlias,
+			wantOrig: "AlphaTool",
+			wantOK:   true,
+		},
+		{
+			name:     "own_device_full_name",
+			wireName: alphaFull,
+			wantOrig: "AlphaTool",
+			wantOK:   true,
+		},
+		{
+			name:     "own_device_truncated_64_name",
+			wireName: longTruncated,
+			wantOrig: longToolName,
+			wantOK:   true,
+		},
+		{
+			name:     "other_device_prefix_rejected",
+			wireName: strings.ReplaceAll(otherDevName, " ", "_") + "_" + alphaAlias,
+			wantOK:   false,
+		},
+		{
+			name:     "other_device_truncated_rejected",
+			wireName: outpostModelToolNameForAlias(otherDevName, longAlias),
+			wantOK:   false,
+		},
+		{
+			name:     "arbitrary_extra_prefix_rejected",
+			wireName: "evil_prefix_" + alphaAlias,
+			wantOK:   false,
+		},
+		{
+			name:     "tampered_hash_truncated_rejected",
+			wireName: "t_00000000_" + alphaAlias,
+			wantOK:   false,
+		},
+		{
+			name:     "unknown_tool_rejected",
+			wireName: "BetaTool",
+			wantOK:   false,
+		},
+		{
+			name:     "empty_rejected",
+			wireName: "   ",
+			wantOK:   false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotOrig, gotOK := reg.resolveName(tc.wireName, devName)
+			if gotOK != tc.wantOK || gotOrig != tc.wantOrig {
+				t.Fatalf("resolveName(%q) = (%q, %v), want (%q, %v)", tc.wireName, gotOrig, gotOK, tc.wantOrig, tc.wantOK)
+			}
+			if _, _, decErr := reg.decodeCall(tc.wireName, json.RawMessage(`{}`), devName); (decErr == nil) != tc.wantOK {
+				t.Fatalf("decodeCall(%q) err=%v, wantOK=%v", tc.wireName, decErr, tc.wantOK)
+			}
+		})
+	}
+}

@@ -16,6 +16,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"quickrelay-studio/internal/config"
 	"quickrelay-studio/internal/store"
 )
 
@@ -187,6 +188,7 @@ func isOutpostIdleBufferedEvent(typ string) bool {
 		"thinking_delta", "thinking_complete",
 		"text_delta", "text_complete",
 		"turn_usage", "acp_metadata", "message_complete",
+		"turn_aborted", "session_error", "stream_error", "turn_failed",
 		"error", "exception":
 		return true
 	default:
@@ -300,6 +302,36 @@ func (p *outpostPool) checkout(convKey string) *outpostSession {
 		s.stopIdleMonitor()
 	}
 	return s
+}
+
+// checkoutByThreadID 按显式 thread_id 检出仍处于挂起等待状态的虚拟 Outpost 会话（用于显式 X-Thread-Id 回传工具结果）。
+func (p *outpostPool) checkoutByThreadID(threadID string) *outpostSession {
+	threadID = strings.TrimSpace(threadID)
+	if p == nil || threadID == "" {
+		return nil
+	}
+	p.mu.Lock()
+	if p.closing {
+		p.mu.Unlock()
+		return nil
+	}
+	var matchedKey string
+	var matched *outpostSession
+	for k, s := range p.idle {
+		if s.threadID == threadID && (matched == nil || s.lastUsedAt.After(matched.lastUsedAt)) {
+			matchedKey = k
+			matched = s
+		}
+	}
+	if matched != nil {
+		delete(p.idle, matchedKey)
+		p.active[matched.id] = matched
+	}
+	p.mu.Unlock()
+	if matched != nil {
+		matched.stopIdleMonitor()
+	}
+	return matched
 }
 
 func (p *outpostPool) registerActive(s *outpostSession) {
@@ -697,7 +729,64 @@ func (s *outpostSession) ensureToolsRegistered(ctx context.Context, reg *outpost
 	return qbsPutOutpost(ctx, s.sess, s.appVersion, s.outpostID, s.devName, reg)
 }
 
-func (p *outpostPool) RunTurn(ctx context.Context, turn *preparedTurn, sess *Session, onEvent EventFunc) (ChatResult, error) {
+// buildOutpostUserMessagePayload 构造原生 Outpost 上行 user_message 帧的完整载荷（含 custom_prompt、工具文档与路由指令）。
+func buildOutpostUserMessagePayload(turn *preparedTurn, sess *Session, reg *outpostToolRegistry, outpostID, devName, threadID, systemPrompt, turnText string) map[string]any {
+	var cp strings.Builder
+	if strings.TrimSpace(systemPrompt) != "" {
+		cp.WriteString(strings.TrimSpace(systemPrompt))
+	}
+	cp.WriteString("\n\n# API Client Presentation\nThis conversation runs through an API gateway, not the desktop UI. Use standard Markdown/plain text and NEVER output <decision>, <option>, or <decisions> UI tags.\n")
+	if reg != nil && reg.PromptDocs != "" {
+		cp.WriteString(reg.PromptDocs)
+	}
+	if reg != nil {
+		cp.WriteString(reg.routingInstructions(outpostID, devName, turn.choiceMode, turn.choiceName, turn.parallelTools))
+	}
+
+	payload := map[string]any{
+		"surfaceType":        sess.Surface,
+		"outpostId":          outpostID,
+		"appVersion":         qbsAppVersion(turn.server.cfg.AppVersion),
+		"thread_id":          threadID,
+		"message_id":         uuid(),
+		"text":               turnText,
+		"custom_prompt":      cp.String(),
+		"agent_mode":         turn.in.Model,
+		"auto_routing":       false,
+		"web_search_enabled": false,
+	}
+	if effort := strings.TrimSpace(turn.in.ThinkingEffort); effort != "" {
+		payload["thinking_effort"] = effort
+	}
+	if id := strings.TrimSpace(turn.chatAgentID); id != "" {
+		payload["chat_agent_id"] = id
+	}
+	if tz := strings.TrimSpace(turn.server.cfg.Timezone); tz != "" {
+		payload["user_timezone"] = tz
+	}
+	if loc := strings.TrimSpace(turn.server.cfg.Locale); loc != "" {
+		payload["user_locale"] = loc
+	}
+	return payload
+}
+
+// checkOutpostUserMessageBudget 校验完整序列化后的原生 user_message 帧是否超过上游 63 KiB 预算；
+// 在 auto 模式下返回 ErrOutpostUnsupported 以便无损回退文本桥，强制 native_outpost 模式返回 ErrUserMessageTooLarge。
+func checkOutpostUserMessageBudget(payload map[string]any, toolMode string) error {
+	n, err := userMessageBytes(payload)
+	if err != nil {
+		return err
+	}
+	if n <= maxUserMessageBytes {
+		return nil
+	}
+	if config.NormalizeToolMode(toolMode) == config.ToolModeAuto {
+		return fmt.Errorf("%w: %w (%d bytes > %d)", ErrOutpostUnsupported, ErrUserMessageTooLarge, n, maxUserMessageBytes)
+	}
+	return fmt.Errorf("%w: %d bytes in native_outpost user_message", ErrUserMessageTooLarge, n)
+}
+
+func (p *outpostPool) RunTurn(ctx context.Context, turn *preparedTurn, sess *Session, onDispatched func(), onEvent EventFunc) (ChatResult, error) {
 	if turn == nil || turn.req == nil || sess == nil || turn.usedAccount == nil {
 		return ChatResult{}, fmt.Errorf("%w: missing turn context", ErrOutpostUnsupported)
 	}
@@ -715,23 +804,36 @@ func (p *outpostPool) RunTurn(ctx context.Context, turn *preparedTurn, sess *Ses
 
 	canReuse := turn.server.cfg.SessionReuse && !turn.auxRequest
 	convKey := turn.convKey()
+	explicitTID := strings.TrimSpace(turn.explicitThreadID)
+	toolMode := turn.server.cfg.GetToolMode()
 
 	var osess *outpostSession
 	resumingPendingTools := false
 	reusingIdleThread := false
 
-	if canReuse && convKey != "" {
-		if candidate := p.checkout(convKey); candidate != nil {
+	if canReuse && (convKey != "" || explicitTID != "") {
+		candidate := p.checkout(convKey)
+		if candidate == nil && explicitTID != "" {
+			candidate = p.checkoutByThreadID(explicitTID)
+		}
+		if candidate != nil {
 			sameAccount := candidate.accountID == turn.usedAccount.ID && candidate.chatAgentID == turn.chatAgentID
+			sameThread := explicitTID == "" || candidate.threadID == explicitTID
 			alive := !candidate.isClosed()
-			if sameAccount && alive {
+			if sameAccount && sameThread && alive {
 				if len(candidate.pendingCalls) > 0 {
 					if outpostToolIDSetMatch(candidate.pendingCalls, input.TurnToolResults) {
 						osess = candidate
+						if convKey != "" {
+							osess.convKey = convKey
+						}
 						resumingPendingTools = true
 					}
 				} else if !input.RawTailHasTools && (candidate.expectedPrefixHash == "" || candidate.expectedPrefixHash == input.HistoryPrefixHash) {
 					osess = candidate
+					if convKey != "" {
+						osess.convKey = convKey
+					}
 					reusingIdleThread = true
 				}
 			}
@@ -745,10 +847,21 @@ func (p *outpostPool) RunTurn(ctx context.Context, turn *preparedTurn, sess *Ses
 	importedHistoryWithCurrentTools := false
 	usedColdImport := false
 	if osess == nil {
-		// 冷新建或冷历史导入一律分配全新云端 thread_id，避免与旧会话已有事件冲突。
 		threadID := ""
 		var histToImport []Message
-		if len(input.HistoryMessages) > 0 || input.RawTailHasTools {
+		if explicitTID != "" {
+			// 调用方显式指定 X-Thread-Id 冷续接时，严禁静默替换为新 UUID；必须验证已知归属与状态一致性。
+			if !turn.explicitThreadKnown {
+				return ChatResult{}, fmt.Errorf("%w: thread %q has unknown ownership", ErrExplicitThreadConflict, explicitTID)
+			}
+			if turn.explicitThreadAccountID != 0 && turn.usedAccount.ID != turn.explicitThreadAccountID {
+				return ChatResult{}, fmt.Errorf("%w: thread %q belongs to another account", ErrExplicitThreadConflict, explicitTID)
+			}
+			if input.RawTailHasTools {
+				return ChatResult{}, fmt.Errorf("%w: thread %q cannot resume unparked tool_result without replacing thread", ErrExplicitThreadConflict, explicitTID)
+			}
+			threadID = explicitTID
+		} else if len(input.HistoryMessages) > 0 || input.RawTailHasTools {
 			if input.RawTailHasTools {
 				// 挂起会话已丢失（如重启或换号），把历史连同本轮已完成 tool_result 整体冷导入新云端线程
 				histToImport = nonLeadingMessages(turn.req.Messages)
@@ -762,6 +875,21 @@ func (p *outpostPool) RunTurn(ctx context.Context, turn *preparedTurn, sess *Ses
 			}
 		}
 		usedColdImport = len(histToImport) > 0
+
+		// 冷启动建连前预检完整序列化 user_message 预算：若超限在建连/注册 Outpost 前直接中止，确保 0 帧发往上游。
+		previewText := input.TurnUserText
+		if importedHistoryWithCurrentTools && strings.TrimSpace(previewText) == "" {
+			previewText = "Continue responding to the latest user request using the completed tool results in the conversation history. Those tools have already run; do not repeat completed actions merely because this connection was restored."
+		}
+		previewThreadID := threadID
+		if previewThreadID == "" {
+			previewThreadID = "00000000-0000-0000-0000-000000000000"
+		}
+		previewPayload := buildOutpostUserMessagePayload(turn, sess, reg, "00000000-0000-0000-0000-000000000000", outpostDeviceName(previewThreadID), previewThreadID, input.SystemPrompt, previewText)
+		if bErr := checkOutpostUserMessageBudget(previewPayload, toolMode); bErr != nil {
+			return ChatResult{}, bErr
+		}
+
 		opened, openErr := p.openSession(ctx, turn, sess, threadID, reg, usedColdImport, histToImport)
 		if openErr != nil {
 			return ChatResult{}, openErr
@@ -822,43 +950,13 @@ func (p *outpostPool) RunTurn(ctx context.Context, turn *preparedTurn, sess *Ses
 		osess.pendingCalls = nil
 	} else {
 		osess.emittedTextPrefix = ""
-		var cp strings.Builder
-		if strings.TrimSpace(input.SystemPrompt) != "" {
-			cp.WriteString(strings.TrimSpace(input.SystemPrompt))
-		}
-		cp.WriteString("\n\n# API Client Presentation\nThis conversation runs through an API gateway, not the desktop UI. Use standard Markdown/plain text and NEVER output <decision>, <option>, or <decisions> UI tags.\n")
-		if reg.PromptDocs != "" {
-			cp.WriteString(reg.PromptDocs)
-		}
-		cp.WriteString(reg.routingInstructions(osess.outpostID, osess.devName, turn.choiceMode, turn.choiceName, turn.parallelTools))
-
 		turnText := input.TurnUserText
 		if importedHistoryWithCurrentTools && strings.TrimSpace(turnText) == "" {
 			turnText = "Continue responding to the latest user request using the completed tool results in the conversation history. Those tools have already run; do not repeat completed actions merely because this connection was restored."
 		}
-		payload := map[string]any{
-			"surfaceType":        sess.Surface,
-			"outpostId":          osess.outpostID,
-			"appVersion":         osess.appVersion,
-			"thread_id":          osess.threadID,
-			"message_id":         uuid(),
-			"text":               turnText,
-			"custom_prompt":      cp.String(),
-			"agent_mode":         turn.in.Model,
-			"auto_routing":       false,
-			"web_search_enabled": false,
-		}
-		if effort := strings.TrimSpace(turn.in.ThinkingEffort); effort != "" {
-			payload["thinking_effort"] = effort
-		}
-		if id := strings.TrimSpace(turn.chatAgentID); id != "" {
-			payload["chat_agent_id"] = id
-		}
-		if tz := strings.TrimSpace(turn.server.cfg.Timezone); tz != "" {
-			payload["user_timezone"] = tz
-		}
-		if loc := strings.TrimSpace(turn.server.cfg.Locale); loc != "" {
-			payload["user_locale"] = loc
+		payload := buildOutpostUserMessagePayload(turn, sess, reg, osess.outpostID, osess.devName, osess.threadID, input.SystemPrompt, turnText)
+		if bErr := checkOutpostUserMessageBudget(payload, toolMode); bErr != nil {
+			return ChatResult{}, bErr
 		}
 		if err := osess.sendFrame(map[string]any{
 			"type":    "user_message",
@@ -868,11 +966,13 @@ func (p *outpostPool) RunTurn(ctx context.Context, turn *preparedTurn, sess *Ses
 		}
 	}
 
-	if turn.in.OnDispatched != nil {
+	if onDispatched != nil {
+		onDispatched()
+	} else if turn.in.OnDispatched != nil {
 		turn.in.OnDispatched()
 	}
 
-	res, sawToolCalls, err := osess.readTurnEvents(ctx, turn, onEvent)
+	res, sawToolCalls, canPark, err := osess.readTurnEvents(ctx, turn, onEvent)
 	res.ThreadID = osess.threadID
 	if err != nil {
 		return res, err
@@ -880,8 +980,8 @@ func (p *outpostPool) RunTurn(ctx context.Context, turn *preparedTurn, sess *Ses
 
 	turnSucceeded = true
 	if sawToolCalls {
-		// 保留挂起态 WS 与 Outpost，等待下一轮客户端回传原生 tool_result
-		if canReuse && convKey != "" {
+		// 仅当客户端收到的工具集合与上游等待结果的工具 ID 完全对齐时保留挂起态 WS；否则清理，下轮由冷导入续接。
+		if canPark && canReuse && convKey != "" {
 			parkedForToolsOrReuse = true
 			p.park(osess)
 		} else {
@@ -941,7 +1041,7 @@ func stripTrailingUserTextsFromNonLeading(msgs []Message) []Message {
 	return msgs[:end]
 }
 
-func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn, onEvent EventFunc) (ChatResult, bool, error) {
+func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn, onEvent EventFunc) (ChatResult, bool, bool, error) {
 	isMaxThinking := strings.EqualFold(strings.TrimSpace(turn.in.ThinkingEffort), "max")
 	idleReadLimit := wsReadIdleTimeout
 	if isMaxThinking && wsReadIdleTimeoutMaxThinking > idleReadLimit {
@@ -968,7 +1068,11 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 
 	var result ChatResult
 	var thinking strings.Builder
-	var segText strings.Builder // 当前 HTTP 轮次已经发射过的片段文本（扣除先前 emittedTextPrefix 后）
+	var segText strings.Builder // 当前 HTTP 轮次已经发射过的累计正文（扣除先前 emittedTextPrefix 后）
+	var msgText strings.Builder // 当前消息段内已经发射过的正文，用于多段 continuation 场景精确对账
+	needSegmentBreak := false
+	sawContinuation := false
+	turnFinished := false
 	var parallelDeadline <-chan time.Time
 	var parallelTimer *time.Timer
 	defer func() {
@@ -984,16 +1088,35 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 	creditSnapshots := make(map[string]creditSnapshot)
 	rawToolCalls := make([]ToolCallState, 0, 2)
 	seenCallIDs := make(map[string]bool)
+	readFailed := false
+
+	emitRawSegText := func(delta string, recordInMsg bool) error {
+		if delta == "" {
+			return nil
+		}
+		segText.WriteString(delta)
+		if recordInMsg {
+			msgText.WriteString(delta)
+		}
+		if onEvent != nil {
+			return onEvent(StreamEvent{Type: "text", Text: delta})
+		}
+		return nil
+	}
 
 	emitSegText := func(delta string) error {
 		if delta == "" {
 			return nil
 		}
-		segText.WriteString(delta)
-		if onEvent != nil {
-			return onEvent(StreamEvent{Type: "text", Text: delta})
+		if needSegmentBreak {
+			needSegmentBreak = false
+			if segText.Len() > 0 && !strings.HasSuffix(segText.String(), "\n") {
+				if err := emitRawSegText("\n\n", false); err != nil {
+					return err
+				}
+			}
 		}
-		return nil
+		return emitRawSegText(delta, true)
 	}
 
 	reconcileFullText := func(fullText string) error {
@@ -1002,12 +1125,22 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 		if s.emittedTextPrefix != "" && strings.HasPrefix(cur, s.emittedTextPrefix) {
 			cur = cur[len(s.emittedTextPrefix):]
 		}
-		already := segText.String()
-		if cur == "" || cur == already {
+		if cur == "" {
 			return nil
 		}
-		if strings.HasPrefix(cur, already) {
-			return emitSegText(cur[len(already):])
+		alreadyAll := segText.String()
+		if cur == alreadyAll {
+			return nil
+		}
+		if alreadyAll != "" && strings.HasPrefix(cur, alreadyAll) {
+			return emitSegText(cur[len(alreadyAll):])
+		}
+		alreadyMsg := msgText.String()
+		if cur == alreadyMsg {
+			return nil
+		}
+		if strings.HasPrefix(cur, alreadyMsg) {
+			return emitSegText(cur[len(alreadyMsg):])
 		}
 		return nil
 	}
@@ -1063,7 +1196,7 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 		return nil
 	}
 
-	finalizeTurn := func(hasTools bool) (ChatResult, bool, error) {
+	finalizeTurn := func(hasTools, completedNormally bool) (ChatResult, bool, bool, error) {
 		result.Text = segText.String()
 		result.Thinking = thinking.String()
 		creditTotals := make(map[string]float64)
@@ -1082,27 +1215,54 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 			result.Usage.Credits = append(result.Usage.Credits, store.CreditUsage{Unit: u, Amount: creditTotals[u]})
 		}
 		if hasTools {
+			connectionClosed := readFailed || s.isClosed()
+			if turn.explicitThreadID != "" && connectionClosed {
+				return result, false, false, errors.New("outpost WebSocket closed before it could accept tool results for the explicit thread")
+			}
 			filtered := filterOutpostToolCalls(rawToolCalls, turn.choiceMode, turn.choiceName, turn.parallelTools)
-			if len(filtered) == 0 && len(rawToolCalls) > 0 {
-				filtered = rawToolCalls
+			if len(filtered) == 0 {
+				// 被策略全部过滤时绝不回退为原始违规调用，直接中止本轮且不挂起会话。
+				s.pendingCalls = nil
+				result.ToolCalls = nil
+				blockedName := "unknown"
+				if len(rawToolCalls) > 0 && strings.TrimSpace(rawToolCalls[0].Name) != "" {
+					blockedName = strings.TrimSpace(rawToolCalls[0].Name)
+				}
+				return result, false, false, fmt.Errorf("%w: choice=%s(%q) blocked upstream tool %q", ErrOutpostToolPolicyMismatch, turn.choiceMode, turn.choiceName, blockedName)
+			}
+			canReuse := turn.server != nil && turn.server.cfg != nil && turn.server.cfg.SessionReuse && !turn.auxRequest
+			convKey := turn.convKey()
+			canPark := !connectionClosed && len(filtered) == len(rawToolCalls) && canReuse && (convKey != "" || strings.TrimSpace(turn.explicitThreadID) != "")
+			if strings.TrimSpace(turn.explicitThreadID) != "" && !canPark {
+				// 显式线程无法挂起等待被过滤的工具子集且不允许下轮换线程重导入，必须在向客户端发出调用前直接报错。
+				s.pendingCalls = nil
+				result.ToolCalls = nil
+				return result, false, false, fmt.Errorf("%w: explicit thread %q cannot safely accept filtered tool_result (upstream=%d, allowed=%d)", ErrOutpostToolPolicyMismatch, strings.TrimSpace(turn.explicitThreadID), len(rawToolCalls), len(filtered))
 			}
 			result.ToolCalls = filtered
-			s.emittedTextPrefix += result.Text
-			s.pendingCalls = make([]string, 0, len(rawToolCalls))
-			for _, tc := range rawToolCalls {
-				s.pendingCalls = append(s.pendingCalls, tc.ID)
+			if canPark {
+				s.emittedTextPrefix += result.Text
+				s.pendingCalls = make([]string, 0, len(filtered))
+				for _, tc := range filtered {
+					s.pendingCalls = append(s.pendingCalls, tc.ID)
+				}
+			} else {
+				s.pendingCalls = nil
 			}
 			if onEvent != nil {
 				for i := range filtered {
 					tcCopy := filtered[i]
 					if err := onEvent(StreamEvent{Type: "tool_call", ToolCall: &tcCopy}); err != nil {
-						return result, true, err
+						return result, true, canPark, err
 					}
 				}
 			}
-			return result, true, nil
+			return result, true, canPark, nil
 		}
-		return result, false, nil
+		if completedNormally {
+			return result, false, false, turn.validateToolChoice(nil)
+		}
+		return result, false, false, nil
 	}
 
 	processEvent := func(ev map[string]any) (completed bool, err error) {
@@ -1121,8 +1281,10 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 			} else if mid, _ := p["message_id"].(string); mid != "" {
 				s.currentMessageID = mid
 			}
+			msgText.Reset()
+			needSegmentBreak = false
 			if segText.Len() > 0 && !strings.HasSuffix(segText.String(), "\n") {
-				if err := emitSegText("\n\n"); err != nil {
+				if err := emitRawSegText("\n\n", false); err != nil {
 					return false, err
 				}
 			}
@@ -1245,7 +1407,30 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 					ResolvedModelID:  resolved,
 				})
 			}
-		case "message_complete", "turn_completed", "turn_ended", "stream_ended", "chat_complete":
+		case "message_complete":
+			var mc struct {
+				Text                 string `json:"text"`
+				ContinuationExpected bool   `json:"continuation_expected"`
+			}
+			_ = json.Unmarshal(payloadBytes, &mc)
+			if len(rawToolCalls) == 0 && mc.Text != "" {
+				if err := reconcileFullText(mc.Text); err != nil {
+					return false, err
+				}
+			}
+			// 区分单条消息结束与整轮回答结束：若 continuation_expected=true，保留 sawContinuation 并重置单段对账状态继续读取。
+			if len(rawToolCalls) == 0 && mc.ContinuationExpected {
+				needSegmentBreak = true
+				sawContinuation = true
+				msgText.Reset()
+				return false, nil
+			}
+			needSegmentBreak = false
+			turnFinished = true
+			return true, nil
+		case "turn_completed", "turn_ended", "stream_ended", "chat_complete":
+			needSegmentBreak = false
+			turnFinished = true
 			if len(rawToolCalls) == 0 {
 				if txt, _ := p["text"].(string); txt != "" {
 					if err := reconcileFullText(txt); err != nil {
@@ -1254,7 +1439,9 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 				}
 			}
 			return true, nil
-		case "error", "exception":
+		case "turn_aborted":
+			return false, &UpstreamError{Code: "turn_aborted", Err: errors.New("upstream turn was aborted")}
+		case "error", "exception", "session_error", "stream_error", "turn_failed":
 			return false, parseOutpostErrorEvent(ev)
 		default:
 			if strings.HasSuffix(typ, "Exception") {
@@ -1271,92 +1458,94 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 		for _, ev := range buffered {
 			done, err := processEvent(ev)
 			if err != nil {
-				res, _, _ := finalizeTurn(false)
-				return res, false, err
+				res, _, _, _ := finalizeTurn(false, false)
+				return res, false, false, err
 			}
 			if done {
-				return finalizeTurn(len(rawToolCalls) > 0)
+				return finalizeTurn(len(rawToolCalls) > 0, true)
 			}
 		}
 	}
 
 	for {
+		var pkt outpostInboundPacket
+		var ok, havePacket bool
 		if len(rawToolCalls) > 0 {
 			// 若在并行窗口或单次 packet 结束后已收齐，先快速非阻塞排空当前已到达包
 			select {
-			case pkt, ok := <-s.eventsCh:
-				if ok && pkt.Err == nil {
-					resetIdle()
-					for _, frameStr := range pkt.Events {
-						var ev map[string]any
-						if json.Unmarshal([]byte(frameStr), &ev) != nil {
-							continue
-						}
-						done, err := processEvent(ev)
-						if err != nil {
-							res, _, _ := finalizeTurn(false)
-							return res, false, err
-						}
-						if done {
-							return finalizeTurn(len(rawToolCalls) > 0)
-						}
-					}
-					continue
-				}
+			case pkt, ok = <-s.eventsCh:
+				havePacket = true
 			default:
 			}
 		}
 
-		select {
-		case <-ctx.Done():
-			res, _, _ := finalizeTurn(false)
-			return res, false, ctx.Err()
-		case <-parallelDeadline:
-			return finalizeTurn(true)
-		case <-idleTimer.C:
-			res, _, _ := finalizeTurn(false)
-			return res, false, fmt.Errorf("outpost WebSocket read idle timeout (%s)", idleReadLimit)
-		case <-pingTicker.C:
-			if err := s.sendFrame(map[string]any{"type": "ping", "payload": map[string]any{}}); err != nil {
-				res, _, _ := finalizeTurn(false)
-				return res, false, err
+		if !havePacket {
+			select {
+			case <-ctx.Done():
+				res, _, _, _ := finalizeTurn(false, false)
+				return res, false, false, ctx.Err()
+			case <-parallelDeadline:
+				return finalizeTurn(true, true)
+			case <-idleTimer.C:
+				res, _, _, _ := finalizeTurn(false, false)
+				return res, false, false, fmt.Errorf("outpost WebSocket read idle timeout (%s)", idleReadLimit)
+			case <-pingTicker.C:
+				if err := s.sendFrame(map[string]any{"type": "ping", "payload": map[string]any{}}); err != nil {
+					res, _, _, _ := finalizeTurn(false, false)
+					return res, false, false, err
+				}
+			case pkt, ok = <-s.eventsCh:
 			}
-		case pkt, ok := <-s.eventsCh:
-			if !ok {
-				if len(rawToolCalls) > 0 {
-					return finalizeTurn(true)
-				}
-				res, _, _ := finalizeTurn(false)
-				return res, false, errors.New("outpost WebSocket closed unexpectedly")
+		}
+		if !ok {
+			readFailed = true
+			if len(rawToolCalls) > 0 {
+				return finalizeTurn(true, true)
 			}
-			if pkt.Err != nil {
-				if len(rawToolCalls) > 0 {
-					return finalizeTurn(true)
-				}
-				if websocket.IsCloseError(pkt.Err, websocket.CloseNormalClosure, websocket.CloseNoStatusReceived) {
-					return finalizeTurn(false)
-				}
-				res, _, _ := finalizeTurn(false)
-				return res, false, fmt.Errorf("outpost WebSocket read: %w", pkt.Err)
+			if turnFinished {
+				return finalizeTurn(false, true)
 			}
-			resetIdle()
-			for _, frameStr := range pkt.Events {
-				var ev map[string]any
-				if json.Unmarshal([]byte(frameStr), &ev) != nil {
-					continue
-				}
-				done, err := processEvent(ev)
-				if err != nil {
-					res, _, _ := finalizeTurn(false)
-					return res, false, err
-				}
-				if done {
-					return finalizeTurn(len(rawToolCalls) > 0)
-				}
+			res, _, _, _ := finalizeTurn(false, false)
+			if sawContinuation {
+				return res, false, false, errors.New("outpost WebSocket closed before continuation completed")
 			}
-			if len(rawToolCalls) > 0 && !turn.parallelTools {
-				return finalizeTurn(true)
+			return res, false, false, errors.New("outpost WebSocket closed unexpectedly")
+		}
+		if pkt.Err != nil {
+			readFailed = true
+			if len(rawToolCalls) > 0 {
+				return finalizeTurn(true, true)
 			}
+			if websocket.IsCloseError(pkt.Err, websocket.CloseNormalClosure, websocket.CloseNoStatusReceived) {
+				if !turnFinished {
+					res, _, _, _ := finalizeTurn(false, false)
+					if sawContinuation {
+						return res, false, false, errors.New("outpost WebSocket closed before continuation completed")
+					}
+					return res, false, false, errors.New("outpost WebSocket closed before turn completed")
+				}
+				return finalizeTurn(false, true)
+			}
+			res, _, _, _ := finalizeTurn(false, false)
+			return res, false, false, fmt.Errorf("outpost WebSocket read: %w", pkt.Err)
+		}
+		resetIdle()
+		for _, frameStr := range pkt.Events {
+			var ev map[string]any
+			if json.Unmarshal([]byte(frameStr), &ev) != nil {
+				continue
+			}
+			done, err := processEvent(ev)
+			if err != nil {
+				res, _, _, _ := finalizeTurn(false, false)
+				return res, false, false, err
+			}
+			if done {
+				return finalizeTurn(len(rawToolCalls) > 0, true)
+			}
+		}
+		if len(rawToolCalls) > 0 && !turn.parallelTools {
+			return finalizeTurn(true, true)
 		}
 	}
 }

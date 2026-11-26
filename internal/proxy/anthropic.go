@@ -568,11 +568,9 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	defer turn.Close()
 
 	if !req.Stream {
-		res, lastErr := turn.runChat(nil, nil, nil)
+		res, lastErr := turn.runChat(nil, nil, nil, nil)
 		if lastErr != nil {
-			if shouldResetConversation(turn.conv, lastErr) {
-				s.sessions.reset(turn.conv, turn.convEpoch, turn.convVersion)
-			}
+			turn.resetConversationAfterFailure(lastErr)
 			status, _ := chatErrorStatus(lastErr)
 			turn.finishTurn("failed", "", res, 0, lastErr)
 			writeCooldownRetryHeader(w, lastErr)
@@ -1009,13 +1007,64 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			bridgeStream.Reset()
 		}
 		quickFilter.Reset()
+	}, func(res ChatResult) ([]ToolCall, error) {
+		if err := turn.ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := getClientWriteErr(); err != nil {
+			return nil, err
+		}
+		if turn.bridgeActive {
+			if !turn.nativeOutpostActive {
+				remText, remCalls := bridgeStream.Flush()
+				if remText != "" {
+					emitFilteredText(remText)
+				}
+				for _, tc := range remCalls {
+					emitToolReply(tc)
+				}
+			}
+			fText, fCalls := quickFilter.Flush()
+			if fText != "" {
+				emitText(fText)
+			}
+			for _, tc := range fCalls {
+				emitToolReply(tc)
+			}
+			if emittedTools == 0 && len(res.ToolCalls) > 0 {
+				for _, tc := range limitToolReplies(nativeToolReplies(res.ToolCalls, turn.allowedTools), turn.choiceMode, turn.choiceName, turn.parallelTools) {
+					emitToolReply(tc)
+				}
+			}
+			if !sawVisibleText && emittedTools == 0 && hasVisibleText(res.Text) {
+				outText, outTools := turn.responseOutput(res)
+				if hasVisibleText(outText) {
+					emitText(outText)
+				}
+				for _, tc := range outTools {
+					emitToolReply(ToolCallReply{
+						ID:        tc.ID,
+						Name:      tc.Function.Name,
+						Arguments: tc.Function.Arguments,
+					})
+				}
+			}
+		} else {
+			fText, _ := quickFilter.Flush()
+			if fText != "" {
+				emitText(fText)
+			}
+			if !sawVisibleText && hasVisibleText(res.Text) {
+				if cleanedRes, _ := cleanQuickOutput(res.Text, nil, nil); hasVisibleText(cleanedRes) {
+					emitText(cleanedRes)
+				}
+			}
+		}
+		return finalOutTools, getClientWriteErr()
 	})
 	stopHB()
-
 	if lastErr != nil {
-		if shouldResetConversation(turn.conv, lastErr) {
-			s.sessions.reset(turn.conv, turn.convEpoch, turn.convVersion)
-		}
+		turn.resetConversationAfterFailure(lastErr)
 		if wErr := getClientWriteErr(); wErr != nil {
 			turn.finishTurn("failed", "", res, 0, wErr)
 			return
@@ -1037,61 +1086,6 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			},
 		})
 		return
-	}
-
-	if getClientWriteErr() != nil || turn.ctx.Err() != nil {
-		errOut := getClientWriteErr()
-		if errOut == nil {
-			errOut = turn.ctx.Err()
-		}
-		turn.finishTurn("failed", "", res, emittedTools, errOut)
-		return
-	}
-	if turn.bridgeActive {
-		if !turn.nativeOutpostActive {
-			remText, remCalls := bridgeStream.Flush()
-			if remText != "" {
-				emitFilteredText(remText)
-			}
-			for _, tc := range remCalls {
-				emitToolReply(tc)
-			}
-		}
-		fText, fCalls := quickFilter.Flush()
-		if fText != "" {
-			emitText(fText)
-		}
-		for _, tc := range fCalls {
-			emitToolReply(tc)
-		}
-		if emittedTools == 0 && len(res.ToolCalls) > 0 {
-			for _, tc := range limitToolReplies(nativeToolReplies(res.ToolCalls, turn.allowedTools), turn.choiceMode, turn.choiceName, turn.parallelTools) {
-				emitToolReply(tc)
-			}
-		}
-		if !sawVisibleText && emittedTools == 0 && hasVisibleText(res.Text) {
-			outText, outTools := turn.responseOutput(res)
-			if hasVisibleText(outText) {
-				emitText(outText)
-			}
-			for _, tc := range outTools {
-				emitToolReply(ToolCallReply{
-					ID:        tc.ID,
-					Name:      tc.Function.Name,
-					Arguments: tc.Function.Arguments,
-				})
-			}
-		}
-	} else {
-		fText, _ := quickFilter.Flush()
-		if fText != "" {
-			emitText(fText)
-		}
-		if !sawVisibleText && hasVisibleText(res.Text) {
-			if cleanedRes, _ := cleanQuickOutput(res.Text, nil, nil); hasVisibleText(cleanedRes) {
-				emitText(cleanedRes)
-			}
-		}
 	}
 
 	flushPendingThinking()
