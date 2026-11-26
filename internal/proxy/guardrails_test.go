@@ -313,3 +313,35 @@ func TestTrimSuggestionMessages(t *testing.T) {
 		t.Fatalf("trimSuggestionMessages mutated original slice")
 	}
 }
+
+func TestClassifyRemoteSandboxTool(t *testing.T) {
+	cases := []struct {
+		name      string
+		tool      string
+		args      string
+		hasAttach bool
+		readCount int
+		wantBlock bool
+		wantWhy   string
+	}{
+		{"web_search 0容忍拦截", "web_search", `{"q":"deepseek logo"}`, true, 0, true, "forbidden_remote_tool"},
+		{"download_file 0容忍拦截", "download_file", `{"url":"https://a.com/logo.png"}`, false, 0, true, "forbidden_remote_tool"},
+		{"execute_bash 0容忍拦截", "execute_bash", `{"cmd":"curl -O https://a.com"}`, true, 0, true, "forbidden_remote_tool"},
+		{"write_file 0容忍拦截", "write_file", `{"path":"a.py"}`, true, 0, true, "forbidden_remote_tool"},
+		{"quick_space_search 0容忍拦截", "quick_space_search", `{}`, true, 0, true, "forbidden_remote_tool"},
+		{"带附件时 read_file 允许", "read_file", `{"path":"prompt-1.txt"}`, true, 0, false, ""},
+		{"带附件时第4次 read_file 允许", "read_file", `{"path":"img-04.png"}`, true, 3, false, ""},
+		{"带附件时第5次超出配额拦截", "read_file", `{"path":"img-05.png"}`, true, 4, true, "remote_read_limit_exceeded"},
+		{"无附件时普通 read_file 拦截", "read_file", `{"path":"/etc/passwd"}`, false, 0, true, "unexpected_remote_tool_without_attachments"},
+		{"无当前轮附件但读历史上传路径放行1次", "read_file", `{"path":"/data/s3files/doc-01.pdf"}`, false, 0, false, ""},
+		{"未知陌生工具拦截", "render_video", `{}`, true, 0, true, "unrecognized_remote_tool"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			blocked, reason := classifyRemoteSandboxTool(tc.tool, tc.args, tc.hasAttach, tc.readCount)
+			if blocked != tc.wantBlock || reason != tc.wantWhy {
+				t.Fatalf("classifyRemoteSandboxTool(%q) = (%v, %q), want (%v, %q)", tc.tool, blocked, reason, tc.wantBlock, tc.wantWhy)
+			}
+		})
+	}
+}

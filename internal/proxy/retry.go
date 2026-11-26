@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -17,9 +18,32 @@ import (
 )
 
 var (
-	ErrEmptyResponse     = errors.New("upstream returned no visible text or tool calls")
-	ErrInvalidAttachment = errors.New("invalid attachment")
+	ErrEmptyResponse            = errors.New("upstream returned no visible text or tool calls")
+	ErrInvalidAttachment        = errors.New("invalid attachment")
+	ErrRemoteSandboxToolBlocked = errors.New("remote cloud sandbox tool blocked")
 )
+
+// RemoteToolBlockedError 表示模型在启用客户端工具桥接时越权调用了远端云端沙箱/搜索/执行工具并被实时阻断。
+type RemoteToolBlockedError struct {
+	ToolName string
+	Reason   string
+}
+
+func (e *RemoteToolBlockedError) Error() string {
+	name := strings.TrimSpace(e.ToolName)
+	if name == "" {
+		name = "unknown"
+	}
+	reason := strings.TrimSpace(e.Reason)
+	if reason == "" {
+		return fmt.Sprintf("%s: %s", ErrRemoteSandboxToolBlocked.Error(), name)
+	}
+	return fmt.Sprintf("%s: %s (%s)", ErrRemoteSandboxToolBlocked.Error(), name, reason)
+}
+
+func (e *RemoteToolBlockedError) Unwrap() error {
+	return ErrRemoteSandboxToolBlocked
+}
 
 type UpstreamError struct {
 	StatusCode int
@@ -50,7 +74,7 @@ const (
 )
 
 func retryActionFor(err error) retryAction {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, ErrUserMessageTooLarge) || errors.Is(err, ErrInvalidAttachment) {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, ErrUserMessageTooLarge) || errors.Is(err, ErrInvalidAttachment) || errors.Is(err, ErrRemoteSandboxToolBlocked) {
 		return retryStop
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
@@ -113,6 +137,9 @@ func retryActionFor(err error) retryAction {
 func shouldResetConversation(conv *conversation, err error) bool {
 	if err == nil || conv == nil {
 		return false
+	}
+	if errors.Is(err, ErrRemoteSandboxToolBlocked) {
+		return true
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, accounts.ErrAllAccountsCoolingDown) || errors.Is(err, ErrInvalidAttachment) {
@@ -235,6 +262,8 @@ func invalidChatRequest(err error) bool {
 
 func chatErrorStatus(err error) (int, string) {
 	switch {
+	case errors.Is(err, ErrRemoteSandboxToolBlocked):
+		return http.StatusBadGateway, "remote_sandbox_tool_blocked"
 	case errors.Is(err, accounts.ErrAllAccountsCoolingDown):
 		return http.StatusTooManyRequests, "rate_limit_exceeded"
 	case errors.Is(err, accounts.ErrNoAccounts), errors.Is(err, accounts.ErrNoAvailableAccounts):

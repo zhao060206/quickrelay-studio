@@ -154,6 +154,7 @@ func buildToolBridgePromptForMode(req *ChatRequest, mode, name string, parallel 
 		b.WriteString("- Keep each turn focused and incremental: for long documents, reports, or large projects, work in clear concise steps (~150-300 lines per file write) and verify outputs across subsequent tool turns so every turn completes well within streaming limits.\n")
 	}
 
+	b.WriteString("- STRICT RULE: Never call any remote cloud sandbox, web search, download, shell, or file-writing tool. Perform all searches, downloads, commands, and file actions strictly via <client_tool_call> and immediately stop to wait for the client result.\n")
 	b.WriteString("- After the client returns the action result in the next turn, continue the task with that result.\n")
 	b.WriteString("- If no workspace action is needed, answer normally in plain text without a marker.\n")
 	if parallel {
@@ -220,6 +221,7 @@ func buildResumeToolReminder(mode, name string, parallel bool) string {
 	if mode == "required" {
 		b.WriteString("\n- You must request at least one action before answering.")
 	}
+	b.WriteString("\n- STRICT RULE: Never invoke remote cloud search, download, shell, or file-writing sandbox tools; always emit <client_tool_call> and stop to wait for the client result.")
 	b.WriteString("\n</client_tool_protocol>")
 	return b.String()
 }

@@ -335,3 +335,65 @@ func extractEnvSummary(rawGuidelines string) string {
 	}
 	return summary
 }
+
+var (
+	forbiddenRemoteToolKeywords = []string{
+		"web_search", "websearch", "web_fetch", "webfetch", "search_web", "online_search",
+		"internet", "browser", "browse", "download", "curl", "wget", "http_request", "fetch_url", "fetch",
+		"bash", "shell", "exec", "terminal", "command", "python", "code_interpreter", "run_code", "sandbox", "script",
+		"write", "create_file", "edit_file", "str_replace", "save_file", "delete", "remove_file", "patch", "mkdir",
+		"quick_space", "space_search", "search_space", "knowledge", "rag_",
+	}
+	readonlyRemoteToolKeywords = []string{
+		"read", "view", "cat", "open", "inspect", "attachment", "file", "list",
+	}
+)
+
+func argsLookLikeUploadedAttachment(args string) bool {
+	lower := strings.ToLower(args)
+	for _, marker := range []string{"/data/s3files/", "prompt-", "guidelines-", "img-", "doc-"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// classifyRemoteSandboxTool 判断启用客户端工具桥接时上游模型触发的云端原生工具是否越权。
+// 高危联网搜索/下载/命令行/写文件工具一律 0 容忍立即拦截；仅允许有限次数只读查看已上传附件。
+func classifyRemoteSandboxTool(name, args string, hasUploadedAttachments bool, allowedReadCount int) (blocked bool, reason string) {
+	lowerName := strings.ToLower(strings.TrimSpace(name))
+	if lowerName == "" {
+		return false, ""
+	}
+	for _, kw := range forbiddenRemoteToolKeywords {
+		if strings.Contains(lowerName, kw) {
+			return true, "forbidden_remote_tool"
+		}
+	}
+	isReadCandidate := argsLookLikeUploadedAttachment(args)
+	if !isReadCandidate {
+		for _, kw := range readonlyRemoteToolKeywords {
+			if strings.Contains(lowerName, kw) {
+				isReadCandidate = true
+				break
+			}
+		}
+	}
+	if isReadCandidate {
+		if hasUploadedAttachments {
+			if allowedReadCount >= 4 {
+				return true, "remote_read_limit_exceeded"
+			}
+			return false, ""
+		}
+		if argsLookLikeUploadedAttachment(args) {
+			if allowedReadCount >= 1 {
+				return true, "remote_read_limit_exceeded"
+			}
+			return false, ""
+		}
+		return true, "unexpected_remote_tool_without_attachments"
+	}
+	return true, "unrecognized_remote_tool"
+}

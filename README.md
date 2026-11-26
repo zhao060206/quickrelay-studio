@@ -1,4 +1,4 @@
-# QuickRelay Studio v2.4.5
+# QuickRelay Studio v2.4.6
 
 **QuickRelay Studio** 是一款基于 Go 与 WebView2 桌面端打造的独立双协议 AI 反代网关与账号池管理控制台。支持将多个 AWS Quick 账号聚合为标准的 **OpenAI** 与 **Anthropic Messages** API，免改造直连 **Claude Code**、**Codex CLI** 及各类开源 SDK，并内置完整的请求明细统计与 1M 上下文持久化会话追踪。
 
@@ -9,6 +9,9 @@
 1. **双协议原生网关**
    - **OpenAI 协议**：完整兼容 `POST /v1/chat/completions` 与 `GET /v1/models`。
    - **Anthropic Messages 协议**：原生支持 `POST /v1/messages`（含流式 SSE 与同步 JSON，完整支持 `type: "document"` PDF/文本文档附件直传）及本地 `POST /v1/messages/count_tokens` 估算。
+   - **防云端沙箱越权空转与自动纠偏（v2.4.6 新增）**：
+     - 在三档协作引导与工具桥接协议中强制禁用 AWS Quick 远端搜索、下载、命令行及写文件沙箱工具，仅允许在远端有限次数只读查看本轮显式上传的附件；
+     - 在 WebSocket 上行读事件流中实时拦截越权原生工具调用及超过 `45s` 的 `tool_progress` 空转卡死，未向客户端开流时自动在全新线程中附带纠偏指令重发切回 `<client_tool_call>`（不记账号失败），已开流时秒级断开、重置受污染会话并立即向客户端报错止损，彻底杜绝界面卡在几百 Token 干等 15 分钟。
    - **附件完整性与跨请求账号限流冷却（v2.4.3 新增 / v2.4.4 增强）**：
      - 严格校验单轮最多 16 个有效图片/二进制文档附件（纯文本文档内联不占配额）：超限、解码失败、不支持来源或上传/DLP 失败均明确返回协议错误，绝不静默丢弃或向模型派发残缺上下文；多轮长对话在升级或切号触发全量历史重放时，优先严格校验当前轮全部附件，并将剩余配额按从近到远分配给历史附件，超出配额或已失效的历史旧附件诚实标记省略（`[earlier image/document omitted]` / `[earlier image/document unavailable]`），既不虚标已附上也不再因历史累计超 16 张图锁死长会话（v2.4.4 增强）；
      - 明确识别上游 `429` / `Throttling` 限流与 `Retry-After` 并设置进程内跨请求冷却（默认 `45s`，上限 `5m`），新请求自动避开冷却账号并用完整历史接手，全员冷却时直接返回 `429` 并保留既有会话映射。

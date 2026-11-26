@@ -163,6 +163,7 @@ type preparedTurn struct {
 	sameAccountRetried  map[int64]bool
 	pinnedFirst         bool
 	preferredAccount    int64
+	remoteToolCorrected bool
 	upstreamWaitingNano atomic.Int64
 }
 
@@ -461,9 +462,10 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		Guidelines:     turnGuidelines,
 		ToolProtocol:   turnToolProtocol,
 		WorkMode:       workMode,
-		ChatAgentID:    s.cfg.ChatAgentID,
-		CreateSession:  true,
-		DeleteSession:  (!s.cfg.SessionReuse && !s.cfg.KeepSessions) || isAux,
+		ChatAgentID:       s.cfg.ChatAgentID,
+		CreateSession:     true,
+		DeleteSession:     (!s.cfg.SessionReuse && !s.cfg.KeepSessions) || isAux,
+		ClientToolsActive: bridgeActive,
 	}
 	if t.resume {
 		t.in.ThreadID = conv.threadID
@@ -652,8 +654,11 @@ func (t *preparedTurn) selectAccount() (*store.Account, *Session, error) {
 func (t *preparedTurn) runChat(onEvent EventFunc, streamStarted func() bool, resetOutput func()) (ChatResult, error) {
 	var res ChatResult
 	var lastErr error
-	for t.attempts < t.maxAttempts {
-		if t.attempts > 0 {
+	forceCorrection := false
+	for t.attempts < t.maxAttempts || forceCorrection {
+		wasForcedCorrection := forceCorrection
+		forceCorrection = false
+		if t.attempts > 0 && !wasForcedCorrection {
 			if err := waitForRetry(t.ctx, t.attempts); err != nil {
 				return res, err
 			}
@@ -711,7 +716,7 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamStarted func() bool, res
 			return res, nil
 		}
 		lastErr = err
-		if !invalidChatRequest(err) && t.ctx.Err() == nil {
+		if !invalidChatRequest(err) && !errors.Is(err, ErrRemoteSandboxToolBlocked) && t.ctx.Err() == nil {
 			t.server.accounts.ReportFailure(t.ctx, acct.ID, err)
 		}
 		log.Printf("chat %s attempt=%d/%d account=%s failed error=%v", t.id, t.attempts, t.maxAttempts, accountLogLabel(acct), err)
@@ -721,6 +726,25 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamStarted func() bool, res
 		}
 		if t.ctx.Err() != nil {
 			return res, t.ctx.Err()
+		}
+		if errors.Is(err, ErrRemoteSandboxToolBlocked) {
+			if !t.remoteToolCorrected {
+				t.remoteToolCorrected = true
+				blockedName := "remote_tool"
+				var rErr *RemoteToolBlockedError
+				if errors.As(err, &rErr) && strings.TrimSpace(rErr.ToolName) != "" {
+					blockedName = strings.TrimSpace(rErr.ToolName)
+				}
+				if swErr := t.switchToFullTranscript(); swErr != nil {
+					return res, swErr
+				}
+				t.in.Prompt += fmt.Sprintf("\n\n[IMPORTANT CORRECTION: Your previous attempt invoked a blocked remote cloud tool (%q) and was terminated. Remote cloud sandbox, web search, download, shell, and file-write tools are strictly disabled. Perform the required action on the user's local machine by emitting <client_tool_call> from <client_tool_protocol> right now, or answer in plain text without invoking remote tools.]", blockedName)
+				t.preferredAccount = acct.ID
+				forceCorrection = true
+				log.Printf("chat %s auto-correcting blocked remote tool %q in fresh thread", t.id, blockedName)
+				continue
+			}
+			return res, err
 		}
 		action := retryActionFor(err)
 		if isRateLimitTemporary(err) {

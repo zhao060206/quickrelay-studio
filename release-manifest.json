@@ -1,15 +1,15 @@
 {
-  "version": "2.4.5",
-  "tag": "v2.4.5",
-  "published_at": "2026-11-26T02:33:00Z",
-  "release_notes": "QuickRelay Studio v2.4.5 更新内容：\n1. 彻底修复带 tools 的 Claude Code 后台自动补全请求污染主对话线程的问题：\n   - 识别末尾以 [SUGGESTION MODE: 开头的输入框建议请求时不再受是否携带 tools 限制，始终使用独立一次性 aux: 会话键隔离，即使用户同时传递 X-Conversation-Id / X-Thread-Id 也不会复用、抢锁或覆盖主会话 thread_id；\n   - 同步补全标题生成请求的新变体匹配（如 succinct title and git branch name、Write the title in the predominant language of the session），防止标题请求漏判。\n2. 建议模式旁路轻量瘦身，省配额提速度：\n   - [SUGGESTION MODE: 旁路请求自动跳过 20K 工具协议与长工作区指南注入、思考强度自动降至 low（未显式关闭时），并仅保留末尾最近 6 条纯文本历史窗口（剥离历史图片/PDF 与巨型工具参数 JSON），不再重放十几万 Token 主历史，显著缩短响应耗时并节省 Cache Write。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.5",
+  "version": "2.4.6",
+  "tag": "v2.4.6",
+  "published_at": "2026-11-26T03:27:30Z",
+  "release_notes": "QuickRelay Studio v2.4.6 更新内容：\n1. 新增强制性「防云端沙箱越权空转」双层护栏：\n   - 在三档协作引导词与客户端工具协议（含续聊精简提醒）中明确禁用 AWS Quick 远端搜索、下载、命令行及写文件沙箱，强制所有真实动作通过 <client_tool_call> 委派给用户本机执行；\n   - 在 WebSocket 上行事件流中实时拦截越权原生工具调用（web_search / download / bash / write_file / quick_space 等高危工具 0 容忍立即熔断，仅放行有限次数的已上传附件只读查看），并新增 45 秒原生工具超时强制断开机制防止 tool_progress 死循环；\n   - 未向客户端开流前遇到拦截，自动在全新线程附带纠偏指令重发切回 <client_tool_call>（不计入账号失败计数）；已开流吐出旁白后再违规时立刻断开并重置受污染会话，彻底杜绝界面卡死在几百 Token 干等 15 分钟白烧上百万缓存。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.4.6",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.4.5-win-x64.zip",
-      "size": 8649303,
-      "sha256": "9ed209eb04eb88489729c1840ef81fdbe1e361dc7cc2ee929f8b1fdb6ddf91c0",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.5/QuickRelay-Studio-v2.4.5-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.4.6-win-x64.zip",
+      "size": 8655076,
+      "sha256": "ba101e373c240c60e25971bc3b5f3b7c3fe70cd6ab97d0c5332445a6b2a82bb0",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.4.6/QuickRelay-Studio-v2.4.6-win-x64.zip"
     }
   }
 }

@@ -1646,3 +1646,424 @@ func TestImprovement_SuggestionModeWithToolsDoesNotPolluteMainThread(t *testing.
 		t.Fatalf("completed suggestion should create & delete its own isolated thread, got %+v", sugCompleteTurn)
 	}
 }
+
+// TestImprovement_RemoteSandboxToolBlockedAndAutoCorrected 覆盖远端云端沙箱越权强拦截的 5 个端到端场景：
+// 1) 未吐正文即调 web_search：秒级熔断、0 账号失败、新建线程附纠偏指令自动重发并成功切回 <client_tool_call>；
+// 2) 已开流吐出旁白后再调 execute_bash 挂起：立刻强断开流下发 error 事件并销毁被污染会话；
+// 3) 本轮含附件时合法调 read_file：正常放行并在 tool_result 后完成回答；
+// 4) read_file 后持续刷 tool_progress 卡死：触发 wsNativeToolTimeout 强制超时熔断；
+// 5) 未传客户端工具的纯问答请求：允许上游自由调用 web_search 正常完成。
+func TestImprovement_RemoteSandboxToolBlockedAndAutoCorrected(t *testing.T) {
+	clientTools := []map[string]any{{
+		"name": "Bash", "description": "run local shell", "input_schema": map[string]any{"type": "object"},
+	}}
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+
+	t.Run("auto_correct_before_stream_starts", func(t *testing.T) {
+		type recTurn struct {
+			hasCreate bool
+			threadID  string
+			text      string
+		}
+		var recs []recTurn
+		var mu sync.Mutex
+		var seq atomic.Int32
+
+		wsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			hasCreate := false
+			for {
+				_, raw, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				mType, payload, ok := decodeClientFrame(raw)
+				if !ok {
+					continue
+				}
+				switch mType {
+				case "session_create":
+					hasCreate = true
+				case "user_message":
+					tid, _ := payload["thread_id"].(string)
+					txt, _ := payload["text"].(string)
+					mu.Lock()
+					recs = append(recs, recTurn{hasCreate: hasCreate, threadID: tid, text: txt})
+					mu.Unlock()
+					n := seq.Add(1)
+					writeEv := func(v any) {
+						_ = conn.WriteMessage(websocket.BinaryMessage, encodeMockAIDPServerEvent(v))
+					}
+					if n == 1 {
+						// 第 1 次：未吐任何文本即违规触发云端 web_search
+						writeEv(map[string]any{"type": "tool_start", "payload": map[string]any{"tool_id": "t_ws_1", "tool_name": "web_search"}})
+						// 模拟云端陷入黑盒等待
+						time.Sleep(400 * time.Millisecond)
+						return
+					}
+					// 第 2 次纠偏后：改发本地 <client_tool_call>
+					writeEv(map[string]any{"type": "message_start", "payload": map[string]any{"message_id": "m_ok"}})
+					writeEv(map[string]any{"type": "text_delta", "payload": map[string]any{"delta": `<client_tool_call>{"name":"Bash","arguments":{"command":"curl -sL https://deepseek.com"}}</client_tool_call>`}})
+					writeEv(map[string]any{"type": "message_complete", "payload": map[string]any{"continuation_expected": false}})
+					writeEv(map[string]any{"type": "turn_completed", "payload": map[string]any{}})
+				}
+			}
+		}))
+		defer wsSrv.Close()
+
+		dbPath := filepath.Join(t.TempDir(), "autocorrect.db")
+		st, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		defer st.Close()
+		_ = st.Save(context.Background(), &store.Account{
+			Email: "ac@example.com", Provider: "social",
+			WSHost: "ws://" + strings.TrimPrefix(wsSrv.URL, "http://"), WSPath: "/ws",
+			AccessToken: "jwt-ac", ActorARN: "arn:aws:quick:us-east-1:ac", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		})
+		cfg := config.Default()
+		cfg.SessionReuse = true
+		cfg.MaxAttempts = 1 // 验证即便 max_attempts=1 也允许自动纠偏 1 次
+		mgr := accounts.New(st, &cfg)
+		srv := NewServer(&cfg, mgr)
+		httpSrv := httptest.NewServer(srv.Handler())
+		defer httpSrv.Close()
+		cl := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}
+
+		start := time.Now()
+		b, _ := json.Marshal(map[string]any{
+			"model": "claude-opus-5", "max_tokens": 256, "stream": true,
+			"tools":    clientTools,
+			"messages": []map[string]any{{"role": "user", "content": "查一下 DeepSeek 官网"}},
+		})
+		resp, err := cl.Post(httpSrv.URL+"/v1/messages", "application/json", bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("POST: %v", err)
+		}
+		rawBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || !strings.Contains(string(rawBody), "Bash") {
+			t.Fatalf("expected 200 OK with Bash tool_use after auto-correction, got %d: %s", resp.StatusCode, string(rawBody))
+		}
+		if elapsed := time.Since(start); elapsed >= 300*time.Millisecond {
+			t.Fatalf("expected rapid abort + auto-correct well under 300ms, took %v", elapsed)
+		}
+
+		// 验证账号未被标记错误或禁用
+		acct, _ := st.Get(context.Background(), 1)
+		if acct.Disabled || acct.LastError != "" {
+			t.Fatalf("blocked remote tool should not mark account failure, got disabled=%t lastError=%q", acct.Disabled, acct.LastError)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(recs) != 2 {
+			t.Fatalf("expected 2 upstream turns (blocked + corrected), got %d", len(recs))
+		}
+		if !recs[1].hasCreate || recs[1].threadID == recs[0].threadID || !strings.Contains(recs[1].text, "IMPORTANT CORRECTION") {
+			t.Fatalf("expected fresh thread with IMPORTANT CORRECTION prompt on retry, got %+v", recs[1])
+		}
+	})
+
+	t.Run("abort_fast_after_stream_started_and_reset_session", func(t *testing.T) {
+		var seq atomic.Int32
+		wsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			for {
+				_, raw, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				mType, _, ok := decodeClientFrame(raw)
+				if !ok || mType != "user_message" {
+					continue
+				}
+				n := seq.Add(1)
+				writeEv := func(v any) {
+					_ = conn.WriteMessage(websocket.BinaryMessage, encodeMockAIDPServerEvent(v))
+				}
+				if n == 1 {
+					writeEv(map[string]any{"type": "message_start", "payload": map[string]any{"message_id": "m1"}})
+					writeEv(map[string]any{"type": "text_delta", "payload": map[string]any{"delta": "先建立会话。"}})
+					writeEv(map[string]any{"type": "message_complete", "payload": map[string]any{"continuation_expected": false}})
+					writeEv(map[string]any{"type": "turn_completed", "payload": map[string]any{}})
+				} else {
+					// 第 2 轮先吐出开场白进入 SSE 流式状态，再触发 execute_bash 并试图挂起 2 秒
+					writeEv(map[string]any{"type": "message_start", "payload": map[string]any{"message_id": "m2"}})
+					writeEv(map[string]any{"type": "text_delta", "payload": map[string]any{"delta": "我去下载 Logo。"}})
+					time.Sleep(20 * time.Millisecond)
+					writeEv(map[string]any{"type": "tool_start", "payload": map[string]any{"tool_id": "t_sh", "tool_name": "execute_bash"}})
+					time.Sleep(2 * time.Second)
+					return
+				}
+			}
+		}))
+		defer wsSrv.Close()
+
+		dbPath := filepath.Join(t.TempDir(), "abort_stream.db")
+		st, _ := store.Open(dbPath)
+		defer st.Close()
+		_ = st.Save(context.Background(), &store.Account{
+			Email: "as@example.com", Provider: "social",
+			WSHost: "ws://" + strings.TrimPrefix(wsSrv.URL, "http://"), WSPath: "/ws",
+			AccessToken: "jwt-as", ActorARN: "arn:aws:quick:us-east-1:as", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		})
+		cfg := config.Default()
+		cfg.SessionReuse = true
+		srv := NewServer(&cfg, accounts.New(st, &cfg))
+		httpSrv := httptest.NewServer(srv.Handler())
+		defer httpSrv.Close()
+		cl := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}
+
+		post := func(msgs []map[string]any) (int, string) {
+			b, _ := json.Marshal(map[string]any{
+				"model": "claude-opus-5", "max_tokens": 256, "stream": true,
+				"tools": clientTools, "messages": msgs,
+			})
+			req, _ := http.NewRequest(http.MethodPost, httpSrv.URL+"/v1/messages", bytes.NewReader(b))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Conversation-Id", "stream-abort-cid")
+			resp, err := cl.Do(req)
+			if err != nil {
+				t.Fatalf("POST: %v", err)
+			}
+			defer resp.Body.Close()
+			raw, _ := io.ReadAll(resp.Body)
+			return resp.StatusCode, string(raw)
+		}
+
+		// 建立第 1 轮持久化会话
+		c1, _ := post([]map[string]any{{"role": "user", "content": "准备开始"}})
+		if c1 != http.StatusOK {
+			t.Fatalf("round 1 failed: %d", c1)
+		}
+		// 第 2 轮触发 execute_bash 挂起 -> 应在远小于 500ms 内快速返回并重置会话
+		tStart := time.Now()
+		_, body2 := post([]map[string]any{
+			{"role": "user", "content": "准备开始"},
+			{"role": "assistant", "content": "先建立会话。"},
+			{"role": "user", "content": "下载官方 Logo"},
+		})
+		if elapsed := time.Since(tStart); elapsed > 600*time.Millisecond {
+			t.Fatalf("expected fast stream abort without waiting 2s sleep, took %v", elapsed)
+		}
+		if !strings.Contains(body2, "execute_bash") || !strings.Contains(body2, `"type":"error"`) {
+			t.Fatalf("expected SSE error event naming execute_bash, got: %s", body2)
+		}
+		if rec, _ := st.GetConversation(context.Background(), "h:stream-abort-cid"); rec != nil {
+			t.Fatalf("expected polluted conversation reset after remote tool error, got %+v", rec)
+		}
+	})
+
+	t.Run("allow_legitimate_attachment_read", func(t *testing.T) {
+		tenantSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/integration/quick-work/upload-attachment":
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{"attachmentId": "att-1", "path": "/data/s3files/img-01.png"})
+			case "/integration/quick-work/attachment-dlp-status":
+				_ = json.NewEncoder(w).Encode(map[string]string{"dlpJobStatus": "COMPLETED", "policyAction": "ALLOW"})
+			}
+		}))
+		defer tenantSrv.Close()
+
+		wsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			for {
+				_, raw, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				mType, _, ok := decodeClientFrame(raw)
+				if !ok || mType != "user_message" {
+					continue
+				}
+				writeEv := func(v any) {
+					_ = conn.WriteMessage(websocket.BinaryMessage, encodeMockAIDPServerEvent(v))
+				}
+				writeEv(map[string]any{"type": "tool_start", "payload": map[string]any{"tool_id": "tr1", "tool_name": "read_file", "arguments": map[string]any{"path": "/data/s3files/img-01.png"}}})
+				writeEv(map[string]any{"type": "tool_result", "payload": map[string]any{"tool_id": "tr1"}})
+				writeEv(map[string]any{"type": "message_start", "payload": map[string]any{"message_id": "m_read"}})
+				writeEv(map[string]any{"type": "text_delta", "payload": map[string]any{"delta": "图片已看清"}})
+				writeEv(map[string]any{"type": "message_complete", "payload": map[string]any{"continuation_expected": false}})
+				writeEv(map[string]any{"type": "turn_completed", "payload": map[string]any{}})
+			}
+		}))
+		defer wsSrv.Close()
+
+		dbPath := filepath.Join(t.TempDir(), "allow_read.db")
+		st, _ := store.Open(dbPath)
+		defer st.Close()
+		_ = st.Save(context.Background(), &store.Account{
+			Email: "ar@example.com", Provider: "social", TenantURL: tenantSrv.URL,
+			WSHost: "ws://" + strings.TrimPrefix(wsSrv.URL, "http://"), WSPath: "/ws",
+			AccessToken: "jwt-ar", ActorARN: "arn:aws:quick:us-east-1:ar", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		})
+		cfg := config.Default()
+		srv := NewServer(&cfg, accounts.New(st, &cfg))
+		httpSrv := httptest.NewServer(srv.Handler())
+		defer httpSrv.Close()
+
+		b, _ := json.Marshal(map[string]any{
+			"model": "claude-opus-5", "max_tokens": 128, "stream": false,
+			"tools": clientTools,
+			"messages": []map[string]any{{
+				"role": "user",
+				"content": []map[string]any{
+					{"type": "text", "text": "看这张图"},
+					{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": base64.StdEncoding.EncodeToString(makeFakePNG(9))}},
+				},
+			}},
+		})
+		resp, err := (&http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}).Post(httpSrv.URL+"/v1/messages", "application/json", bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("POST: %v", err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), "图片已看清") {
+			t.Fatalf("expected 200 OK allowing attachment read_file, got %d: %s", resp.StatusCode, string(raw))
+		}
+	})
+
+	t.Run("timeout_kills_stalled_tool_progress_loop", func(t *testing.T) {
+		prev := wsNativeToolTimeout
+		wsNativeToolTimeout = 80 * time.Millisecond
+		defer func() { wsNativeToolTimeout = prev }()
+
+		wsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			for {
+				_, raw, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				mType, _, ok := decodeClientFrame(raw)
+				if !ok || mType != "user_message" {
+					continue
+				}
+				_ = conn.WriteMessage(websocket.BinaryMessage, encodeMockAIDPServerEvent(map[string]any{
+					"type":    "tool_start",
+					"payload": map[string]any{"tool_id": "t_loop", "tool_name": "read_file", "arguments": map[string]any{"path": "/data/s3files/doc-01.pdf"}},
+				}))
+				for k := 0; k < 25; k++ {
+					if err := conn.WriteMessage(websocket.BinaryMessage, encodeMockAIDPServerEvent(map[string]any{
+						"type":    "tool_progress",
+						"payload": map[string]any{"tool_id": "t_loop", "input_delta": " "},
+					})); err != nil {
+						return
+					}
+					time.Sleep(15 * time.Millisecond)
+				}
+			}
+		}))
+		defer wsSrv.Close()
+
+		dbPath := filepath.Join(t.TempDir(), "stall_timeout.db")
+		st, _ := store.Open(dbPath)
+		defer st.Close()
+		_ = st.Save(context.Background(), &store.Account{
+			Email: "st@example.com", Provider: "social",
+			WSHost: "ws://" + strings.TrimPrefix(wsSrv.URL, "http://"), WSPath: "/ws",
+			AccessToken: "jwt-st", ActorARN: "arn:aws:quick:us-east-1:st", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		})
+		cfg := config.Default()
+		cfg.MaxAttempts = 1
+		srv := NewServer(&cfg, accounts.New(st, &cfg))
+		httpSrv := httptest.NewServer(srv.Handler())
+		defer httpSrv.Close()
+
+		b, _ := json.Marshal(map[string]any{
+			"model": "claude-opus-5", "max_tokens": 128, "stream": false,
+			"tools":    clientTools,
+			"messages": []map[string]any{{"role": "user", "content": "读取附件"}},
+		})
+		start := time.Now()
+		resp, err := (&http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}).Post(httpSrv.URL+"/v1/messages", "application/json", bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("POST: %v", err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadGateway || !strings.Contains(string(raw), "remote_tool_timeout") {
+			t.Fatalf("expected 502 remote_tool_timeout after stall, got %d: %s", resp.StatusCode, string(raw))
+		}
+		if elapsed := time.Since(start); elapsed > 600*time.Millisecond {
+			t.Fatalf("expected timeout guard to fire promptly around 160ms (2 attempts x 80ms), took %v", elapsed)
+		}
+	})
+
+	t.Run("no_client_tools_allows_native_web_search", func(t *testing.T) {
+		wsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			conn, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			for {
+				_, raw, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				mType, _, ok := decodeClientFrame(raw)
+				if !ok || mType != "user_message" {
+					continue
+				}
+				writeEv := func(v any) {
+					_ = conn.WriteMessage(websocket.BinaryMessage, encodeMockAIDPServerEvent(v))
+				}
+				writeEv(map[string]any{"type": "tool_start", "payload": map[string]any{"tool_id": "t_free", "tool_name": "web_search"}})
+				writeEv(map[string]any{"type": "tool_result", "payload": map[string]any{"tool_id": "t_free"}})
+				writeEv(map[string]any{"type": "message_start", "payload": map[string]any{"message_id": "m_free"}})
+				writeEv(map[string]any{"type": "text_delta", "payload": map[string]any{"delta": "已联网查到最新信息"}})
+				writeEv(map[string]any{"type": "message_complete", "payload": map[string]any{"continuation_expected": false}})
+				writeEv(map[string]any{"type": "turn_completed", "payload": map[string]any{}})
+			}
+		}))
+		defer wsSrv.Close()
+
+		dbPath := filepath.Join(t.TempDir(), "no_tools.db")
+		st, _ := store.Open(dbPath)
+		defer st.Close()
+		_ = st.Save(context.Background(), &store.Account{
+			Email: "nt@example.com", Provider: "social",
+			WSHost: "ws://" + strings.TrimPrefix(wsSrv.URL, "http://"), WSPath: "/ws",
+			AccessToken: "jwt-nt", ActorARN: "arn:aws:quick:us-east-1:nt", ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		})
+		cfg := config.Default()
+		srv := NewServer(&cfg, accounts.New(st, &cfg))
+		httpSrv := httptest.NewServer(srv.Handler())
+		defer httpSrv.Close()
+
+		b, _ := json.Marshal(map[string]any{
+			"model": "claude-opus-5", "max_tokens": 128, "stream": false,
+			"messages": []map[string]any{{"role": "user", "content": "查查今天天气"}},
+		})
+		resp, err := (&http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: nil}}).Post(httpSrv.URL+"/v1/messages", "application/json", bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("POST: %v", err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), "已联网查到最新信息") {
+			t.Fatalf("expected 200 OK when client sent no tools, got %d: %s", resp.StatusCode, string(raw))
+		}
+	})
+}
