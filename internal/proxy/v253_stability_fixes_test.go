@@ -233,10 +233,10 @@ func TestV253_OversizedMCPToolsWith16ImagesOffloadsToolsAttachment(t *testing.T)
 
 // TestV253_OutpostEarlyThinkingDisconnectAutoRetriesAndSendsWSPing 验证：
 // 1) 虚拟 Outpost 流式请求在早期 thinking_delta 阶段遭遇非预期 WebSocket 断开时，自动清空暂存思考并重连成功；
-// 2) 保活心跳同时发送应用层 ping 与底层 RFC6455 Ping 控制帧。
+// 2) 重连后的长思考跨越多次 pingTicker 保活周期时不会误判连接关闭，且持续发送应用层 ping 与底层 RFC6455 Ping 控制帧。
 func TestV253_OutpostEarlyThinkingDisconnectAutoRetriesAndSendsWSPing(t *testing.T) {
 	oldKeep := outpostKeepaliveInterval
-	outpostKeepaliveInterval = 35 * time.Millisecond
+	outpostKeepaliveInterval = 30 * time.Millisecond
 	defer func() { outpostKeepaliveInterval = oldKeep }()
 
 	var wsAttempt atomic.Int32
@@ -253,20 +253,23 @@ func TestV253_OutpostEarlyThinkingDisconnectAutoRetriesAndSendsWSPing(t *testing
 		}
 		attempt := wsAttempt.Add(1)
 		if attempt == 1 {
-			// 异步等待并断开，使 mock 服务端的 ReadMessage 循环在等待期间继续读取并处理客户端发来的 Ping 控制帧与应用层 ping 帧
 			go func() {
 				_ = writeFrame(map[string]any{"type": "message_start", "payload": map[string]any{"message_id": "m_drop"}})
 				_ = writeFrame(map[string]any{"type": "thinking_delta", "payload": map[string]any{"delta": "stale-thinking-before-drop "}})
-				time.Sleep(95 * time.Millisecond)
+				time.Sleep(15 * time.Millisecond)
 				_ = conn.Close()
 			}()
 			return
 		}
-		_ = writeFrame(map[string]any{"type": "message_start", "payload": map[string]any{"message_id": "m_ok"}})
-		_ = writeFrame(map[string]any{"type": "thinking_delta", "payload": map[string]any{"delta": "clean-thinking "}})
-		_ = writeFrame(map[string]any{"type": "text_delta", "payload": map[string]any{"delta": "Recovered seamlessly."}})
-		_ = writeFrame(map[string]any{"type": "message_complete", "payload": map[string]any{"text": "Recovered seamlessly."}})
-		_ = writeFrame(map[string]any{"type": "turn_completed", "payload": map[string]any{}})
+		// 第 2 次尝试故意持续思考跨越 3 个以上 keepalive 周期（110ms > 3*30ms），验证 pingTicker 分支正常 continue 不会误断连接
+		go func() {
+			_ = writeFrame(map[string]any{"type": "message_start", "payload": map[string]any{"message_id": "m_ok"}})
+			_ = writeFrame(map[string]any{"type": "thinking_delta", "payload": map[string]any{"delta": "clean-thinking "}})
+			time.Sleep(110 * time.Millisecond)
+			_ = writeFrame(map[string]any{"type": "text_delta", "payload": map[string]any{"delta": "Recovered seamlessly."}})
+			_ = writeFrame(map[string]any{"type": "message_complete", "payload": map[string]any{"text": "Recovered seamlessly."}})
+			_ = writeFrame(map[string]any{"type": "turn_completed", "payload": map[string]any{}})
+		}()
 	}
 
 	_, httpSrv := setupOutpostTestServer(t, mock, config.ToolModeAuto)
@@ -300,8 +303,8 @@ func TestV253_OutpostEarlyThinkingDisconnectAutoRetriesAndSendsWSPing(t *testing
 	if !strings.Contains(sse, "Recovered seamlessly.") || !strings.Contains(sse, "clean-thinking") {
 		t.Fatalf("expected clean thinking and final text in SSE output, got:\n%s", sse)
 	}
-	if controlPingCount.Load() == 0 {
-		t.Fatalf("expected RFC6455 WebSocket Ping control frames to be sent during active wait")
+	if controlPingCount.Load() < 2 {
+		t.Fatalf("expected at least 2 RFC6455 WebSocket Ping control frames across multi-keepalive wait, got %d", controlPingCount.Load())
 	}
 }
 

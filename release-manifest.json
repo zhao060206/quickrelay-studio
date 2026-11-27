@@ -1,15 +1,15 @@
 {
-  "version": "2.5.3",
-  "tag": "v2.5.3",
-  "published_at": "2026-11-27T09:04:25Z",
-  "release_notes": "高负载长会话稳定性加固：解除 /compact 压缩与 16 图 + 大 MCP 工具表的 64 KB 单帧死锁（新增第 3 档 Schema 瘦身与 tools-*.txt 附件外置兜底）；为虚拟 Outpost 补齐 15s 双层 WebSocket 心跳、早期思考暂存与闪断无感自动重连；陈年历史旧截图不再阻断虚拟 Outpost 原生工具，并放宽云端已上传附件只读检索配额。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.5.3",
+  "version": "2.5.4",
+  "tag": "v2.5.4",
+  "published_at": "2026-11-27T10:25:17Z",
+  "release_notes": "紧急修复虚拟 Outpost 活跃等待期触发 pingTicker 保活心跳后漏写 continue 导致超过 15s/25s 的长思考任务误判连接关闭 (outpost WebSocket closed unexpectedly) 的缺陷，并完整包含 v2.5.3 对 /compact 与 16 图大工具集 64 KB 超限的加固。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.5.4",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.5.3-win-x64.zip",
-      "size": 8826052,
-      "sha256": "398f11acf540c2aa5eef654ed3fad0d2e77eab9f479390568fce176deaa6bcd6",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.5.3/QuickRelay-Studio-v2.5.3-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.5.4-win-x64.zip",
+      "size": 8826130,
+      "sha256": "0bcfa4c7a093e2f1026452566ac4cac44f010a76266db1cbbf3dd0c20249c253",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.5.4/QuickRelay-Studio-v2.5.4-win-x64.zip"
     }
   }
 }

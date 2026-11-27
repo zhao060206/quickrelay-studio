@@ -1590,6 +1590,7 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 					res, _, _, _ := finalizeTurn(false, false)
 					return res, false, false, err
 				}
+				continue
 			case pkt, ok = <-s.eventsCh:
 			}
 		}
