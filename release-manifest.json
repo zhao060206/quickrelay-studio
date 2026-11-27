@@ -1,15 +1,15 @@
 {
-  "version": "2.5.2",
-  "tag": "v2.5.2",
-  "published_at": "2026-11-26T14:08:08Z",
-  "release_notes": "优化 Claude Code 自动审批与减少手动审批弹窗：无工具 <transcript> 旁路分类请求分流极速模型 fast、未传思考参数时强制设为 low 并执行保首尾及闭合后指令的结构感知裁剪；虚拟 Outpost 工具指引优先选用 Read/Glob/Grep/Edit/Write 专用工具替代 Bash；并行工具聚拢窗口调整至 180ms 并在流式工具生成期间自动滑动续期 600ms。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.5.2",
+  "version": "2.5.3",
+  "tag": "v2.5.3",
+  "published_at": "2026-11-27T09:04:25Z",
+  "release_notes": "高负载长会话稳定性加固：解除 /compact 压缩与 16 图 + 大 MCP 工具表的 64 KB 单帧死锁（新增第 3 档 Schema 瘦身与 tools-*.txt 附件外置兜底）；为虚拟 Outpost 补齐 15s 双层 WebSocket 心跳、早期思考暂存与闪断无感自动重连；陈年历史旧截图不再阻断虚拟 Outpost 原生工具，并放宽云端已上传附件只读检索配额。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.5.3",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.5.2-win-x64.zip",
-      "size": 8813715,
-      "sha256": "e5f450f51dea8c566f366fbda04aa566bfa708286a1db6254bed8835f7a398a3",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.5.2/QuickRelay-Studio-v2.5.2-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.5.3-win-x64.zip",
+      "size": 8826052,
+      "sha256": "398f11acf540c2aa5eef654ed3fad0d2e77eab9f479390568fce176deaa6bcd6",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.5.3/QuickRelay-Studio-v2.5.3-win-x64.zip"
     }
   }
 }

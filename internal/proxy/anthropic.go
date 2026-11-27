@@ -798,7 +798,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		if chunk == "" {
 			return
 		}
-		if _, outputStarted := streamProgress(); !turn.nativeOutpostActive && turn.bridgeActive && !outputStarted {
+		if _, outputStarted := streamProgress(); turn.bridgeActive && !outputStarted {
 			if flushed, shouldFlush := thinkBuf.Add(chunk, thinkingPrestreamMaxBytes, thinkingPrestreamHold); shouldFlush {
 				emitThinkingNow(flushed)
 			}

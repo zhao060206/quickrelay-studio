@@ -176,6 +176,7 @@ type preparedTurn struct {
 	fallbackText          string
 	auxRequest            bool
 	suggestionMode        bool
+	compactRequest        bool
 
 	in                      ChatInput
 	chatAgentID             string
@@ -413,6 +414,7 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		parallelTools = *req.ParallelToolCalls
 	}
 	workMode := s.cfg.GetWorkMode()
+	isCompact := !isSuggestion && !isTranscript && isCompactionRequest(req, prompt)
 	var bridgePrompt string
 	var bridgeActive bool
 	var leadingGuide string
@@ -420,11 +422,13 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 	var toolHash string
 	var guideHash string
 	if !isSuggestion {
-		bridgePrompt = buildToolBridgePromptForMode(req, choiceMode, choiceName, parallelTools, workMode)
-		bridgeActive = bridgePrompt != ""
+		if !isCompact {
+			bridgePrompt = buildToolBridgePromptForMode(req, choiceMode, choiceName, parallelTools, workMode)
+			bridgeActive = bridgePrompt != ""
+			toolHash = toolProtocolFingerprint(req, choiceMode, choiceName, parallelTools)
+		}
 		leadingGuide = leadingGuidelinesForMode(req.Messages, workMode)
 		fullGuide = callerGuidelinesForMode(req.Messages, workMode)
-		toolHash = toolProtocolFingerprint(req, choiceMode, choiceName, parallelTools)
 		guideHash = shortSHA256(leadingGuide)
 	}
 	baseHash := encodeBaseHash(guideHash, toolHash)
@@ -432,7 +436,6 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 
 	rawThinkingEffort := resolveThinkingEffort(req, s.cfg.ThinkingEffort)
 	thinkingEffort := rawThinkingEffort
-	isCompact := !isSuggestion && isCompactionRequest(req, prompt)
 	explicitOff := isExplicitThinkingOff(req)
 	if isSuggestion {
 		if !explicitOff && thinkingEffort != "" && thinkingEffort != "low" {
@@ -569,6 +572,7 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		fallbackText:            prompt,
 		auxRequest:              isAux,
 		suggestionMode:          isSuggestion,
+		compactRequest:          isCompact,
 		requestedThinkingEffort: rawThinkingEffort,
 		startedAt:               time.Now(),
 		maxAttempts:             s.maxAttempts(),
@@ -601,7 +605,9 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 				promptHistory = deltaFormatted.History
 				promptCurrent = deltaFormatted.Current
 				promptCurrentIsTool = deltaFormatted.CurrentIsTool
-				images = deltaImages
+				if !isCompact {
+					images = deltaImages
+				}
 				turnGuidelines = deltaGuide
 				t.resume = true
 			}
@@ -702,7 +708,7 @@ func (t *preparedTurn) loadFull() error {
 	if len(msgs) == 0 && t.req != nil {
 		msgs = t.req.Messages
 	}
-	if t.suggestionMode {
+	if t.suggestionMode || t.compactRequest {
 		p, err := formatPrompt(msgs)
 		if err != nil {
 			return err
@@ -802,7 +808,11 @@ func (t *preparedTurn) shouldUseNativeOutpost(sess *Session) bool {
 	if !t.bridgeActive || t.choiceMode == "none" || t.auxRequest || t.suggestionMode || t.nativeOutpostFallback {
 		return false
 	}
-	if len(t.in.Images) > 0 || sess == nil || isGatewayProvider(sess.Provider) || strings.TrimSpace(sess.TenantURL) == "" {
+	hasBlockingMedia := len(t.in.Images) > 0
+	if t.req != nil && len(t.req.Messages) > 0 {
+		hasBlockingMedia = recentMessagesHaveBinaryMedia(t.req.Messages, outpostRecentMediaWindow)
+	}
+	if hasBlockingMedia || sess == nil || isGatewayProvider(sess.Provider) || strings.TrimSpace(sess.TenantURL) == "" {
 		return false
 	}
 	return true
@@ -1561,7 +1571,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		switch ev.Type {
 		case "thinking":
 			if ev.Text != "" {
-				if _, outputStarted := streamProgress(); !turn.nativeOutpostActive && turn.bridgeActive && !outputStarted {
+				if _, outputStarted := streamProgress(); turn.bridgeActive && !outputStarted {
 					if flushed, shouldFlush := thinkBuf.Add(ev.Text, thinkingPrestreamMaxBytes, thinkingPrestreamHold); shouldFlush {
 						writeChunk(map[string]any{"reasoning_content": flushed}, nil)
 					}

@@ -99,8 +99,9 @@ func forwardToolDefinitions(req *ChatRequest) string {
 }
 
 const (
-	toolDefsCompactThresholdBytes    = 16 * 1024
-	toolDefsAggressiveThresholdBytes = 26 * 1024
+	toolDefsCompactThresholdBytes      = 16 * 1024
+	toolDefsAggressiveThresholdBytes   = 26 * 1024
+	toolDefsUltraCompactThresholdBytes = 36 * 1024
 )
 
 var (
@@ -187,6 +188,9 @@ func compactToolSchema(v any, maxParamDescRunes int) any {
 			if k == "$schema" || k == "title" {
 				continue
 			}
+			if maxParamDescRunes <= 0 && (k == "description" || k == "default" || k == "examples" || k == "example") {
+				continue
+			}
 			if k == "additionalProperties" {
 				if b, ok := val.(bool); ok && !b {
 					continue
@@ -255,6 +259,11 @@ func forwardToolDefinitionsForMode(req *ChatRequest, workMode string) string {
 			body = compacted
 		}
 	}
+	if len(body) > toolDefsUltraCompactThresholdBytes {
+		if compacted, cErr := marshalDefs(compactToolDefinitions(defs, 36, 0)); cErr == nil && len(compacted) < len(body) {
+			body = compacted
+		}
+	}
 	prefix := "Workspace actions available via the user's local client:\n"
 	if config.NormalizeWorkMode(workMode) == config.WorkModeDocument {
 		prefix = "Document and workspace actions supported by the user's desktop app:\n"
@@ -312,6 +321,68 @@ func buildToolBridgePromptForMode(req *ChatRequest, mode, name string, parallel 
 	}
 	if mode == "required" {
 		b.WriteString("- You must request at least one action before answering.\n")
+	}
+	b.WriteString("</client_tool_protocol>")
+	return b.String()
+}
+
+// extractToolNamesFromProtocol 从完整 <client_tool_protocol> 文本中提取已声明的工具名列表，供工具表外置附件时生成内联摘要。
+func extractToolNamesFromProtocol(rawProtocol string) []string {
+	start := strings.Index(rawProtocol, `{"tools":`)
+	if start < 0 {
+		start = strings.Index(rawProtocol, `{"tool_choice":`)
+	}
+	if start < 0 {
+		return nil
+	}
+	end := strings.Index(rawProtocol[start:], "\n\nFormat:")
+	jsonSlice := rawProtocol[start:]
+	if end > 0 {
+		jsonSlice = rawProtocol[start : start+end]
+	}
+	var parsed struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(jsonSlice)), &parsed); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(parsed.Tools))
+	for _, t := range parsed.Tools {
+		if n := strings.TrimSpace(t.Name); n != "" {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// buildExternalizedToolProtocolNote 在多附件元数据 + 大型 MCP 工具表超出 64 KB 单帧上限时，
+// 将完整工具 Schema 外置为附件，并在主帧保留紧凑调用协议与工具名索引。
+func buildExternalizedToolProtocolNote(attName, rawProtocol string) string {
+	names := extractToolNamesFromProtocol(rawProtocol)
+	var b strings.Builder
+	b.WriteString("<client_tool_protocol>\n")
+	fmt.Fprintf(&b, "Complete client tool definitions and JSON parameter schemas are attached in %q.\n", attName)
+	if summary := formatToolNamesSummary(names, 900); summary != "" {
+		b.WriteString("- Registered local tools: ")
+		b.WriteString(summary)
+		b.WriteByte('\n')
+	}
+	b.WriteString("- Format: emit one marker per local action with no Markdown code fences and no trailing text:\n")
+	b.WriteString(`<client_tool_call>{"name":"TOOL_NAME","arguments":{...}}</client_tool_call>`)
+	b.WriteString("\n- STRICT RULE: Never call remote cloud sandbox, web search, download, shell, or file-write tools; inspect the attached schema file if unsure about exact parameter keys, then emit <client_tool_call> and wait for the client result.\n")
+	if strings.Contains(rawProtocol, "- Request at most one action per turn.") {
+		b.WriteString("- Request at most one action per turn.\n")
+	}
+	if strings.Contains(rawProtocol, "- You must request at least one action before answering.") {
+		b.WriteString("- You must request at least one action before answering.\n")
+	}
+	for _, line := range strings.Split(rawProtocol, "\n") {
+		if strings.HasPrefix(line, "- You must call ") {
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
 	}
 	b.WriteString("</client_tool_protocol>")
 	return b.String()

@@ -485,7 +485,7 @@ var (
 
 func argsLookLikeUploadedAttachment(args string) bool {
 	lower := strings.ToLower(args)
-	for _, marker := range []string{"/data/s3files/", "prompt-", "guidelines-", "img-", "doc-"} {
+	for _, marker := range []string{"/data/s3files/", "prompt-", "guidelines-", "tools-", "img-", "doc-"} {
 		if strings.Contains(lower, marker) {
 			return true
 		}
@@ -572,7 +572,7 @@ func classifyRemoteSandboxTool(name, args string, argsFinal, hasUploadedAttachme
 			if argsTargetUserLocalPath(args) {
 				return true, "remote_tool_targeting_local_path", false
 			}
-			if scriptReadCount >= 2 {
+			if scriptReadCount >= 6 {
 				return true, "remote_read_limit_exceeded", false
 			}
 			if argsFinal && hasSubstantiveToolArgs(args) && !argsLookLikeReadonlyAttachmentScript(args) {
@@ -595,12 +595,12 @@ func classifyRemoteSandboxTool(name, args string, argsFinal, hasUploadedAttachme
 			return true, "remote_tool_targeting_local_path", false
 		}
 		if hasUploadedAttachments {
-			if allowedReadCount >= 6 {
+			if allowedReadCount >= 20 {
 				return true, "remote_read_limit_exceeded", false
 			}
 			return false, "", false
 		}
-		if allowedReadCount >= 2 {
+		if allowedReadCount >= 8 {
 			return true, "remote_read_limit_exceeded", false
 		}
 		return false, "", false

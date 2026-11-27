@@ -22,8 +22,9 @@ var (
 	ErrInvalidAttachment        = errors.New("invalid attachment")
 	ErrRemoteSandboxToolBlocked = errors.New("remote cloud sandbox tool blocked")
 	ErrThreadAgentMismatch      = errors.New("explicit X-Thread-Id conflicts with current chat_agent_id or has unknown agent ownership; start a new conversation with a fresh X-Thread-Id")
-	ErrExplicitThreadConflict   = errors.New("explicit X-Thread-Id cannot be safely resumed on the current native outpost session; start a new conversation with a fresh X-Thread-Id")
+	ErrExplicitThreadConflict    = errors.New("explicit X-Thread-Id cannot be safely resumed on the current native outpost session; start a new conversation with a fresh X-Thread-Id")
 	ErrOutpostToolPolicyMismatch = errors.New("upstream tool call did not match requested tool_choice policy")
+	ErrOutpostPrematureClose     = errors.New("outpost WebSocket closed prematurely")
 )
 
 // RemoteToolBlockedError 表示模型在启用客户端工具桥接时越权调用了远端云端沙箱/搜索/执行工具并被实时阻断。
@@ -83,7 +84,7 @@ func retryActionFor(err error) retryAction {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return retryTemporary
 	}
-	if errors.Is(err, ErrEmptyResponse) {
+	if errors.Is(err, ErrEmptyResponse) || errors.Is(err, ErrOutpostPrematureClose) {
 		return retryTemporary
 	}
 	var upstreamErr *UpstreamError

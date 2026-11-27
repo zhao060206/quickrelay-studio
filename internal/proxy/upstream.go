@@ -1379,12 +1379,16 @@ func prepareFrameWithinBudgetDetailed(
 	workMode string,
 	attachFn func(name string, data []byte) (attachmentRef, error),
 ) error {
-	buildProbePayload := func(atts []map[string]any, g, p string) map[string]any {
+	curToolProtocol := toolProtocol
+	var cachedToolsAtt map[string]any
+	var cachedToolsNote string
+
+	buildProbePayloadWithTP := func(atts []map[string]any, g, tp, p string) map[string]any {
 		probe := make(map[string]any, len(payload)+1)
 		for k, v := range payload {
 			probe[k] = v
 		}
-		probe["text"] = renderTurnTextForMode(workMode, g, toolProtocol, legacySystem, p)
+		probe["text"] = renderTurnTextForMode(workMode, g, tp, legacySystem, p)
 		if len(atts) > 0 {
 			probe["attachments"] = atts
 		} else {
@@ -1392,12 +1396,15 @@ func prepareFrameWithinBudgetDetailed(
 		}
 		return probe
 	}
-	fitsWith := func(atts []map[string]any, g, p string) bool {
-		n, err := userMessageBytes(buildProbePayload(atts, g, p))
+	fitsWithTP := func(atts []map[string]any, g, tp, p string) bool {
+		n, err := userMessageBytes(buildProbePayloadWithTP(atts, g, tp, p))
 		return err == nil && n <= maxUserMessageBytes
 	}
+	fitsWith := func(atts []map[string]any, g, p string) bool {
+		return fitsWithTP(atts, g, curToolProtocol, p)
+	}
 	applyMain := func(atts []map[string]any, g, p string) {
-		payload["text"] = renderTurnTextForMode(workMode, g, toolProtocol, legacySystem, p)
+		payload["text"] = renderTurnTextForMode(workMode, g, curToolProtocol, legacySystem, p)
 		if len(atts) > 0 {
 			payload["attachments"] = atts
 		} else {
@@ -1453,13 +1460,50 @@ func prepareFrameWithinBudgetDetailed(
 	}
 	isDocMode := config.NormalizeWorkMode(workMode) == config.WorkModeDocument
 
-	// shrinkGuidelinesOnDemand 在当前正文已确定的前提下，按模式对超限工作区规范做内联精简或真实外置上传。
+	tryOffloadToolProtocol := func(atts []map[string]any, curG, bodyText string, dryRun bool) (string, []map[string]any, bool, error) {
+		if len(toolProtocol) <= 2048 {
+			return curG, atts, false, nil
+		}
+		if dryRun {
+			tName := attachmentToolsName(messageID)
+			probeTP := buildExternalizedToolProtocolNote(tName, toolProtocol)
+			probeAtts := append(cloneAttachmentSlice(atts), placeholderPromptAttachment(tName))
+			return curG, probeAtts, fitsWithTP(probeAtts, curG, probeTP, bodyText), nil
+		}
+		if cachedToolsAtt == nil {
+			tAtt, tErr := attachFn(attachmentToolsName(messageID), []byte(toolProtocol))
+			if tErr != nil {
+				return curG, atts, false, tErr
+			}
+			if tAtt.Path == "" {
+				return curG, atts, false, attachErr("attachment upload returned empty path for %s", tAtt.Name)
+			}
+			cachedToolsAtt = fileAttachmentMeta(tAtt, attachmentMimeType)
+			cachedToolsNote = buildExternalizedToolProtocolNote(tAtt.Name, toolProtocol)
+			curToolProtocol = cachedToolsNote
+		}
+		nextAtts := cloneAttachmentSlice(atts)
+		hasCached := false
+		for _, item := range nextAtts {
+			if item["id"] == cachedToolsAtt["id"] && cachedToolsAtt["id"] != nil {
+				hasCached = true
+				break
+			}
+		}
+		if !hasCached {
+			nextAtts = append(nextAtts, cachedToolsAtt)
+		}
+		return curG, nextAtts, fitsWith(nextAtts, curG, bodyText), nil
+	}
+
+	// shrinkGuidelinesOnDemand 在当前正文已确定的前提下，按模式对超限工作区规范做内联精简或真实外置上传；
+	// 若因多附件元数据叠加庞大 MCP 工具表仍超过 63 KB，则继续将完整工具 Schema 外置为 tools-*.txt 兜底。
 	shrinkGuidelinesOnDemand := func(atts []map[string]any, curG, bodyText string, dryRun bool) (string, []map[string]any, bool, error) {
 		if fitsWith(atts, curG, bodyText) {
 			return curG, atts, true, nil
 		}
 		if rawGuidelines == "" {
-			return curG, atts, false, nil
+			return tryOffloadToolProtocol(atts, curG, bodyText, dryRun)
 		}
 		if isDocMode {
 			g1 := compactGuidelinesInline(envSummary)
@@ -1467,7 +1511,10 @@ func prepareFrameWithinBudgetDetailed(
 				return g1, atts, true, nil
 			}
 			g2 := compactGuidelinesInline("")
-			return g2, atts, fitsWith(atts, g2, bodyText), nil
+			if fitsWith(atts, g2, bodyText) {
+				return g2, atts, true, nil
+			}
+			return tryOffloadToolProtocol(atts, g2, bodyText, dryRun)
 		}
 		var nextG string
 		nextAtts := cloneAttachmentSlice(atts)
@@ -1484,7 +1531,7 @@ func prepareFrameWithinBudgetDetailed(
 					return nextG, nextAtts, true, nil
 				}
 			}
-			return nextG, nextAtts, false, nil
+			return tryOffloadToolProtocol(nextAtts, nextG, bodyText, true)
 		}
 		att, gErr := attachFn(attachmentGuidelinesName(messageID), []byte(rawGuidelines))
 		if gErr != nil {
@@ -1504,7 +1551,7 @@ func prepareFrameWithinBudgetDetailed(
 				return nextG, nextAtts, true, nil
 			}
 		}
-		return nextG, nextAtts, false, nil
+		return tryOffloadToolProtocol(nextAtts, nextG, bodyText, false)
 	}
 
 	failedNote := ""
@@ -1533,8 +1580,8 @@ func prepareFrameWithinBudgetDetailed(
 	hasSplitHistory := strings.TrimSpace(historyPrompt) != "" && strings.TrimSpace(currentTurn) != ""
 	if !hasSplitHistory {
 		// 无先前历史（单轮超长对话 / 兼容老 12 参调用）：
-		// 优先尝试仅通过压缩/外置工作区规范把完整正文逐字保在主帧内；确系正文自己超限时才上传 prompt 附件。
-		if rawGuidelines != "" {
+		// 优先尝试仅通过压缩/外置工作区规范或超大工具表把完整正文逐字保在主帧内；确系正文自己超限时才上传 prompt 附件。
+		if rawGuidelines != "" || len(toolProtocol) > 2048 {
 			if _, _, dryOK, _ := shrinkGuidelinesOnDemand(curAtts, curGuidelines, prompt, true); dryOK {
 				nextG, nextAtts, ok, gErr := shrinkGuidelinesOnDemand(curAtts, curGuidelines, prompt, false)
 				if gErr != nil {

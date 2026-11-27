@@ -537,6 +537,49 @@ func messageHasBinaryMedia(m Message) bool {
 	return false
 }
 
+const (
+	outpostRecentMediaWindow  = 6
+	outpostOmittedMediaMarker = "[earlier media attachment omitted in restored session]"
+)
+
+// recentMessagesHaveBinaryMedia 判断当前用户/工具回合或最近 recentWindow 条非系统消息内是否包含二进制媒体附件。
+// 近期刚发送的图片保留走 text_bridge 真实上传看图；仅更早历史含陈年旧截图时放行进入虚拟 Outpost 原生工具通道。
+func recentMessagesHaveBinaryMedia(msgs []Message, recentWindow int) bool {
+	nonLead := nonLeadingMessages(msgs)
+	if len(nonLead) == 0 {
+		return false
+	}
+	tailStart := len(nonLead)
+	for tailStart > 0 {
+		role := strings.ToLower(strings.TrimSpace(nonLead[tailStart-1].Role))
+		if role != "user" && role != "tool" && role != "developer" && role != "system" {
+			break
+		}
+		tailStart--
+	}
+	checkFrom := len(nonLead) - recentWindow
+	if checkFrom < 0 {
+		checkFrom = 0
+	}
+	if tailStart < checkFrom {
+		checkFrom = tailStart
+	}
+	for _, m := range nonLead[checkFrom:] {
+		if messageHasBinaryMedia(m) {
+			return true
+		}
+	}
+	return false
+}
+
+func historicalMessageTextWithOmittedMedia(m Message) string {
+	txt := strings.TrimSpace(contentText(m.Content))
+	if txt == "" {
+		return outpostOmittedMediaMarker
+	}
+	return txt + "\n" + outpostOmittedMediaMarker
+}
+
 func outpostEventID(prefix, threadID, key string) string {
 	return prefix + "-" + sha256LowerHex(threadID+"\x00"+key)[:32]
 }
@@ -604,9 +647,16 @@ func buildOutpostHistoryEvents(msgs []Message, threadID, devName string) ([]map[
 		return nil
 	}
 
+	recentCutoff := len(trimmed) - outpostRecentMediaWindow
+	if recentCutoff < 0 {
+		recentCutoff = 0
+	}
 	for idx, m := range trimmed {
 		if messageHasBinaryMedia(m) {
-			return nil, fmt.Errorf("%w: message %d contains media attachment", errOutpostHistoryNotImportable, idx)
+			if idx >= recentCutoff {
+				return nil, fmt.Errorf("%w: message %d contains media attachment", errOutpostHistoryNotImportable, idx)
+			}
+			m.Content = historicalMessageTextWithOmittedMedia(m)
 		}
 		role := strings.ToLower(strings.TrimSpace(m.Role))
 		msgID := outpostEventID("msg", threadID, fmt.Sprintf("%d:%s", idx, role))

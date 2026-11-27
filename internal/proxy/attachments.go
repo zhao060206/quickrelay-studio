@@ -91,6 +91,11 @@ func attachmentGuidelinesName(messageID string) string {
 	return attachmentFileName(attachmentGuidelinesPrefix, messageID, attachmentPromptSuffix)
 }
 
+// attachmentToolsName 生成超大客户端工具 Schema 外置上传时的带外附件文件名。
+func attachmentToolsName(messageID string) string {
+	return attachmentFileName("tools-", messageID, attachmentPromptSuffix)
+}
+
 // attachmentGuidelinesNote 在超限工作区规范转为附件后生成主帧短引用，明确允许模型直接调用本地工具而不必先读冗长附件。
 func attachmentGuidelinesNote(name string) string {
 	return attachmentGuidelinesNoteWithEnv(name, "")

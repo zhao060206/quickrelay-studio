@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -29,7 +30,19 @@ const (
 var (
 	outpostParallelToolWindow       = 180 * time.Millisecond
 	outpostParallelActiveStepWindow = 600 * time.Millisecond
+	outpostKeepaliveInterval        = 15 * time.Second
 )
+
+func effectiveOutpostKeepalive() time.Duration {
+	d := outpostKeepaliveInterval
+	if d <= 0 {
+		d = 15 * time.Second
+	}
+	if wsKeepaliveInterval > 0 && wsKeepaliveInterval < d {
+		d = wsKeepaliveInterval
+	}
+	return d
+}
 
 type outpostInboundPacket struct {
 	Events []string
@@ -73,6 +86,49 @@ type outpostSession struct {
 	idleDone     chan struct{}
 
 	closeOnce sync.Once
+
+	readErrMu   sync.Mutex
+	lastReadErr error
+}
+
+func (s *outpostSession) setReadErr(err error) {
+	if s == nil || err == nil {
+		return
+	}
+	s.readErrMu.Lock()
+	if s.lastReadErr == nil {
+		s.lastReadErr = err
+	}
+	s.readErrMu.Unlock()
+}
+
+func (s *outpostSession) getReadErr() error {
+	if s == nil {
+		return nil
+	}
+	s.readErrMu.Lock()
+	defer s.readErrMu.Unlock()
+	return s.lastReadErr
+}
+
+func (s *outpostSession) sendKeepalive() error {
+	if err := s.sendFrame(map[string]any{"type": "ping", "payload": map[string]any{}}); err != nil {
+		return err
+	}
+	s.writeMu.Lock()
+	if s.conn != nil {
+		_ = s.conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second))
+	}
+	s.writeMu.Unlock()
+	return nil
+}
+
+func (s *outpostSession) sendPong() {
+	s.writeMu.Lock()
+	if s.conn != nil {
+		_ = s.conn.WriteControl(websocket.PongMessage, []byte("pong"), time.Now().Add(3*time.Second))
+	}
+	s.writeMu.Unlock()
 }
 
 func (s *outpostSession) sendFrame(v any) error {
@@ -90,7 +146,7 @@ func (s *outpostSession) sendFrame(v any) error {
 }
 
 func (s *outpostSession) startReader() {
-	s.eventsCh = make(chan outpostInboundPacket, 64)
+	s.eventsCh = make(chan outpostInboundPacket, 256)
 	s.readDone = make(chan struct{})
 	go func() {
 		defer close(s.readDone)
@@ -98,6 +154,7 @@ func (s *outpostSession) startReader() {
 		for {
 			msgType, data, err := s.conn.ReadMessage()
 			if err != nil {
+				s.setReadErr(err)
 				select {
 				case s.eventsCh <- outpostInboundPacket{Err: err}:
 				default:
@@ -111,6 +168,7 @@ func (s *outpostSession) startReader() {
 				var decErr error
 				frames, decErr = aidpDecode(data)
 				if decErr != nil && len(frames) == 0 {
+					s.setReadErr(decErr)
 					select {
 					case s.eventsCh <- outpostInboundPacket{Err: decErr}:
 					default:
@@ -213,10 +271,7 @@ func (s *outpostSession) startIdleMonitor(idleTTL time.Duration) {
 
 	go func() {
 		defer close(s.idleDone)
-		keepaliveInterval := wsKeepaliveInterval
-		if keepaliveInterval <= 0 {
-			keepaliveInterval = 25 * time.Second
-		}
+		keepaliveInterval := effectiveOutpostKeepalive()
 		pingTicker := time.NewTicker(keepaliveInterval)
 		defer pingTicker.Stop()
 		idleTimer := time.NewTimer(idleTTL)
@@ -230,7 +285,7 @@ func (s *outpostSession) startIdleMonitor(idleTTL time.Duration) {
 				s.pool.evictSessionIfMatches(s.convKey, s.id, false)
 				return
 			case <-pingTicker.C:
-				if err := s.sendFrame(map[string]any{"type": "ping", "payload": map[string]any{}}); err != nil {
+				if err := s.sendKeepalive(); err != nil {
 					s.pool.evictSessionIfMatches(s.convKey, s.id, false)
 					return
 				}
@@ -734,17 +789,21 @@ func (s *outpostSession) ensureToolsRegistered(ctx context.Context, reg *outpost
 }
 
 // buildOutpostUserMessagePayload 构造原生 Outpost 上行 user_message 帧的完整载荷（含 custom_prompt、工具文档与路由指令）。
+// 若含冗余技能列表导致轻微超过 63 KiB 帧上限，优先无损压缩 <available_skills>，绝不截断用户正文或工具文档。
 func buildOutpostUserMessagePayload(turn *preparedTurn, sess *Session, reg *outpostToolRegistry, outpostID, devName, threadID, systemPrompt, turnText string) map[string]any {
-	var cp strings.Builder
-	if strings.TrimSpace(systemPrompt) != "" {
-		cp.WriteString(strings.TrimSpace(systemPrompt))
-	}
-	cp.WriteString("\n\n# API Client Presentation\nThis conversation runs through an API gateway, not the desktop UI. Use standard Markdown/plain text and NEVER output <decision>, <option>, or <decisions> UI tags.\n")
-	if reg != nil && reg.PromptDocs != "" {
-		cp.WriteString(reg.PromptDocs)
-	}
-	if reg != nil {
-		cp.WriteString(reg.routingInstructions(outpostID, devName, turn.choiceMode, turn.choiceName, turn.parallelTools))
+	buildCP := func(sys string) string {
+		var cp strings.Builder
+		if strings.TrimSpace(sys) != "" {
+			cp.WriteString(strings.TrimSpace(sys))
+		}
+		cp.WriteString("\n\n# API Client Presentation\nThis conversation runs through an API gateway, not the desktop UI. Use standard Markdown/plain text and NEVER output <decision>, <option>, or <decisions> UI tags.\n")
+		if reg != nil && reg.PromptDocs != "" {
+			cp.WriteString(reg.PromptDocs)
+		}
+		if reg != nil {
+			cp.WriteString(reg.routingInstructions(outpostID, devName, turn.choiceMode, turn.choiceName, turn.parallelTools))
+		}
+		return cp.String()
 	}
 
 	payload := map[string]any{
@@ -754,7 +813,7 @@ func buildOutpostUserMessagePayload(turn *preparedTurn, sess *Session, reg *outp
 		"thread_id":          threadID,
 		"message_id":         uuid(),
 		"text":               turnText,
-		"custom_prompt":      cp.String(),
+		"custom_prompt":      buildCP(systemPrompt),
 		"agent_mode":         turn.in.Model,
 		"auto_routing":       false,
 		"web_search_enabled": false,
@@ -770,6 +829,19 @@ func buildOutpostUserMessagePayload(turn *preparedTurn, sess *Session, reg *outp
 	}
 	if loc := strings.TrimSpace(turn.server.cfg.Locale); loc != "" {
 		payload["user_locale"] = loc
+	}
+	if n, err := userMessageBytes(payload); err == nil && n > maxUserMessageBytes && strings.TrimSpace(systemPrompt) != "" {
+		curSys := systemPrompt
+		if compacted := compactSkillsSection(curSys); len(compacted) < len(curSys) {
+			curSys = compacted
+			payload["custom_prompt"] = buildCP(curSys)
+			if n2, err2 := userMessageBytes(payload); err2 == nil && n2 <= maxUserMessageBytes {
+				return payload
+			}
+		}
+		if indexed := compactSkillsIndexOnly(systemPrompt); len(indexed) < len(curSys) {
+			payload["custom_prompt"] = buildCP(indexed)
+		}
 	}
 	return payload
 }
@@ -1051,10 +1123,7 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 	if isMaxThinking && wsReadIdleTimeoutMaxThinking > idleReadLimit {
 		idleReadLimit = wsReadIdleTimeoutMaxThinking
 	}
-	keepaliveInterval := wsKeepaliveInterval
-	if keepaliveInterval <= 0 {
-		keepaliveInterval = 25 * time.Second
-	}
+	keepaliveInterval := effectiveOutpostKeepalive()
 
 	pingTicker := time.NewTicker(keepaliveInterval)
 	defer pingTicker.Stop()
@@ -1468,6 +1537,8 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 			return false, &UpstreamError{Code: "turn_aborted", Err: errors.New("upstream turn was aborted")}
 		case "error", "exception", "session_error", "stream_error", "turn_failed":
 			return false, parseOutpostErrorEvent(ev)
+		case "ping":
+			s.sendPong()
 		default:
 			if strings.HasSuffix(typ, "Exception") {
 				return false, parseOutpostErrorEvent(ev)
@@ -1515,7 +1586,7 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 				res, _, _, _ := finalizeTurn(false, false)
 				return res, false, false, fmt.Errorf("outpost WebSocket read idle timeout (%s)", idleReadLimit)
 			case <-pingTicker.C:
-				if err := s.sendFrame(map[string]any{"type": "ping", "payload": map[string]any{}}); err != nil {
+				if err := s.sendKeepalive(); err != nil {
 					res, _, _, _ := finalizeTurn(false, false)
 					return res, false, false, err
 				}
@@ -1531,10 +1602,14 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 				return finalizeTurn(false, true)
 			}
 			res, _, _, _ := finalizeTurn(false, false)
-			if sawContinuation {
-				return res, false, false, errors.New("outpost WebSocket closed before continuation completed")
+			cause := s.getReadErr()
+			if cause == nil {
+				cause = io.ErrUnexpectedEOF
 			}
-			return res, false, false, errors.New("outpost WebSocket closed unexpectedly")
+			if sawContinuation {
+				return res, false, false, fmt.Errorf("outpost WebSocket closed before continuation completed (%w): %w", ErrOutpostPrematureClose, cause)
+			}
+			return res, false, false, fmt.Errorf("outpost WebSocket closed unexpectedly (%w): %w", ErrOutpostPrematureClose, cause)
 		}
 		if pkt.Err != nil {
 			readFailed = true
@@ -1545,14 +1620,14 @@ func (s *outpostSession) readTurnEvents(ctx context.Context, turn *preparedTurn,
 				if !turnFinished {
 					res, _, _, _ := finalizeTurn(false, false)
 					if sawContinuation {
-						return res, false, false, errors.New("outpost WebSocket closed before continuation completed")
+						return res, false, false, fmt.Errorf("outpost WebSocket closed before continuation completed (%w): %w", ErrOutpostPrematureClose, pkt.Err)
 					}
-					return res, false, false, errors.New("outpost WebSocket closed before turn completed")
+					return res, false, false, fmt.Errorf("outpost WebSocket closed before turn completed (%w): %w", ErrOutpostPrematureClose, pkt.Err)
 				}
 				return finalizeTurn(false, true)
 			}
 			res, _, _, _ := finalizeTurn(false, false)
-			return res, false, false, fmt.Errorf("outpost WebSocket read: %w", pkt.Err)
+			return res, false, false, fmt.Errorf("outpost WebSocket read (%w): %w", ErrOutpostPrematureClose, pkt.Err)
 		}
 		resetIdle()
 		for _, frameStr := range pkt.Events {
