@@ -164,6 +164,9 @@ type preparedTurn struct {
 	nativeOutpostActive   bool
 	nativeOutpostFallback bool
 	baseHash              string
+	guideHash             string
+	toolHash              string
+	resumeBaseHash        string
 	fullGuide             string
 	fullBridgePrompt      string
 	fullPrompt            string
@@ -561,6 +564,8 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 		parallelTools:           parallelTools,
 		bridgeActive:            bridgeActive,
 		baseHash:                baseHash,
+		guideHash:               guideHash,
+		toolHash:                toolHash,
 		chatAgentID:             effectiveAgentID,
 		explicitThreadID:        explicitThreadID,
 		explicitThreadKnown:     explicitThreadKnown,
@@ -585,6 +590,9 @@ func (s *Server) prepareTurn(r *http.Request, req *ChatRequest, protocol, endpoi
 	resumeSource := conv
 	if !isAux && explicitThreadID != "" {
 		resumeSource = explicitTargetConv
+	}
+	if resumeSource != nil {
+		t.resumeBaseHash = resumeSource.baseHash
 	}
 	promptText := ""
 	promptHistory := ""
@@ -780,7 +788,12 @@ func (t *preparedTurn) saveConversation(res ChatResult, outText string, outTools
 	}
 	if !t.auxRequest && t.server.cfg.SessionReuse && res.ThreadID != "" && t.usedAccount != nil {
 		asstHash := assistantOutputFingerprint(outText, outTools)
-		t.server.sessions.saveWithAgent(t.conv, t.convEpoch, t.convVersion, res.ThreadID, t.usedAccount.ID, t.baseHash, t.chatAgentID, t.req.Messages, asstHash)
+		gHash, tHash := t.guideHash, t.toolHash
+		if gHash == "" && tHash == "" && t.baseHash != "" {
+			gHash, tHash = splitBaseHash(t.baseHash)
+		}
+		savedHash := encodeBaseHashForTransport(gHash, tHash, t.nativeOutpostActive)
+		t.server.sessions.saveWithAgent(t.conv, t.convEpoch, t.convVersion, res.ThreadID, t.usedAccount.ID, savedHash, t.chatAgentID, t.req.Messages, asstHash)
 	}
 }
 
@@ -808,6 +821,10 @@ func (t *preparedTurn) shouldUseNativeOutpost(sess *Session) bool {
 	if !t.bridgeActive || t.choiceMode == "none" || t.auxRequest || t.suggestionMode || t.nativeOutpostFallback {
 		return false
 	}
+	if mode == config.ToolModeAuto && t.explicitThreadID != "" && isTextBridgeBaseHash(t.resumeBaseHash) &&
+		!t.server.outposts.HasSessionOrThread(t.convKey(), t.explicitThreadID) {
+		return false
+	}
 	hasBlockingMedia := len(t.in.Images) > 0
 	if t.req != nil && len(t.req.Messages) > 0 {
 		hasBlockingMedia = recentMessagesHaveBinaryMedia(t.req.Messages, outpostRecentMediaWindow)
@@ -816,6 +833,40 @@ func (t *preparedTurn) shouldUseNativeOutpost(sess *Session) bool {
 		return false
 	}
 	return true
+}
+
+// detachFromNativeOutpostForTextBridge 在会话从虚拟 Outpost 切往 text_bridge（如工具读取了本地图片或单帧超 63 KiB 自动回退）时，
+// 关闭并反注册原挂起 Outpost 连接，强制切换为全新 thread_id 并附带完整历史、完整工具协议与图片附件，
+// 彻底杜绝向等待原生 tool_result 的挂起 Outpost 线程投递普通 user_message 造成云端排队死锁。
+func (t *preparedTurn) detachFromNativeOutpostForTextBridge() error {
+	if t == nil || t.server == nil {
+		return nil
+	}
+	prevThreadID := strings.TrimSpace(t.in.ThreadID)
+	hasOutpostConn := t.server.outposts != nil && t.server.outposts.HasSessionOrThread(t.convKey(), prevThreadID)
+	prevWasOutpost := hasOutpostConn ||
+		(t.resume && isOutpostBaseHash(t.resumeBaseHash)) ||
+		(t.resume && t.conv != nil && isOutpostBaseHash(t.conv.baseHash)) ||
+		(t.explicitThreadID != "" && isOutpostBaseHash(t.resumeBaseHash))
+	if !prevWasOutpost {
+		return nil
+	}
+	if t.explicitThreadID != "" {
+		return fmt.Errorf("%w: explicit X-Thread-Id %q is bound to a native outpost session and cannot dispatch via text_bridge", ErrExplicitThreadConflict, t.explicitThreadID)
+	}
+	if t.server.outposts != nil {
+		t.server.outposts.InvalidateKey(t.convKey())
+		if prevThreadID != "" {
+			t.server.outposts.InvalidateThread(prevThreadID)
+		}
+	}
+	if t.resume || (!t.in.CreateSession && prevThreadID != "") {
+		log.Printf("chat %s detaching native_outpost thread=%q for text_bridge; switching to fresh thread with full transcript", t.id, prevThreadID)
+		if err := t.switchToFullTranscript(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (t *preparedTurn) responseOutput(result ChatResult) (string, []ToolCall) {
@@ -1007,6 +1058,9 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamProgress func() (started
 					log.Printf("chat %s outpost unsupported (%v); falling back to text_bridge", t.id, err)
 					t.nativeOutpostFallback = true
 					t.nativeOutpostActive = false
+					if dErr := t.detachFromNativeOutpostForTextBridge(); dErr != nil {
+						return res, dErr
+					}
 					if resetOutput != nil {
 						resetOutput()
 					}
@@ -1016,6 +1070,11 @@ func (t *preparedTurn) runChat(onEvent EventFunc, streamProgress func() (started
 				}
 			}
 		} else {
+			if dErr := t.detachFromNativeOutpostForTextBridge(); dErr != nil {
+				return res, dErr
+			}
+			attemptIn = t.in
+			attemptIn.OnDispatched = t.markUpstreamWaiting
 			res, err = t.server.upstream.Chat(t.ctx, sess, attemptIn, onEvent)
 		}
 		t.clearUpstreamWaiting()

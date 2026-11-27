@@ -37,6 +37,9 @@ var (
 	wsCompleteGraceMaxThinking   = 10 * time.Second
 	wsNativeToolTimeout          = 45 * time.Second
 	wsNativeToolTotalTimeout     = 90 * time.Second
+	// wsResumeFirstProgressTimeout 限制续聊旧 thread_id 等待首个实质模型响应事件的最大时长（小于 maxThinkingPrestart 45s），
+	// 防止复用已挂起或异常僵死的旧线程时因保活帧不断刷新静默读超时而空等 10 分钟。
+	wsResumeFirstProgressTimeout = 38 * time.Second
 )
 
 // ErrUserMessageTooLarge means the user_message frame cannot fit under the
@@ -402,7 +405,8 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		in.OnDispatched()
 	}
 
-	result, err := u.readEventsWithGuard(ctx, conn, gateway, threadID, effort, in.ClientToolsActive, hasUploadedAttachments, onEvent)
+	isResumedSession := !in.CreateSession && strings.TrimSpace(in.ThreadID) != ""
+	result, err := u.readEventsWithResumeGuard(ctx, conn, gateway, threadID, effort, in.ClientToolsActive, hasUploadedAttachments, isResumedSession, onEvent)
 	result.ThreadID = threadID
 	if in.DeleteSession {
 		_ = send(map[string]any{"type": "session_delete", "payload": map[string]any{"session_id": threadID}})
@@ -486,6 +490,10 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 }
 
 func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn, gateway bool, threadID, thinkingEffort string, clientToolsActive, hasUploadedAttachments bool, onEvent EventFunc) (ChatResult, error) {
+	return u.readEventsWithResumeGuard(ctx, conn, gateway, threadID, thinkingEffort, clientToolsActive, hasUploadedAttachments, false, onEvent)
+}
+
+func (u *Upstream) readEventsWithResumeGuard(ctx context.Context, conn *websocket.Conn, gateway bool, threadID, thinkingEffort string, clientToolsActive, hasUploadedAttachments, isResumedSession bool, onEvent EventFunc) (ChatResult, error) {
 	isMaxThinking := strings.EqualFold(strings.TrimSpace(thinkingEffort), "max")
 	idleReadLimit := wsReadIdleTimeout
 	if isMaxThinking && wsReadIdleTimeoutMaxThinking > idleReadLimit {
@@ -495,6 +503,11 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 	if isMaxThinking && wsCompleteGraceMaxThinking > completeGrace {
 		completeGrace = wsCompleteGraceMaxThinking
 	}
+	var resumeFirstProgressDeadline time.Time
+	if isResumedSession && wsResumeFirstProgressTimeout > 0 {
+		resumeFirstProgressDeadline = time.Now().Add(wsResumeFirstProgressTimeout)
+	}
+	sawModelProgress := false
 	var result ChatResult
 	var text strings.Builder
 	var thinking strings.Builder
@@ -722,6 +735,22 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 				return finish()
 			}
 		}
+		if !sawModelProgress && !resumeFirstProgressDeadline.IsZero() {
+			remaining := time.Until(resumeFirstProgressDeadline)
+			if remaining <= 0 {
+				log.Printf("upstream resumed session stalled without model progress thread=%s timeout=%s", threadID, wsResumeFirstProgressTimeout)
+				_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "resumed session stalled"), time.Now().Add(time.Second))
+				res, _ := finish()
+				return res, &UpstreamError{
+					StatusCode: http.StatusGatewayTimeout,
+					Code:       "SessionStalled",
+					Err:        errors.New("resumed session stalled without model progress"),
+				}
+			}
+			if remaining < readWait {
+				readWait = remaining
+			}
+		}
 		if clientToolsActive && !nativeToolActiveSince.IsZero() {
 			elapsed := time.Since(nativeToolActiveSince)
 			totalElapsed := nativeToolTotalElapsed + elapsed
@@ -751,6 +780,14 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 				}
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return res, ctxErr
+				}
+				if !sawModelProgress && !resumeFirstProgressDeadline.IsZero() && !time.Now().Before(resumeFirstProgressDeadline) {
+					log.Printf("upstream resumed session stalled on read deadline thread=%s timeout=%s", threadID, wsResumeFirstProgressTimeout)
+					return res, &UpstreamError{
+						StatusCode: http.StatusGatewayTimeout,
+						Code:       "SessionStalled",
+						Err:        errors.New("resumed session stalled without model progress"),
+					}
 				}
 				if clientToolsActive && !nativeToolActiveSince.IsZero() {
 					elapsed := time.Since(nativeToolActiveSince)
@@ -805,6 +842,16 @@ func (u *Upstream) readEventsWithGuard(ctx context.Context, conn *websocket.Conn
 			continue
 		}
 		eventCounts[env.Type]++
+		switch env.Type {
+		case "message_start", "acp_metadata", "thinking_start", "thinking_delta", "thinking_complete",
+			"text_delta", "text_complete", "turn_usage", "tool_start", "tool_arguments", "tool_arguments_edited",
+			"tool_progress", "tool_call", "tool_call_update", "tool_complete", "message_complete", "tool_result":
+			sawModelProgress = true
+		default:
+			if terminal[env.Type] {
+				sawModelProgress = true
+			}
+		}
 		switch env.Type {
 		case "message_start":
 			pauseNativeToolTimer()

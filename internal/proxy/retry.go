@@ -142,7 +142,7 @@ func shouldResetConversation(conv *conversation, err error) bool {
 	if err == nil || conv == nil {
 		return false
 	}
-	if errors.Is(err, ErrRemoteSandboxToolBlocked) {
+	if errors.Is(err, ErrRemoteSandboxToolBlocked) || errors.Is(err, ErrEmptyResponse) {
 		return true
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
@@ -170,7 +170,7 @@ func retryActionForCode(code string) (retryAction, bool) {
 		"resourceexhausted", "creditsexhausted", "subscriptionrequired", "paymentrequired", "attachmenttransportunsupported":
 		return retryNextAccount, true
 	case "sessionnotfound", "threadnotfound", "conversationnotfound", "invalidsession", "sessionexpired",
-		"invalidthread", "threadexpired", "sessiondoesnotexist":
+		"invalidthread", "threadexpired", "sessiondoesnotexist", "sessionstalled", "threadstalled":
 		return retryNewSession, true
 	case "validation", "validationerror", "invalidargument", "invalidrequest", "invalidrequesterror", "badrequest",
 		"malformedrequest", "prompttoolarge", "messagetoolarge", "requesttoolarge", "contextlengthexceeded",

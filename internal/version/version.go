@@ -2,7 +2,7 @@
 package version
 
 // Current 为当前发行版本号（声明为 var 以便构建阶段按需通过 -ldflags -X 覆写）。
-var Current = "2.5.4"
+var Current = "2.5.5"
 
 const (
 	// RepoOwner 为官方 GitHub 仓库所有者。

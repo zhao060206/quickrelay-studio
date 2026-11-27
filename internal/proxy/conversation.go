@@ -607,17 +607,37 @@ func shortSHA256(text string) string {
 
 // encodeBaseHash 将静态规范摘要与工具定义摘要编码到 base_hash 列，保持表结构免迁移。
 func encodeBaseHash(guideHash, toolHash string) string {
+	return encodeBaseHashForTransport(guideHash, toolHash, false)
+}
+
+// encodeBaseHashForTransport 按本轮实际通道类型编码 base_hash：
+// 虚拟 Outpost 会话使用 "v2o:" 前缀，普通文本桥会话使用 "v2:" 前缀，
+// 以便后续跨通道切换（如 Read 读取本地图片回退 text_bridge）时精确识别并隔离云端 thread_id。
+func encodeBaseHashForTransport(guideHash, toolHash string, nativeOutpost bool) string {
+	if nativeOutpost {
+		return "v2o:" + guideHash + ":" + toolHash
+	}
 	return "v2:" + guideHash + ":" + toolHash
 }
 
-// splitBaseHash 解析持久化记录中的规范摘要与工具定义摘要（兼容旧版纯 SHA-256 值）。
+func isOutpostBaseHash(stored string) bool {
+	return strings.HasPrefix(stored, "v2o:")
+}
+
+func isTextBridgeBaseHash(stored string) bool {
+	return strings.HasPrefix(stored, "v2:")
+}
+
+// splitBaseHash 解析持久化记录中的规范摘要与工具定义摘要（兼容 "v2:" / "v2o:" 与旧版纯 SHA-256 值）。
 func splitBaseHash(stored string) (guideHash, toolHash string) {
-	if strings.HasPrefix(stored, "v2:") {
-		rest := strings.TrimPrefix(stored, "v2:")
-		if idx := strings.IndexByte(rest, ':'); idx >= 0 {
-			return rest[:idx], rest[idx+1:]
+	for _, prefix := range []string{"v2o:", "v2:"} {
+		if strings.HasPrefix(stored, prefix) {
+			rest := strings.TrimPrefix(stored, prefix)
+			if idx := strings.IndexByte(rest, ':'); idx >= 0 {
+				return rest[:idx], rest[idx+1:]
+			}
+			return rest, ""
 		}
-		return rest, ""
 	}
 	return stored, ""
 }

@@ -1,15 +1,15 @@
 {
-  "version": "2.5.4",
-  "tag": "v2.5.4",
-  "published_at": "2026-11-27T10:25:17Z",
-  "release_notes": "紧急修复虚拟 Outpost 活跃等待期触发 pingTicker 保活心跳后漏写 continue 导致超过 15s/25s 的长思考任务误判连接关闭 (outpost WebSocket closed unexpectedly) 的缺陷，并完整包含 v2.5.3 对 /compact 与 16 图大工具集 64 KB 超限的加固。",
-  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.5.4",
+  "version": "2.5.5",
+  "tag": "v2.5.5",
+  "published_at": "2026-11-27T11:05:26Z",
+  "release_notes": "修复虚拟 Outpost 会话中调用 Read 读取本地图片（或超长帧自动回退）切往 text_bridge 时复用挂起 thread_id 导致云端排队死锁 10 分钟的缺陷：跨通道切换自动反注册原挂起 Outpost 并开启新线程秒回；同时新增续聊旧线程 38s 首字活性自愈，自动重建存量僵死会话。",
+  "release_url": "https://github.com/zhao060206/quickrelay-studio/releases/tag/v2.5.5",
   "assets": {
     "windows_amd64": {
-      "name": "QuickRelay-Studio-v2.5.4-win-x64.zip",
-      "size": 8826130,
-      "sha256": "0bcfa4c7a093e2f1026452566ac4cac44f010a76266db1cbbf3dd0c20249c253",
-      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.5.4/QuickRelay-Studio-v2.5.4-win-x64.zip"
+      "name": "QuickRelay-Studio-v2.5.5-win-x64.zip",
+      "size": 8831544,
+      "sha256": "2138e8cd12a1d358696872278d9bbaf4bf1019d2686bf4567d80852fe3a693d0",
+      "url": "https://github.com/zhao060206/quickrelay-studio/releases/download/v2.5.5/QuickRelay-Studio-v2.5.5-win-x64.zip"
     }
   }
 }

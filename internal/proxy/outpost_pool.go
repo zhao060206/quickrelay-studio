@@ -474,6 +474,64 @@ func (p *outpostPool) evictSessionIfMatches(convKey, sessionID string, syncUnreg
 	cur.closeAndUnregister(syncUnreg)
 }
 
+// HasSessionOrThread 检查挂起或活跃虚拟 Outpost 池中是否存在关联指定会话键或线程 ID 的连接。
+func (p *outpostPool) HasSessionOrThread(convKey, threadID string) bool {
+	if p == nil {
+		return false
+	}
+	convKey = strings.TrimSpace(convKey)
+	threadID = strings.TrimSpace(threadID)
+	if convKey == "" && threadID == "" {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if convKey != "" && p.idle[convKey] != nil {
+		return true
+	}
+	for _, s := range p.idle {
+		if s != nil && ((convKey != "" && s.convKey == convKey) || (threadID != "" && s.threadID == threadID)) {
+			return true
+		}
+	}
+	for _, s := range p.active {
+		if s != nil && ((convKey != "" && s.convKey == convKey) || (threadID != "" && s.threadID == threadID)) {
+			return true
+		}
+	}
+	return false
+}
+
+// InvalidateThread 关闭并反注册绑定到指定 thread_id 的挂起或活跃虚拟 Outpost。
+func (p *outpostPool) InvalidateThread(threadID string) {
+	if p == nil {
+		return
+	}
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		return
+	}
+	var targets []*outpostSession
+	p.mu.Lock()
+	for k, s := range p.idle {
+		if s != nil && s.threadID == threadID {
+			delete(p.idle, k)
+			targets = append(targets, s)
+		}
+	}
+	for id, s := range p.active {
+		if s != nil && s.threadID == threadID {
+			delete(p.active, id)
+			targets = append(targets, s)
+		}
+	}
+	p.mu.Unlock()
+	for _, s := range targets {
+		s.stopIdleMonitor()
+		s.closeAndUnregister(false)
+	}
+}
+
 // InvalidateKey 关闭并反注册指定会话键关联的挂起或活跃虚拟 Outpost。
 func (p *outpostPool) InvalidateKey(convKey string) {
 	if p == nil || strings.TrimSpace(convKey) == "" {

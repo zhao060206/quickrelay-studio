@@ -1,4 +1,4 @@
-# QuickRelay Studio v2.5.4
+# QuickRelay Studio v2.5.5
 
 **QuickRelay Studio** 是一款基于 Go 与 WebView2 桌面端打造的独立双协议 AI 反代网关与账号池管理控制台。支持将多个 AWS Quick 账号聚合为标准的 **OpenAI** 与 **Anthropic Messages** API，免改造直连 **Claude Code**、**Codex CLI** 及各类开源 SDK，并内置完整的请求明细统计与 1M 上下文持久化会话追踪。
 
@@ -7,9 +7,10 @@
 ## 核心特性
 
 1. **双协议原生网关**
-   - **虚拟 Outpost 原生工具直通与常驻挂起会话池（v2.5.0 架构升级 / v2.5.1 ~ v2.5.4 稳定性与审批体验深度优化）**：
+   - **虚拟 Outpost 原生工具直通与常驻挂起会话池（v2.5.0 架构升级 / v2.5.1 ~ v2.5.5 稳定性与跨通道体验深度优化）**：
      - 在 AIDP + 有效租户地址且携带工具的请求中，默认以 `tool_mode: "auto"` 通过 `putOutpost` 注册虚拟设备并直接暴露客户端工具为上游原生工具（避免文本 `<client_tool_call>` 协议退化与身份漂移），并支持 `native_outpost` / `text_bridge` 三模式切换及 `PUT /api/tool-mode` 热更新；
      - **零延迟同线程续写与结构化历史冷导入**：挂起期由单一常驻 WebSocket 读循环保持连接活性与事件缓冲，同线程工具结果回传原位恢复；新建或切号重放时通过 `/store/sessions` + `/events/batch` 写入结构化历史事件；停机及会话单删/全清自动反注册虚拟 Outpost；
+     - **v2.5.5 虚拟 Outpost 与图片文本桥跨通道线程隔离及僵死续聊自愈**：彻底修复在虚拟 Outpost 会话中调用 `Read(*.png)` 等工具读取本地图片（或因单帧超 `63 KiB` 回退）切往 `text_bridge` 时复用正在死等原生 `tool_result` 的同一挂起 `thread_id` 导致云端排队死锁 10 分钟的缺陷——跨通道切换时自动关闭并反注册原挂起虚拟 Outpost，开启全新 `thread_id` 携带完整历史、完整 `<client_tool_protocol>` 与图片附件秒级响应，后续图片滑出最近窗口后可再次平滑恢复虚拟 Outpost；同时为续聊旧线程新增 `38s` 首字活性检测（早于 `45s` SSE 预热）与 `ErrEmptyResponse` 失效清理，存量僵死旧线程自动触发 `retryNewSession` 重建自愈；
      - **v2.5.3 ~ v2.5.4 高负载长会话稳定性加固**：修复虚拟 Outpost `readTurnEvents` 活跃等待期触发 `pingTicker` 保活后漏写 `continue` 导致长思考跨越首个心跳周期（`25s`/`15s`）时误判 `outpost WebSocket closed unexpectedly` 的关键缺陷（v2.5.4）；识别 `/compact` 会话压缩请求时自动跳过无用工具协议注入与历史旧图上传，解除 16 图 + 大 MCP 工具表导致的 `64 KB` 单帧超限死锁；普通 `text_bridge` 请求新增第 3 档超紧凑 Schema 与 `tools-*.txt` 附件外置兜底；为虚拟 Outpost 补齐 `15s` 双层心跳、早期思考暂存与闪断无感自动重连；早于最近 6 条消息的陈年旧截图自动转为文本占位以保持虚拟 Outpost 可用，并放宽云端已上传 `prompt-*.txt` 的只读检索配额；
      - **v2.5.2 自动审批加速与减少误弹窗**：针对无工具 `<transcript>` 自动审批分类请求强制分流极速模型 `fast`、在未显式传思考参数时强制设为 `low` 并执行保首尾及闭合标签后待审指令的结构感知裁剪（消除大上下文重写与附件 DLP 延迟）；在虚拟 Outpost 工具路由指引中优先引导使用 `Read`/`Glob`/`Grep`/`Edit`/`Write`/`MultiEdit` 等专用工具替代 `Bash` 以减少客户端手动审批弹窗；同时将原生并行工具聚拢窗口扩至 `180ms`，并在收到同轮下一个工具的 `tool_start`/`tool_progress`/`tool_arguments` 时自动滑动续期 `600ms`，防止大参数并行调用被拆成多轮；
      - **v2.5.1 全链路稳定性加固**：完整支持多段 `continuation_expected` 回答与中途断流保护；执行原生 `user_message` 完整序列化 `63 KiB` 帧预算检查（`auto` 无损回退 `text_bridge`，`native_outpost` 明确报错）并修复长思考首包 SSE 预热派发；跨原生、自动回退与文本桥全路径统一执行强制工具选择（`function`/`tool`/`required`/`any`）与精确设备前缀匹配；收紧显式 `X-Thread-Id` 全链路历史核对、配额错误保留绑定与断连防下发一致性；
